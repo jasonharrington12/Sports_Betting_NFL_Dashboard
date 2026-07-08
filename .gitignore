@@ -1,0 +1,7 @@
+nfl_2024_player_game_logs.csv
+nfl_2025_player_game_logs.csv
+final_nfl_2024_2025_player_game_logs.csv
+player_team_changes_2024_to_2025.csv
+__pycache__/
+*.pyc
+.streamlit/
