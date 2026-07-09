@@ -391,7 +391,7 @@ def bar_chart(nfl, player_name, category, line=None):
         bars = ax.bar(weeks, values, color=colors, edgecolor="white",
                       linewidth=0.6, alpha=0.87, zorder=2)
         ax.axhline(avg, color=C_AVG, linewidth=1.8, linestyle="--",
-                   label=f"Season Avg: {avg:.1f}", zorder=3)
+                   label=f"Season Avg: {avg:.2f}", zorder=3)
         if line is not None:
             ax.axhline(line, color=C_LINE, linewidth=1.8, linestyle="-",
                        label=f"Prop Line: {line}", zorder=3)
@@ -400,7 +400,7 @@ def bar_chart(nfl, player_name, category, line=None):
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + max(values) * 0.02,
-                    str(int(val)) if val == int(val) else f"{val:.1f}",
+                    str(int(val)) if val == int(val) else f"{val:.2f}",
                     ha="center", va="bottom", fontsize=7.5, color="#333333",
                 )
         ax.set_title(label, fontsize=11, fontweight="bold", pad=6)
@@ -498,7 +498,7 @@ def team_bar_chart(nfl, season, stat_col, stat_label):
     for bar, val in zip(bars, tdf[stat_col]):
         ax.text(bar.get_width() + tdf[stat_col].max() * 0.01,
                 bar.get_y() + bar.get_height() / 2,
-                f"{val:.1f}", va="center", fontsize=7.5)
+                f"{val:.2f}", va="center", fontsize=7.5)
     ax.set_title(f"{season}  —  Avg {stat_label} per Game by Team",
                  fontsize=12, fontweight="bold")
     ax.set_xlabel(f"Avg {stat_label}", fontsize=9)
@@ -604,10 +604,10 @@ with tab1:
                     )
 
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Weighted Avg",      f"{res['w_avg']:.1f}")
+                    m1.metric("Weighted Avg",      f"{res['w_avg']:.2f}")
                     m2.metric("Weighted Hit Rate", f"{res['w_hit']:.1f}%")
-                    m3.metric("Last 3 Avg",        f"{res['last_3_avg']:.1f}")
-                    m4.metric("Std Deviation",     f"{res['std_dev']:.1f}")
+                    m3.metric("Last 3 Avg",        f"{res['last_3_avg']:.2f}")
+                    m4.metric("Std Deviation",     f"{res['std_dev']:.2f}")
 
                     st.subheader("Season Split")
                     split_rows = []
@@ -616,7 +616,7 @@ with tab1:
                             "Season": "2025",
                             "Hit Rate": f"{res['hr_2025']:.1f}%",
                             "Over / Total": f"{int(res['over_2025'])} / {res['total_2025']}",
-                            "Average": f"{res['avg_2025']:.1f}",
+                            "Average": f"{res['avg_2025']:.2f}",
                             "Weight": "1.0",
                         })
                     if res["hr_2024"] is not None:
@@ -624,7 +624,7 @@ with tab1:
                             "Season": "2024",
                             "Hit Rate": f"{res['hr_2024']:.1f}%",
                             "Over / Total": f"{int(res['over_2024'])} / {res['total_2024']}",
-                            "Average": f"{res['avg_2024']:.1f}",
+                            "Average": f"{res['avg_2024']:.2f}",
                             "Weight": res["weight_label"],
                         })
                     if split_rows:
@@ -678,8 +678,8 @@ with tab2:
                 h1, h2, h3, h4, h5 = st.columns(5)
                 h1.metric("Games (2025)", len(p25))
                 h2.metric("Games (2024)", len(p24))
-                h3.metric("2025 Avg Fantasy", f"{p25['fantasy_points'].mean():.1f}" if not p25.empty else "—")
-                h4.metric("2024 Avg Fantasy", f"{p24['fantasy_points'].mean():.1f}" if not p24.empty else "—")
+                h3.metric("2025 Avg Fantasy", f"{p25['fantasy_points'].mean():.2f}" if not p25.empty else "—")
+                h4.metric("2024 Avg Fantasy", f"{p24['fantasy_points'].mean():.2f}" if not p24.empty else "—")
                 changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
                 h5.metric("Team Change", "Yes ⚠️" if changed else "No")
 
@@ -846,7 +846,7 @@ with tab4:
                 ax4.text(
                     bar.get_width() + leaders[val_label].max() * 0.01,
                     bar.get_y() + bar.get_height() / 2,
-                    f"{val:.1f}", va="center", fontsize=7.5,
+                    f"{val:.2f}", va="center", fontsize=7.5,
                 )
             ax4.set_xlabel(val_label, fontsize=9)
             ax4.spines["top"].set_visible(False)
@@ -1059,13 +1059,13 @@ with tab6:
 
                 # ── key metrics ───────────────────────────────────────────────
                 k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Player Last 3 Avg",        f"{player_last3:.1f}")
-                k2.metric(f"{me_opp} Allows (Avg)",   f"{opp_allowed_avg:.1f}",
-                          delta=f"{opp_allowed_avg - league_def_avg:+.1f} vs league",
+                k1.metric("Player Last 3 Avg",        f"{player_last3:.2f}")
+                k2.metric(f"{me_opp} Allows (Avg)",   f"{opp_allowed_avg:.2f}",
+                          delta=f"{opp_allowed_avg - league_def_avg:+.2f} vs league",
                           delta_color="inverse")
                 k3.metric("Edge vs Defense",
-                          f"{edge:+.1f}" if edge is not None else "N/A")
-                k4.metric("Prop Line Gap",             f"{edge_vs_line:+.1f}")
+                          f"{edge:+.2f}" if edge is not None else "N/A")
+                k4.metric("Prop Line Gap",             f"{edge_vs_line:+.2f}")
 
                 st.divider()
 
@@ -1075,12 +1075,12 @@ with tab6:
                 with d1:
                     st.subheader(f"📌 {full_name}")
                     player_rows = [
-                        {"Metric": "2025 Season Avg",    "Value": f"{player_avg_25:.1f}"  if player_avg_25  is not None else "—"},
-                        {"Metric": "2024 Season Avg",    "Value": f"{player_avg_24:.1f}"  if player_avg_24  is not None else "—"},
-                        {"Metric": "Last 3 Games Avg",   "Value": f"{player_last3:.1f}"},
-                        {"Metric": "Career Avg (both)",  "Value": f"{player_all_avg:.1f}"},
+                        {"Metric": "2025 Season Avg",    "Value": f"{player_avg_25:.2f}"  if player_avg_25  is not None else "—"},
+                        {"Metric": "2024 Season Avg",    "Value": f"{player_avg_24:.2f}"  if player_avg_24  is not None else "—"},
+                        {"Metric": "Last 3 Games Avg",   "Value": f"{player_last3:.2f}"},
+                        {"Metric": "Career Avg (both)",  "Value": f"{player_all_avg:.2f}"},
                         {"Metric": "Prop Line",          "Value": str(me_line)},
-                        {"Metric": "Last-3 vs Line",     "Value": f"{edge_vs_line:+.1f}"},
+                        {"Metric": "Last-3 vs Line",     "Value": f"{edge_vs_line:+.2f}"},
                     ]
                     st.dataframe(pd.DataFrame(player_rows),
                                  use_container_width=True, hide_index=True)
@@ -1088,13 +1088,13 @@ with tab6:
                 with d2:
                     st.subheader(f"🛡️ {me_opp} Defense")
                     def_rows = [
-                        {"Metric": f"Avg {col_label} Allowed",    "Value": f"{opp_allowed_avg:.1f}"},
-                        {"Metric": "Std Dev (allowed)",            "Value": f"{opp_allowed_std:.1f}"},
+                        {"Metric": f"Avg {col_label} Allowed",    "Value": f"{opp_allowed_avg:.2f}"},
+                        {"Metric": "Std Dev (allowed)",            "Value": f"{opp_allowed_std:.2f}"},
                         {"Metric": "Sample Games",                 "Value": str(opp_games)},
-                        {"Metric": "League Avg Allowed",           "Value": f"{league_def_avg:.1f}"},
+                        {"Metric": "League Avg Allowed",           "Value": f"{league_def_avg:.2f}"},
                         {"Metric": f"Defensive Rank (of {total_teams})",
                                                                    "Value": f"#{opp_rank}" if opp_rank else "N/A"},
-                        {"Metric": "Edge vs Defense",              "Value": f"{edge:+.1f}" if edge is not None else "N/A"},
+                        {"Metric": "Edge vs Defense",              "Value": f"{edge:+.2f}" if edge is not None else "N/A"},
                     ]
                     st.dataframe(pd.DataFrame(def_rows),
                                  use_container_width=True, hide_index=True)
@@ -1122,12 +1122,12 @@ with tab6:
                 if opp_allowed_avg:
                     ax6.axhline(opp_allowed_avg, color="#f59e0b", linewidth=1.8,
                                 linestyle="--",
-                                label=f"{me_opp} Avg Allowed: {opp_allowed_avg:.1f}",
+                                label=f"{me_opp} Avg Allowed: {opp_allowed_avg:.2f}",
                                 zorder=4)
 
                 # player season avg
                 ax6.axhline(player_all_avg, color=C_AVG, linewidth=1.4,
-                            linestyle=":", label=f"Player Avg: {player_all_avg:.1f}",
+                            linestyle=":", label=f"Player Avg: {player_all_avg:.2f}",
                             zorder=3)
 
                 # season boundary
@@ -1451,123 +1451,266 @@ with tab7:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 8 — MATCHUP FINDER
-# Ranks every team's defense by how many yards they allow for a given stat
-# so you can instantly spot the softest matchups across the whole league.
+# Fetches this week's NFL schedule, ranks every team defense by yards allowed,
+# and generates a specific player + prop line suggestion for each game.
 # ══════════════════════════════════════════════════════════════════════════════
 with tab8:
     if not data_ok:
         st.info("Load data first using the **Data Refresh** tab.")
     else:
+        # ── helpers ───────────────────────────────────────────────────────────
         @st.cache_data(show_spinner=False)
         def build_defense_table(nfl):
-            """
-            For every team, calculate how many yards/TDs opposing players
-            racked up against them — this is the 'yards allowed' metric.
-            Parsed from game_id: {season}_{week:02d}_{away}_{home}
-            """
             df = nfl.copy()
-            def get_opponent(row):
+            def get_opp(row):
                 parts = str(row["game_id"]).split("_")
-                if len(parts) < 4:
-                    return "UNK"
+                if len(parts) < 4: return "UNK"
                 away, home = parts[2], parts[3]
                 return home if row["team"] == away else away
-            df["opponent"] = df.apply(get_opponent, axis=1)
+            df["opponent"] = df.apply(get_opp, axis=1)
             return df
 
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def fetch_this_weeks_games():
+            """
+            Finds the current/next NFL week and returns a list of upcoming
+            (unplayed) games as {home, away, date} dicts.
+            Falls back to most recent completed week if offseason.
+            """
+            import datetime as _dt
+            today = _dt.date.today()
+            cur_year = today.year if today.month >= 9 else today.year - 1
+
+            upcoming = []
+            last_completed = []
+
+            for week in range(1, 19):
+                url = (
+                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                    f"?seasontype=2&week={week}&dates={cur_year}"
+                )
+                data = _get_json(url)
+                if not data:
+                    continue
+                events = data.get("events", [])
+                if not events:
+                    break
+                for e in events:
+                    comp  = e["competitions"][0]
+                    done  = comp["status"]["type"]["completed"]
+                    teams = {c["homeAway"]: c["team"]["abbreviation"]
+                             for c in comp["competitors"]}
+                    game_date = e["date"][:10]
+                    entry = {
+                        "home": teams.get("home", "UNK"),
+                        "away": teams.get("away", "UNK"),
+                        "date": game_date,
+                        "week": week,
+                        "completed": done,
+                        "name": e.get("shortName", e.get("name", "")),
+                    }
+                    if not done:
+                        upcoming.append(entry)
+                    else:
+                        last_completed.append(entry)
+
+            return upcoming if upcoming else last_completed[-16:]  # offseason fallback
+
+        # ── build defensive stats table ───────────────────────────────────────
         nfl_def = build_defense_table(nfl_df)
 
-        st.subheader("🎯 Best Matchup Finder")
-        st.caption("Find the softest defenses to target for any stat this week.")
+        st.subheader("🎯 Matchup Finder — This Week's Best Props")
+        st.caption(
+            "Pulls this week's schedule from ESPN, finds the softest defensive matchup "
+            "for each game, and suggests the best player + prop line to target."
+        )
 
-        mf_c1, mf_c2 = st.columns([1, 3])
+        # ── controls ──────────────────────────────────────────────────────────
+        mf_c1, mf_c2 = st.columns([1, 4])
         with mf_c1:
-            mf_stat   = st.selectbox("Stat to attack", list(CAT_MAP.keys()),
-                                      format_func=str.title, key="mf_stat")
-            mf_season = st.radio("Season sample", [2025, 2024, "Both"],
-                                  key="mf_season")
-            mf_top    = st.slider("Show top N softest", 5, 32, 10, key="mf_top")
+            mf_stat      = st.selectbox("Stat category", list(CAT_MAP.keys()),
+                                         format_func=str.title, key="mf_stat")
+            mf_season    = st.radio("Defensive sample", [2025, 2024, "Both"],
+                                     key="mf_season")
             mf_min_games = st.number_input("Min games sample", 1, 18, 4,
                                             key="mf_min")
+            mf_min_player = st.number_input("Min player games", 1, 18, 3,
+                                             key="mf_min_player")
 
         with mf_c2:
             col, col_label = CAT_MAP[mf_stat.lower()]
 
+            # Build defense ranks
             if mf_season == "Both":
                 def_sample = nfl_def.copy()
             else:
                 def_sample = nfl_def[nfl_def["season"] == int(mf_season)]
 
-            # avg yards allowed per game by opponent
             def_agg = (
                 def_sample.groupby("opponent")
-                .agg(
-                    avg_allowed=(col, "mean"),
-                    games=(col, "count"),
-                    total_allowed=(col, "sum"),
-                )
+                .agg(avg_allowed=(col, "mean"), games=(col, "count"))
                 .reset_index()
             )
             def_agg = def_agg[def_agg["games"] >= mf_min_games]
+            league_avg = def_agg["avg_allowed"].mean()
             def_agg = def_agg.sort_values("avg_allowed", ascending=False).reset_index(drop=True)
             def_agg["rank"] = def_agg.index + 1
+            def_ranks = dict(zip(def_agg["opponent"], def_agg["rank"]))
+            def_avgs  = dict(zip(def_agg["opponent"], def_agg["avg_allowed"]))
+            total_teams = len(def_agg)
 
-            # league average
-            league_avg = def_agg["avg_allowed"].mean()
+            # Fetch schedule
+            with st.spinner("Fetching this week's schedule from ESPN..."):
+                games = fetch_this_weeks_games()
 
-            # Top softest (most yards allowed = easiest to score against)
-            softest = def_agg.head(mf_top).copy()
-            softest["vs_league"] = softest["avg_allowed"] - league_avg
-            softest["grade"] = softest["avg_allowed"].apply(
-                lambda v: "🟢 Soft" if v > league_avg * 1.10
-                else ("🔴 Tough" if v < league_avg * 0.90 else "🟡 Average")
-            )
+            if not games:
+                st.warning("No schedule data available. ESPN API may be temporarily unavailable.")
+            else:
+                is_upcoming = any(not g["completed"] for g in games)
+                week_num    = games[0]["week"]
+                label       = f"Week {week_num} Upcoming Games" if is_upcoming else f"Week {week_num} (Most Recent — Offseason)"
+                st.markdown(f"**{label}** — {len(games)} games")
 
-            # Chart
-            fig8, ax8 = plt.subplots(figsize=(9, max(3, len(softest) * 0.45)))
-            bar_colors = [
-                C_OVER  if v > league_avg * 1.10 else
-                (C_LINE if v < league_avg * 0.90 else "#f59e0b")
-                for v in softest["avg_allowed"]
-            ]
-            bars = ax8.barh(
-                softest["opponent"][::-1], softest["avg_allowed"][::-1],
-                color=bar_colors[::-1], alpha=0.85, edgecolor="white", linewidth=0.4
-            )
-            ax8.axvline(league_avg, color=C_AVG, linewidth=1.5, linestyle="--",
-                        label=f"League avg: {league_avg:.1f}")
-            for bar, val in zip(bars, softest["avg_allowed"][::-1]):
-                ax8.text(bar.get_width() + softest["avg_allowed"].max() * 0.01,
-                         bar.get_y() + bar.get_height() / 2,
-                         f"{val:.1f}", va="center", fontsize=8)
-            ax8.set_title(f"Avg {col_label} Allowed per Game — Top {mf_top} Softest Defenses",
-                          fontsize=11, fontweight="bold")
-            ax8.set_xlabel(f"Avg {col_label} Allowed", fontsize=9)
-            ax8.legend(fontsize=8)
-            ax8.spines["top"].set_visible(False)
-            ax8.spines["right"].set_visible(False)
-            ax8.grid(axis="x", linestyle="--", alpha=0.35)
-            plt.tight_layout()
-            st.pyplot(fig8, use_container_width=True)
-            plt.close(fig8)
+                # ── Per-game prop suggestions ─────────────────────────────────
+                prop_rows = []
+                for game in games:
+                    home, away = game["home"], game["away"]
 
-            # Full defense rankings table
-            st.subheader(f"Full Defense Rankings — {col_label}")
-            display_def = def_agg.copy()
-            display_def["avg_allowed"]   = display_def["avg_allowed"].round(1)
-            display_def["total_allowed"] = display_def["total_allowed"].round(0).astype(int)
-            display_def["grade"] = display_def["avg_allowed"].apply(
-                lambda v: "🟢 Soft" if v > league_avg * 1.10
-                else ("🔴 Tough" if v < league_avg * 0.90 else "🟡 Average")
-            )
-            display_def = display_def.rename(columns={
-                "opponent": "Defense", "avg_allowed": f"Avg {col_label} Allowed",
-                "games": "Games", "total_allowed": f"Total {col_label}",
-                "rank": "Rank", "grade": "Grade",
-            })
-            st.dataframe(display_def[["Rank","Defense", f"Avg {col_label} Allowed",
-                                       "Games", "Grade"]],
-                         use_container_width=True, hide_index=True)
+                    for offense_team, defense_team in [(away, home), (home, away)]:
+                        def_avg = def_avgs.get(defense_team, league_avg)
+                        def_rank = def_ranks.get(defense_team, total_teams)
+                        matchup_grade = (
+                            "🟢 Soft" if def_avg > league_avg * 1.10
+                            else ("🔴 Tough" if def_avg < league_avg * 0.90 else "🟡 Average")
+                        )
+
+                        # Find best player on offense_team for this stat
+                        team_players = nfl_def[
+                            (nfl_def["team"] == offense_team) &
+                            (nfl_def["season"] == 2025)
+                        ]
+                        # Filter to players who actually produce in this stat
+                        team_players = team_players[team_players[col] > 0]
+                        if team_players.empty:
+                            # Try 2024 data
+                            team_players = nfl_def[
+                                (nfl_def["team"] == offense_team) &
+                                (nfl_def["season"] == 2024) &
+                                (nfl_def[col] > 0)
+                            ]
+                        if team_players.empty:
+                            continue
+
+                        # Aggregate by player, keep those with enough games
+                        p_agg = (
+                            team_players.groupby("player_name")[col]
+                            .agg(["mean", "count", "std"])
+                            .reset_index()
+                        )
+                        p_agg = p_agg[p_agg["count"] >= mf_min_player]
+                        if p_agg.empty:
+                            continue
+
+                        p_agg = p_agg.sort_values("mean", ascending=False)
+                        best  = p_agg.iloc[0]
+
+                        # Prop line = player's weighted avg adjusted for matchup
+                        player_avg = float(best["mean"])
+                        matchup_factor = def_avg / league_avg if league_avg > 0 else 1.0
+
+                        # Get last-3 avg for this player
+                        p_df   = nfl_def[nfl_def["player_name"] == best["player_name"]]
+                        p_2025 = p_df[p_df["season"] == 2025]
+                        last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg
+
+                        # Suggested line = midpoint of player avg and opp allows
+                        # This is what a sportsbook might set
+                        suggested_line = round((player_avg + def_avg) / 2 / 5) * 5 - 0.5
+
+                        rec = "OVER" if player_avg * matchup_factor > suggested_line else "UNDER"
+                        confidence = abs(player_avg * matchup_factor - suggested_line)
+
+                        prop_rows.append({
+                            "Game":         f"{away} @ {home}",
+                            "Date":         game["date"],
+                            "Offense":      offense_team,
+                            "Defense":      defense_team,
+                            "Player":       best["player_name"],
+                            "Stat":         col_label,
+                            "Player Avg":   round(player_avg, 2),
+                            "Last 3 Avg":   round(last3, 2),
+                            "Def Allows":   round(def_avg, 2),
+                            "Def Rank":     f"#{def_rank}",
+                            "Matchup":      matchup_grade,
+                            "Suggested Line": suggested_line,
+                            "Pick":         rec,
+                            "_conf":        confidence,
+                        })
+
+                if prop_rows:
+                    prop_df = pd.DataFrame(prop_rows).sort_values("_conf", ascending=False)
+                    prop_df = prop_df.drop(columns=["_conf"])
+
+                    # ── Top 5 best bets banner ────────────────────────────────
+                    st.subheader("Top Prop Suggestions This Week")
+                    top5 = prop_df[prop_df["Matchup"] == "🟢 Soft"].head(5)
+                    if top5.empty:
+                        top5 = prop_df.head(5)
+
+                    for _, r in top5.iterrows():
+                        pick_color = "#2DC653" if r["Pick"] == "OVER" else "#D62828"
+                        st.markdown(
+                            f'<div style="border-left:5px solid {pick_color};'
+                            f'padding:10px 14px;background:#f7f8fa;border-radius:6px;'
+                            f'margin-bottom:8px;">'
+                            f'<b>{r["Player"]}</b> ({r["Offense"]}) &nbsp;|&nbsp; '
+                            f'<b>{col_label} {r["Pick"]} {r["Suggested Line"]}</b>'
+                            f'&nbsp;&nbsp;·&nbsp;&nbsp;'
+                            f'vs {r["Defense"]} {r["Matchup"]} (allows {r["Def Allows"]:.2f}/gm)'
+                            f'&nbsp;&nbsp;·&nbsp;&nbsp;'
+                            f'Player avg: {r["Player Avg"]:.2f} &nbsp;|&nbsp; Last 3: {r["Last 3 Avg"]:.2f}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    # ── Full table ────────────────────────────────────────────
+                    st.divider()
+                    st.subheader(f"All {col_label} Props — {label}")
+                    st.dataframe(prop_df, use_container_width=True, hide_index=True)
+
+                    # ── Defense rankings chart ────────────────────────────────
+                    st.divider()
+                    st.subheader(f"Full Defense Rankings — {col_label}")
+                    show_top = st.slider("Show top N defenses", 5, 32, 16, key="mf_chart_n")
+                    chart_df8 = def_agg.head(show_top)
+                    fig8, ax8 = plt.subplots(figsize=(9, max(3, len(chart_df8) * 0.45)))
+                    bar_colors8 = [
+                        C_OVER  if v > league_avg * 1.10 else
+                        (C_LINE if v < league_avg * 0.90 else "#f59e0b")
+                        for v in chart_df8["avg_allowed"]
+                    ]
+                    bars8 = ax8.barh(
+                        chart_df8["opponent"][::-1], chart_df8["avg_allowed"][::-1],
+                        color=bar_colors8[::-1], alpha=0.85, edgecolor="white", linewidth=0.4
+                    )
+                    ax8.axvline(league_avg, color=C_AVG, linewidth=1.5, linestyle="--",
+                                label=f"League avg: {league_avg:.2f}")
+                    for bar, val in zip(bars8, chart_df8["avg_allowed"][::-1]):
+                        ax8.text(bar.get_width() + chart_df8["avg_allowed"].max() * 0.01,
+                                 bar.get_y() + bar.get_height() / 2,
+                                 f"{val:.2f}", va="center", fontsize=8)
+                    ax8.set_title(
+                        f"Avg {col_label} Allowed per Game — Softest to Toughest",
+                        fontsize=11, fontweight="bold"
+                    )
+                    ax8.set_xlabel(f"Avg {col_label} Allowed", fontsize=9)
+                    ax8.legend(fontsize=8)
+                    ax8.spines["top"].set_visible(False)
+                    ax8.spines["right"].set_visible(False)
+                    ax8.grid(axis="x", linestyle="--", alpha=0.35)
+                    plt.tight_layout()
+                    st.pyplot(fig8, use_container_width=True)
+                    plt.close(fig8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1732,12 +1875,12 @@ with tab10:
 
                 # Summary metrics
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Home Avg",    f"{home_games[col].mean():.1f}" if not home_games.empty else "—")
-                m2.metric("Away Avg",    f"{away_games[col].mean():.1f}" if not away_games.empty else "—")
+                m1.metric("Home Avg",    f"{home_games[col].mean():.2f}" if not home_games.empty else "—")
+                m2.metric("Away Avg",    f"{away_games[col].mean():.2f}" if not away_games.empty else "—")
                 m3.metric("Home Games",  len(home_games))
                 m4.metric("Away Games",  len(away_games))
                 diff = (home_games[col].mean() - away_games[col].mean()) if (not home_games.empty and not away_games.empty) else 0
-                m5.metric("Home vs Away", f"{diff:+.1f}")
+                m5.metric("Home vs Away", f"{diff:+.2f}")
                 if ha_line > 0:
                     hr_home = (home_games[col] > ha_line).mean() * 100 if not home_games.empty else 0
                     hr_away = (away_games[col] > ha_line).mean() * 100 if not away_games.empty else 0
@@ -1762,7 +1905,7 @@ with tab10:
                                     edgecolor="white", linewidth=0.5)
                     avg10 = vals.mean()
                     ax.axhline(avg10, color=C_AVG, linewidth=1.6, linestyle="--",
-                               label=f"Avg: {avg10:.1f}")
+                               label=f"Avg: {avg10:.2f}")
                     if ha_line > 0:
                         ax.axhline(ha_line, color=C_LINE, linewidth=1.6,
                                    linestyle="-", label=f"Line: {ha_line}")
@@ -1770,7 +1913,7 @@ with tab10:
                         if val > 0:
                             ax.text(bar.get_x() + bar.get_width() / 2,
                                     bar.get_height() + max(vals) * 0.02,
-                                    f"{int(val)}" if val == int(val) else f"{val:.1f}",
+                                    f"{int(val)}" if val == int(val) else f"{val:.2f}",
                                     ha="center", va="bottom", fontsize=7.5)
                     ax.set_title(label, fontsize=11, fontweight="bold")
                     ax.set_xlabel("Game #", fontsize=9)
@@ -1927,15 +2070,15 @@ with tab11:
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-                    col_disp.metric("Weighted Avg",     f"{s['w_avg']:.1f}")
-                    col_disp.metric("Last 3 Avg",       f"{s['last3']:.1f}")
-                    col_disp.metric("Season Avg",       f"{s['season_avg']:.1f}")
-                    col_disp.metric(f"{s['opponent']} Allows", f"{s['opp_allowed']:.1f}",
-                                     delta=f"{s['opp_allowed']-s['league_avg']:+.1f} vs league",
+                    col_disp.metric("Weighted Avg",     f"{s['w_avg']:.2f}")
+                    col_disp.metric("Last 3 Avg",       f"{s['last3']:.2f}")
+                    col_disp.metric("Season Avg",       f"{s['season_avg']:.2f}")
+                    col_disp.metric(f"{s['opponent']} Allows", f"{s['opp_allowed']:.2f}",
+                                     delta=f"{s['opp_allowed']-s['league_avg']:+.2f} vs league",
                                      delta_color="inverse")
                     col_disp.metric("Matchup Factor",   f"{s['matchup_factor']:.2f}x")
                     col_disp.metric("Form Boost",       f"{s['form_boost']:.2f}x")
-                    col_disp.metric("Final Score",      f"{s['final_score']:.1f}",
+                    col_disp.metric("Final Score",      f"{s['final_score']:.2f}",
                                      delta="START" if is_winner else "SIT",
                                      delta_color="normal" if is_winner else "inverse")
 
