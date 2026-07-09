@@ -1188,13 +1188,16 @@ with tab7:
                 return abs(odds) / (abs(odds) + 100)
 
         def prob_to_american(p: float) -> int:
-            """Convert probability (0-1) back to American odds."""
+            """Convert probability (0-1) back to American odds.
+            Clamps output so favourites never exceed -350 and underdogs never
+            exceed +350, keeping lines within a realistic sportsbook range.
+            """
             if p <= 0 or p >= 1:
                 return 0
             if p >= 0.5:
-                return -round((p / (1 - p)) * 100)
+                return max(-350, -round((p / (1 - p)) * 100))
             else:
-                return round(((1 - p) / p) * 100)
+                return min(350, round(((1 - p) / p) * 100))
 
         def parlay_payout(leg_odds: list[int], stake: float) -> float:
             """
@@ -1241,8 +1244,8 @@ with tab7:
             rec = "OVER" if w_avg > line else "UNDER"
             # implied prob: if bet OVER, use hit rate; if UNDER use (1 - hit rate)
             implied = w_hit if rec == "OVER" else 1 - w_hit
-            # cap between 5% and 95% to avoid extreme odds
-            implied = max(0.05, min(0.95, implied))
+            # cap between 22% and 78% → American odds stay within ±350
+            implied = max(0.222, min(0.778, implied))
 
             return {
                 "player":      pdf["player_name"].iloc[0],
