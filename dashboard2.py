@@ -12,8 +12,6 @@ Tabs
 5. Data Refresh    – scrape fresh data from the ESPN API without leaving the browser
 """
 
-import subprocess
-import sys
 import time
 
 import matplotlib.pyplot as plt
@@ -64,9 +62,9 @@ C_TREND = "#7c5cd8"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LIVE SCRAPE HELPERS  (used when CSVs are not on disk — e.g. Streamlit Cloud)
+# ESPN API HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-import re as _re, time as _time, requests as _requests, os as _os
+import re as _re, time as _time, requests as _requests
 
 _ESPN_SCOREBOARD = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
@@ -189,31 +187,26 @@ def _scrape_season_live(year, progress_text=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (cached — reads local CSVs or scrapes live on Streamlit Cloud)
+# DATA LOADING  (ESPN API only — cached for 1 hour so data stays fresh)
+# ttl=3600 means: first visitor triggers a scrape, everyone else for the next
+# hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
+# any new games that were played.
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
-    # Fast path: local CSVs exist (running on your own machine)
-    if _os.path.exists("nfl_2024_player_game_logs.csv") and \
-       _os.path.exists("nfl_2025_player_game_logs.csv"):
-        df_2024 = pd.read_csv("nfl_2024_player_game_logs.csv")
-        df_2025 = pd.read_csv("nfl_2025_player_game_logs.csv")
-    else:
-        # Cloud / first-run: scrape live from ESPN API.
-        # @st.cache_data ensures this only runs once per deployment session.
-        msg = st.empty()
-        msg.info("First load: scraping 2024 + 2025 data from ESPN (~5 min). "
-                 "This only happens once per session — subsequent loads use the cache.")
-        prog = st.empty()
-        df_2024 = _scrape_season_live(2024, prog)
-        df_2025 = _scrape_season_live(2025, prog)
-        prog.empty()
-        msg.empty()
-        if df_2024.empty or df_2025.empty:
-            raise RuntimeError(
-                "Live scrape returned no data. ESPN API may be temporarily unavailable — "
-                "try refreshing in a minute."
-            )
+    msg  = st.empty()
+    prog = st.empty()
+    msg.info("⏳ Loading data from ESPN API… this takes ~5 min on first load, "
+             "then caches for 1 hour.")
+    df_2024 = _scrape_season_live(2024, prog)
+    df_2025 = _scrape_season_live(2025, prog)
+    prog.empty()
+    msg.empty()
+    if df_2024.empty or df_2025.empty:
+        raise RuntimeError(
+            "ESPN API returned no data. It may be temporarily unavailable — "
+            "try refreshing the page in a minute."
+        )
 
     for df in [df_2024, df_2025]:
         df.columns = df.columns.str.lower().str.strip()
@@ -852,168 +845,54 @@ with tab4:
 # TAB 5 — DATA REFRESH
 # ══════════════════════════════════════════════════════════════════════════════
 with tab5:
-    import os
     import datetime as _dt
 
-    # ── helper: run a scraper command and stream output ───────────────────
-    def _run_scraper(cmd, spinner_msg):
-        log_area  = st.empty()
-        log_lines = []
-        with st.spinner(spinner_msg):
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            for line in proc.stdout:
-                log_lines.append(line.rstrip())
-                log_area.code("\n".join(log_lines[-40:]))
-            proc.wait()
-        return proc.returncode
+    st.subheader("🔄 Data Refresh")
+    st.markdown(
+        "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
+        "After 1 hour the cache expires and the next page load automatically "
+        "fetches the latest games — no action needed week-to-week."
+    )
 
-    # ── CSV status cards ──────────────────────────────────────────────────
-    def _csv_status():
-        for f in ["nfl_2024_player_game_logs.csv", "nfl_2025_player_game_logs.csv"]:
-            if os.path.exists(f):
-                year = f.split("_")[1]
-                size = os.path.getsize(f) / 1024
-                mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(f)))
-                # parse latest week from game_id column
-                try:
-                    df_tmp = pd.read_csv(f, usecols=["game_id"])
-                    latest_wk = int(
-                        df_tmp["game_id"].str.split("_", expand=True)[1]
-                        .dropna().astype(int).max()
-                    )
-                except Exception:
-                    latest_wk = "?"
-                st.success(
-                    f"✅ `{f}`  —  {size:.0f} KB  ·  latest week: **{latest_wk}**  ·  updated: {mtime}"
-                )
-            else:
-                st.error(f"❌ `{f}`  not found")
-
-    st.subheader("Data Management")
-
-    # ── top status row ────────────────────────────────────────────────────
-    _csv_status()
+    # ── Cache status ──────────────────────────────────────────────────────
     st.divider()
-
-    # ── three action columns ──────────────────────────────────────────────
-    a1, a2, a3 = st.columns(3)
-
-    # ── ACTION 1: Update new weeks only ──────────────────────────────────
-    with a1:
-        st.markdown("### 🔄 Update New Weeks")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### ℹ️ How it works")
+        st.markdown(
+            """
+- **First load of the day** → scrapes 2024 + 2025 from ESPN (~5 min)
+- **Everyone else within that hour** → instant load from cache
+- **After 1 hour** → cache expires, next visitor triggers a fresh scrape
+- **New games** appear automatically the next time the cache refreshes
+            """
+        )
+    with c2:
+        st.markdown("### ⚡ Manual Refresh")
         st.caption(
-            "Only fetches weeks not yet in your CSVs.  "
-            "Runs in **~1–2 min** during the season.  "
-            "Automatically skips during the offseason."
+            "Force a fresh scrape right now — useful after a big game "
+            "or if data looks out of date."
         )
-        update_year = st.radio(
-            "Season to update", ["Current season", "2025", "2024", "Both (2024+2025)"],
-            key="upd_year"
-        )
-        if st.button("▶ Update Now", type="primary", key="upd_go", use_container_width=True):
-            if update_year == "Both (2024+2025)":
-                cmd = [sys.executable, "scrape_nfl_data.py", "--update", "--year", "2024", "2025"]
-            elif update_year == "Current season":
-                cmd = [sys.executable, "scrape_nfl_data.py", "--update"]
-            else:
-                cmd = [sys.executable, "scrape_nfl_data.py", "--update", "--year", update_year]
-            rc = _run_scraper(cmd, "Checking for new weeks…")
-            if rc == 0:
-                st.success("✅ Done! Reloading data…")
-                st.cache_data.clear()
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.error("❌ Update failed — see log above.")
+        if data_ok:
+            season_counts = nfl_df.groupby("season")["game_id"].nunique()
+            for season, games in season_counts.items():
+                latest_wk = (
+                    nfl_df[nfl_df["season"] == season]["game_id"]
+                    .str.split("_", expand=True)[1]
+                    .dropna().astype(int).max()
+                )
+                st.success(
+                    f"✅ **{season}** — {games} games loaded  ·  latest week: **{latest_wk}**"
+                )
+            last_player_count = nfl_df["player_name"].nunique()
+            st.metric("Total Players", f"{last_player_count:,}")
 
-    # ── ACTION 2: Full re-scrape ──────────────────────────────────────────
-    with a2:
-        st.markdown("### 📥 Full Re-Scrape")
-        st.caption(
-            "Downloads all 18 weeks from scratch and overwrites the CSV.  "
-            "Use this once per season or if data looks wrong.  "
-            "Takes **~3–4 min per season**."
-        )
-        scrape_2024 = st.checkbox("Include 2024", value=False, key="full_2024")
-        scrape_2025 = st.checkbox("Include 2025", value=True,  key="full_2025")
-        if st.button("📥 Full Scrape", key="full_go", use_container_width=True):
-            years = []
-            if scrape_2024: years.append("2024")
-            if scrape_2025: years.append("2025")
-            if not years:
-                st.warning("Select at least one season.")
-            else:
-                cmd = [sys.executable, "scrape_nfl_data.py", "--year"] + years
-                rc  = _run_scraper(cmd, f"Full scrape of {', '.join(years)}…")
-                if rc == 0:
-                    st.success("✅ Done! Reloading data…")
-                    st.cache_data.clear()
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.error("❌ Scrape failed — see log above.")
-
-    # ── ACTION 3: Windows Task Scheduler setup ────────────────────────────
-    with a3:
-        st.markdown("### ⏰ Auto-Update Schedule")
-        st.caption(
-            "Set up Windows Task Scheduler to run the updater automatically "
-            "every Tuesday during the season — no manual action needed."
-        )
-        proj_dir   = os.path.abspath(".")
-        python_exe = sys.executable.replace("\\", "\\\\")
-        proj_esc   = proj_dir.replace("\\", "\\\\")
-
-        with st.expander("📋 Show setup instructions", expanded=False):
-            st.markdown(
-                f"""
-**One-time Windows Task Scheduler setup:**
-
-1. Open **Start Menu** → search **Task Scheduler** → open it
-2. Click **Create Basic Task** (right panel)
-3. Fill in:
-   - **Name:** `NFL Auto-Update`
-   - **Trigger:** Weekly → **Tuesday** at `10:00 AM`
-   - **Action:** Start a program
-   - **Program/script:**
-     ```
-     {sys.executable}
-     ```
-   - **Add arguments:**
-     ```
-     scrape_nfl_data.py --update
-     ```
-   - **Start in:**
-     ```
-     {proj_dir}
-     ```
-4. Click **Finish**
-
-That's it — every Tuesday morning it quietly fetches the latest week and appends it to your CSVs.
-The next time you open the dashboard it will load the fresh data automatically.
-
-> **Season awareness:** The `--update` flag automatically detects the offseason
-> (Feb–Aug) and does nothing, so you can leave the schedule running year-round.
-                """
-            )
-
-        # One-click PowerShell command to register the task
-        ps_cmd = (
-            f'$action = New-ScheduledTaskAction -Execute \\"{sys.executable}\\" '
-            f'-Argument \\"scrape_nfl_data.py --update\\" '
-            f'-WorkingDirectory \\"{proj_dir}\\"; '
-            f'$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Tuesday -At 10am; '
-            f'Register-ScheduledTask -TaskName \\"NFL Auto-Update\\" '
-            f'-Action $action -Trigger $trigger -RunLevel Highest -Force'
-        )
-        st.code(ps_cmd, language="powershell")
-        st.caption("Copy the command above into an **Admin PowerShell** window to register the task instantly.")
+        st.divider()
+        if st.button("🔄 Refresh Data Now", type="primary",
+                     use_container_width=True, key="api_refresh"):
+            st.cache_data.clear()
+            time.sleep(0.5)
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
