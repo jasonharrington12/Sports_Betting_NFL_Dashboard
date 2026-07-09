@@ -233,12 +233,18 @@ def load_data():
     team_changes = teams_2024.merge(teams_2025, on="player_name", how="inner")
     team_changes["changed_team"] = team_changes["team_2024"] != team_changes["team_2025"]
 
+    # Only flag changed_team=True for players who actually changed.
+    # Use outer merge so players only in 2025 (rookies) also get the column.
     df_2024 = df_2024.merge(
         team_changes[["player_name", "changed_team"]], on="player_name", how="left"
     )
     df_2024["changed_team"] = df_2024["changed_team"].fillna(False)
 
+    # Give 2025 rows the column too (always False — they're playing for their current team)
+    df_2025["changed_team"] = False
+
     nfl = pd.concat([df_2024, df_2025], ignore_index=True)
+    nfl["changed_team"] = nfl["changed_team"].fillna(False)
     nfl = nfl.sort_values(["player_name", "season", "game_id"]).reset_index(drop=True)
 
     # ── season weights ─────────────────────────────────────────────────────
