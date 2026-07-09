@@ -194,19 +194,33 @@ def _scrape_season_live(year, progress_text=None):
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
+    import datetime as _dt
+    # Auto-detect current and previous NFL season years.
+    # NFL seasons straddle two calendar years: the 2025 season runs Sep 2025–Jan 2026.
+    # Jan–Aug = still the previous season year; Sep–Dec = new season year.
+    _today = _dt.date.today()
+    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
+    _prev_year = _cur_year - 1
+
     msg  = st.empty()
     prog = st.empty()
-    msg.info("⏳ Loading data from ESPN API… this takes ~5 min on first load, "
-             "then caches for 1 hour.")
-    df_2024 = _scrape_season_live(2024, prog)
-    df_2025 = _scrape_season_live(2025, prog)
+    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API... "
+             "this takes ~5 min on first load, then caches for 1 hour.")
+    df_prev = _scrape_season_live(_prev_year, prog)
+    df_cur  = _scrape_season_live(_cur_year,  prog)
     prog.empty()
     msg.empty()
-    if df_2024.empty or df_2025.empty:
+
+    # Current season may be empty before it starts (offseason) — that's fine
+    if df_prev.empty and df_cur.empty:
         raise RuntimeError(
             "ESPN API returned no data. It may be temporarily unavailable — "
             "try refreshing the page in a minute."
         )
+
+    # Use whichever frames have data
+    df_2024 = df_prev if not df_prev.empty else pd.DataFrame(columns=df_cur.columns)
+    df_2025 = df_cur  if not df_cur.empty  else pd.DataFrame(columns=df_prev.columns)
 
     for df in [df_2024, df_2025]:
         df.columns = df.columns.str.lower().str.strip()
