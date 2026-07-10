@@ -1626,12 +1626,36 @@ with tab8:
                         p_2025 = p_df[p_df["season"] == 2025]
                         last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg
 
-                        # Suggested line = midpoint of player avg and opp allows
-                        # This is what a sportsbook might set
-                        suggested_line = round((player_avg + def_avg) / 2 / 5) * 5 - 0.5
+                        # ── Realistic sportsbook line ─────────────────────────
+                        # Pick the closest standard increment used by books,
+                        # biased slightly toward the matchup-adjusted projection.
+                        proj = player_avg * matchup_factor
+                        if col == "passing_yards":
+                            increments = [i + 0.5 for i in range(50, 500, 25)]
+                        elif col in ("rush_yards", "receiving_yards"):
+                            increments = [i + 0.5 for i in range(0, 250, 10)]
+                        elif col == "receptions":
+                            increments = [i + 0.5 for i in range(0, 20, 1)]
+                        elif col == "passing_tds":
+                            increments = [0.5, 1.5, 2.5, 3.5]
+                        else:  # fantasy points
+                            increments = [i + 0.5 for i in range(0, 60, 5)]
 
-                        rec = "OVER" if player_avg * matchup_factor > suggested_line else "UNDER"
-                        confidence = abs(player_avg * matchup_factor - suggested_line)
+                        suggested_line = min(increments, key=lambda x: abs(x - proj))
+
+                        rec = "OVER" if proj > suggested_line else "UNDER"
+                        confidence = abs(proj - suggested_line)
+
+                        # Implied odds: hit-rate of player vs this line weighted
+                        p_vals = p_df[col].values
+                        hit_rate = float((p_vals > suggested_line).mean()) if len(p_vals) else 0.5
+                        implied = hit_rate if rec == "OVER" else 1 - hit_rate
+                        implied = max(0.222, min(0.778, implied))
+                        raw_odds = -round((implied / (1 - implied)) * 100) if implied >= 0.5 \
+                                   else round(((1 - implied) / implied) * 100)
+                        # clamp to ±350
+                        american = max(-350, raw_odds) if raw_odds < 0 else min(350, raw_odds)
+                        odds_str = f"{american:+d}"
 
                         prop_rows.append({
                             "Game":         f"{away} @ {home}",
@@ -1647,6 +1671,7 @@ with tab8:
                             "Matchup":      matchup_grade,
                             "Suggested Line": suggested_line,
                             "Pick":         rec,
+                            "Odds":         odds_str,
                             "_conf":        confidence,
                         })
 
@@ -1667,7 +1692,8 @@ with tab8:
                             f'padding:10px 14px;background:#f7f8fa;border-radius:6px;'
                             f'margin-bottom:8px;">'
                             f'<b>{r["Player"]}</b> ({r["Offense"]}) &nbsp;|&nbsp; '
-                            f'<b>{col_label} {r["Pick"]} {r["Suggested Line"]}</b>'
+                            f'<b>{col_label} {r["Pick"]} {r["Suggested Line"]}</b> '
+                            f'<span style="color:#3b82d4;font-weight:600;">({r["Odds"]})</span>'
                             f'&nbsp;&nbsp;·&nbsp;&nbsp;'
                             f'vs {r["Defense"]} {r["Matchup"]} (allows {r["Def Allows"]:.2f}/gm)'
                             f'&nbsp;&nbsp;·&nbsp;&nbsp;'
