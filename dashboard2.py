@@ -1603,7 +1603,7 @@ with tab8:
         def fetch_this_weeks_games():
             """
             Finds the current/next NFL week and returns a list of upcoming
-            (unplayed) games as {home, away, date} dicts.
+            (unplayed) games as {home, away, date, espn_id} dicts.
             Falls back to most recent completed week if offseason.
             """
             import datetime as _dt
@@ -1631,12 +1631,13 @@ with tab8:
                              for c in comp["competitors"]}
                     game_date = e["date"][:10]
                     entry = {
-                        "home": teams.get("home", "UNK"),
-                        "away": teams.get("away", "UNK"),
-                        "date": game_date,
-                        "week": week,
+                        "home":     teams.get("home", "UNK"),
+                        "away":     teams.get("away", "UNK"),
+                        "date":     game_date,
+                        "week":     week,
                         "completed": done,
-                        "name": e.get("shortName", e.get("name", "")),
+                        "name":     e.get("shortName", e.get("name", "")),
+                        "espn_id":  e.get("id", ""),
                     }
                     if not done:
                         upcoming.append(entry)
@@ -1644,6 +1645,37 @@ with tab8:
                         last_completed.append(entry)
 
             return upcoming if upcoming else last_completed[-16:]  # offseason fallback
+
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def fetch_game_odds(espn_id: str) -> dict:
+            """
+            Pull game-level odds (spread + over/under) from ESPN's free
+            odds endpoint for a single game event ID.
+            Returns a dict with keys: over_under, home_spread, away_spread,
+            book_name.  All values are None if not available.
+            """
+            url = (
+                f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
+                f"/events/{espn_id}/competitions/{espn_id}/odds"
+            )
+            data = _get_json(url)
+            result = {"over_under": None, "home_spread": None,
+                      "away_spread": None, "book_name": None}
+            if not data:
+                return result
+            # ESPN returns a list of odds providers; take the first (consensus)
+            items = data.get("items", [])
+            if not items:
+                return result
+            provider = items[0]
+            result["book_name"]   = provider.get("provider", {}).get("name", "ESPN")
+            result["over_under"]  = provider.get("overUnder")
+            result["home_spread"] = provider.get("homeTeamOdds", {}).get("spreadOdds")
+            result["away_spread"] = provider.get("awayTeamOdds", {}).get("spreadOdds")
+            # spreadOdds is a signed float, e.g. -3.5; try "spread" key as fallback
+            if result["home_spread"] is None:
+                result["home_spread"] = provider.get("spread")
+            return result
 
         # ── build defensive stats table ───────────────────────────────────────
         nfl_def = build_defense_table(nfl_df)
@@ -1688,9 +1720,16 @@ with tab8:
             def_avgs  = dict(zip(def_agg["opponent"], def_agg["avg_allowed"]))
             total_teams = len(def_agg)
 
-            # Fetch schedule
-            with st.spinner("Fetching this week's schedule from ESPN..."):
+            # Fetch schedule + odds
+            with st.spinner("Fetching this week's schedule and odds from ESPN..."):
                 games = fetch_this_weeks_games()
+                # Pull odds for each game (cached per game ID)
+                for g in games:
+                    if g.get("espn_id"):
+                        g["odds"] = fetch_game_odds(g["espn_id"])
+                    else:
+                        g["odds"] = {"over_under": None, "home_spread": None,
+                                     "away_spread": None, "book_name": None}
 
             if not games:
                 st.warning("No schedule data available. ESPN API may be temporarily unavailable.")
@@ -1698,7 +1737,29 @@ with tab8:
                 is_upcoming = any(not g["completed"] for g in games)
                 week_num    = games[0]["week"]
                 label       = f"Week {week_num} Upcoming Games" if is_upcoming else f"Week {week_num} (Most Recent — Offseason)"
-                st.markdown(f"**{label}** — {len(games)} games")
+
+                # ── Game odds summary cards ───────────────────────────────────
+                ou_games = [g for g in games if g["odds"].get("over_under")]
+                if ou_games:
+                    st.markdown(f"**{label}** — {len(games)} games  ·  "
+                                f"O/U lines from ESPN")
+                    ou_cols = st.columns(min(len(ou_games), 4))
+                    for i, g in enumerate(ou_games[:8]):
+                        ou  = g["odds"]["over_under"]
+                        spd = g["odds"]["home_spread"]
+                        spd_str = f"  ·  Spread: {spd:+.1f}" if spd is not None else ""
+                        col_idx = i % min(len(ou_games), 4)
+                        ou_cols[col_idx].markdown(
+                            f'<div style="background:#f7f8fa;border:1px solid #e5e7eb;'
+                            f'border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:12px;">'
+                            f'<b>{g["away"]} @ {g["home"]}</b><br>'
+                            f'<span style="color:#3b82d4;font-weight:700;">O/U {ou}</span>'
+                            f'{spd_str}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    st.divider()
+                else:
+                    st.markdown(f"**{label}** — {len(games)} games")
 
                 # ── Per-game prop suggestions ─────────────────────────────────
                 prop_rows = []
@@ -1783,16 +1844,18 @@ with tab8:
                         american = max(-350, raw_odds) if raw_odds < 0 else min(350, raw_odds)
                         odds_str = f"{american:+d}"
 
+                        ou = game["odds"].get("over_under")
                         prop_rows.append({
                             "Game":         f"{away} @ {home}",
                             "Date":         game["date"],
+                            "Game O/U":     f"{ou}" if ou else "—",
                             "Offense":      offense_team,
                             "Defense":      defense_team,
                             "Player":       best["player_name"],
                             "Stat":         col_label,
-                            "Player Avg":   round(player_avg, 2),
-                            "Last 3 Avg":   round(last3, 2),
-                            "Def Allows":   round(def_avg, 2),
+                            "Player Avg":   round(player_avg, 1),
+                            "Last 3 Avg":   round(last3, 1),
+                            "Def Allows":   round(def_avg, 1),
                             "Def Rank":     f"#{def_rank}",
                             "Matchup":      matchup_grade,
                             "Suggested Line": suggested_line,
@@ -1813,6 +1876,7 @@ with tab8:
 
                     for _, r in top5.iterrows():
                         pick_color = "#2DC653" if r["Pick"] == "OVER" else "#D62828"
+                        ou_str = f'&nbsp;&nbsp;·&nbsp;&nbsp;Game O/U: <b>{r["Game O/U"]}</b>' if r["Game O/U"] != "—" else ""
                         st.markdown(
                             f'<div style="border-left:5px solid {pick_color};'
                             f'padding:10px 14px;background:#f7f8fa;border-radius:6px;'
@@ -1824,6 +1888,7 @@ with tab8:
                             f'vs {r["Defense"]} {r["Matchup"]} (allows {r["Def Allows"]:.1f}/gm)'
                             f'&nbsp;&nbsp;·&nbsp;&nbsp;'
                             f'Player avg: {r["Player Avg"]:.1f} &nbsp;|&nbsp; Last 3: {r["Last 3 Avg"]:.1f}'
+                            f'{ou_str}'
                             f'</div>',
                             unsafe_allow_html=True,
                         )
