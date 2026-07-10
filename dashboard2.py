@@ -548,404 +548,505 @@ with st.spinner("Loading data…"):
 # ──────────────────────────────────────────────────────────────────────────────
 # TABS
 # ──────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-    "📊 Prop Analyzer",
-    "👤 Player Profile",
-    "🏟️ Team Overview",
-    "🏆 League Leaders",
-    "🔄 Data Refresh",
-    "🆚 Matchup Edge",
-    "🎰 Parlay Builder",
-    "🎯 Matchup Finder",
-    "🚑 Injury Report",
-    "🏠 Home/Away Splits",
-    "🏆 Start/Sit Advisor",
+main_bet, main_players, main_teams, main_settings = st.tabs([
+    "🎯 Betting Tools",
+    "👤 Players",
+    "🏟️ Teams & League",
+    "⚙️ Settings & Data",
 ])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — PROP ANALYZER
+# MAIN TAB 1 — BETTING TOOLS
+# Sub-tabs: Prop Analyzer · Matchup Edge · Matchup Finder · Parlay Builder · Streak Finder
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+with main_bet:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        all_players = sorted(nfl_df["player_name"].unique())
+        tab1, tab6, tab8, tab7, tab_streak = st.tabs([
+            "📊 Prop Analyzer",
+            "🆚 Matchup Edge",
+            "🎯 Matchup Finder",
+            "🎰 Parlay Builder",
+            "🔥 Streak Finder",
+        ])
 
-        c_left, c_right = st.columns([1, 3])
-        with c_left:
-            st.subheader("Controls")
-            player_sel = st.selectbox(
-                "Player", all_players,
-                index=all_players.index("Drake Maye") if "Drake Maye" in all_players else 0,
-                key="pa_player",
-            )
-            cat_sel = st.selectbox(
-                "Stat Category", list(CAT_MAP.keys()),
-                format_func=str.title, key="pa_cat",
-            )
-            line_val = st.number_input(
-                "Prop Line", min_value=0.0, value=200.5, step=0.5,
-                format="%.1f", key="pa_line",
-            )
-            weighted = st.toggle("Season Weighting", value=True,
-                                 help="2025 × 1.0 · 2024 × 0.6 · team-changer × 0.3")
-            game_window = st.radio(
-                "Game Window",
-                options=["Last 3", "Last 5", "Season"],
-                index=2,
-                horizontal=True,
-                help="Limit analysis and chart to the most recent N games.",
-                key="pa_window",
-            )
-            go = st.button("Analyze", type="primary", use_container_width=True, key="pa_go")
+        # ── PROP ANALYZER ────────────────────────────────────────────────────
+        with tab1:
+            all_players = sorted(nfl_df["player_name"].unique())
+            c_left, c_right = st.columns([1, 3])
+            with c_left:
+                st.subheader("Controls")
+                player_sel = st.selectbox(
+                    "Player", all_players,
+                    index=all_players.index("Drake Maye") if "Drake Maye" in all_players else 0,
+                    key="pa_player",
+                )
+                cat_sel = st.selectbox(
+                    "Stat Category", list(CAT_MAP.keys()),
+                    format_func=str.title, key="pa_cat",
+                )
+                line_val = st.number_input(
+                    "Prop Line", min_value=0.0, value=200.5, step=0.5,
+                    format="%.1f", key="pa_line",
+                )
+                weighted = st.toggle("Season Weighting", value=True,
+                                     help="2025 × 1.0 · 2024 × 0.6 · team-changer × 0.3")
+                game_window = st.radio(
+                    "Game Window",
+                    options=["Last 3", "Last 5", "Season"],
+                    index=2,
+                    horizontal=True,
+                    help="Limit analysis and chart to the most recent N games.",
+                    key="pa_window",
+                )
+                go = st.button("Analyze", type="primary", use_container_width=True, key="pa_go")
 
-            st.divider()
-            st.caption("**Dataset**")
-            st.metric("Rows",    f"{len(nfl_df):,}")
-            st.metric("Players", f"{nfl_df['player_name'].nunique():,}")
-            st.metric("Team Changes", int(team_changes["changed_team"].sum()))
+                st.divider()
+                st.caption("**Dataset**")
+                st.metric("Rows",    f"{len(nfl_df):,}")
+                st.metric("Players", f"{nfl_df['player_name'].nunique():,}")
+                st.metric("Team Changes", int(team_changes["changed_team"].sum()))
 
-        with c_right:
-            if go:
-                res = prop_analysis(nfl_df, player_sel, cat_sel, line_val, weighted, game_window)
-                if res is None:
-                    st.error("Player not found.")
-                else:
-                    if res["changed"]:
-                        st.warning(
-                            f"⚠️ Team change: **{res['team_24']}** (2024) → "
-                            f"**{res['team_25']}** (2025) — 2024 weight = {res['weight_label']}"
+            with c_right:
+                if go:
+                    res = prop_analysis(nfl_df, player_sel, cat_sel, line_val, weighted, game_window)
+                    if res is None:
+                        st.error("Player not found.")
+                    else:
+                        if res["changed"]:
+                            st.warning(
+                                f"⚠️ Team change: **{res['team_24']}** (2024) → "
+                                f"**{res['team_25']}** (2025) — 2024 weight = {res['weight_label']}"
+                            )
+
+                        rec = res["recommendation"]
+                        color = "#2DC653" if rec == "OVER" else "#D62828"
+                        st.markdown(
+                            f'<div style="background:{color};color:#fff;padding:14px 20px;'
+                            f'border-radius:8px;font-size:22px;font-weight:700;'
+                            f'text-align:center;margin-bottom:16px;">'
+                            f'Suggested Bet: {rec} &nbsp;{line_val}</div>',
+                            unsafe_allow_html=True,
                         )
 
-                    rec = res["recommendation"]
-                    color = "#2DC653" if rec == "OVER" else "#D62828"
-                    st.markdown(
-                        f'<div style="background:{color};color:#fff;padding:14px 20px;'
-                        f'border-radius:8px;font-size:22px;font-weight:700;'
-                        f'text-align:center;margin-bottom:16px;">'
-                        f'Suggested Bet: {rec} &nbsp;{line_val}</div>',
-                        unsafe_allow_html=True,
-                    )
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Weighted Avg",      f"{res['w_avg']:.1f}",
+                                  help=f"Weighted avg over {res['window_label']} ({res['window_games']} games)")
+                        m2.metric("Weighted Hit Rate", f"{res['w_hit']:.1f}%",
+                                  help=f"Hit rate over {res['window_label']} ({res['window_games']} games)")
+                        m3.metric(f"{res['window_label']} Avg", f"{res['window_avg']:.1f}",
+                                  help=f"Simple avg over {res['window_label']} ({res['window_games']} games)")
+                        m4.metric("Std Deviation",     f"{res['std_dev']:.1f}",
+                                  help=f"Std dev over {res['window_label']} ({res['window_games']} games)")
 
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Weighted Avg",      f"{res['w_avg']:.2f}",
-                              help=f"Weighted avg over {res['window_label']} ({res['window_games']} games)")
-                    m2.metric("Weighted Hit Rate", f"{res['w_hit']:.1f}%",
-                              help=f"Hit rate over {res['window_label']} ({res['window_games']} games)")
-                    m3.metric(f"{res['window_label']} Avg", f"{res['window_avg']:.2f}",
-                              help=f"Simple avg over {res['window_label']} ({res['window_games']} games)")
-                    m4.metric("Std Deviation",     f"{res['std_dev']:.2f}",
-                              help=f"Std dev over {res['window_label']} ({res['window_games']} games)")
+                        st.subheader("Season Split")
+                        split_rows = []
+                        if res["hr_2025"] is not None:
+                            split_rows.append({
+                                "Season": "2025",
+                                "Hit Rate": f"{res['hr_2025']:.1f}%",
+                                "Over / Total": f"{int(res['over_2025'])} / {res['total_2025']}",
+                                "Average": f"{res['avg_2025']:.1f}",
+                                "Weight": "1.0",
+                            })
+                        if res["hr_2024"] is not None:
+                            split_rows.append({
+                                "Season": "2024",
+                                "Hit Rate": f"{res['hr_2024']:.1f}%",
+                                "Over / Total": f"{int(res['over_2024'])} / {res['total_2024']}",
+                                "Average": f"{res['avg_2024']:.1f}",
+                                "Weight": res["weight_label"],
+                            })
+                        if split_rows:
+                            st.dataframe(pd.DataFrame(split_rows),
+                                         use_container_width=True, hide_index=True)
 
-                    st.subheader("Season Split")
-                    split_rows = []
-                    if res["hr_2025"] is not None:
-                        split_rows.append({
-                            "Season": "2025",
-                            "Hit Rate": f"{res['hr_2025']:.1f}%",
-                            "Over / Total": f"{int(res['over_2025'])} / {res['total_2025']}",
-                            "Average": f"{res['avg_2025']:.2f}",
-                            "Weight": "1.0",
-                        })
-                    if res["hr_2024"] is not None:
-                        split_rows.append({
-                            "Season": "2024",
-                            "Hit Rate": f"{res['hr_2024']:.1f}%",
-                            "Over / Total": f"{int(res['over_2024'])} / {res['total_2024']}",
-                            "Average": f"{res['avg_2024']:.2f}",
-                            "Weight": res["weight_label"],
-                        })
-                    if split_rows:
-                        st.dataframe(pd.DataFrame(split_rows),
-                                     use_container_width=True, hide_index=True)
-
-                    st.subheader("Week-by-Week Chart")
-                    fig = bar_chart(nfl_df, player_sel, cat_sel, line=line_val, game_window=game_window)
-                    if fig:
-                        st.pyplot(fig, use_container_width=True)
-                        plt.close(fig)
-            else:
-                st.info("👈 Set your controls and click **Analyze**.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — PLAYER PROFILE
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
-    else:
-        all_players2 = sorted(nfl_df["player_name"].unique())
-
-        col_a, col_b = st.columns([1, 4])
-        with col_a:
-            st.subheader("Player")
-            pp_player = st.selectbox(
-                "Select player", all_players2,
-                index=all_players2.index("Drake Maye") if "Drake Maye" in all_players2 else 0,
-                key="pp_player",
-            )
-            pp_cat = st.selectbox(
-                "Trend stat", list(CAT_MAP.keys()),
-                format_func=str.title, key="pp_cat",
-            )
-            pp_season = st.radio("Season filter", ["Both", "2024", "2025"], key="pp_season")
-
-        with col_b:
-            pdf = find_player(nfl_df, pp_player)
-            if pdf.empty:
-                st.error("Player not found.")
-            else:
-                full = pdf["player_name"].iloc[0]
-                team = pdf.sort_values("game_id")["team"].iloc[-1]
-                p24  = pdf[pdf["season"] == 2024]
-                p25  = pdf[pdf["season"] == 2025]
-
-                # ── header metrics ─────────────────────────────────────
-                st.subheader(f"{full}  ·  {team}")
-                h1, h2, h3, h4, h5 = st.columns(5)
-                h1.metric("Games (2025)", len(p25))
-                h2.metric("Games (2024)", len(p24))
-                h3.metric("2025 Avg Fantasy", f"{p25['fantasy_points'].mean():.2f}" if not p25.empty else "—")
-                h4.metric("2024 Avg Fantasy", f"{p24['fantasy_points'].mean():.2f}" if not p24.empty else "—")
-                changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
-                h5.metric("Team Change", "Yes ⚠️" if changed else "No")
-
-                # ── trend chart ────────────────────────────────────────
-                st.subheader(f"{CAT_MAP[pp_cat.lower()][1]} — All Games Trend")
-                fig2 = trend_chart(nfl_df, pp_player, pp_cat)
-                if fig2:
-                    st.pyplot(fig2, use_container_width=True)
-                    plt.close(fig2)
-
-                # ── game log table ─────────────────────────────────────
-                st.subheader("Game Log")
-                if pp_season == "2024":
-                    log_df = p24.copy()
-                elif pp_season == "2025":
-                    log_df = p25.copy()
+                        st.subheader("Week-by-Week Chart")
+                        fig = bar_chart(nfl_df, player_sel, cat_sel, line=line_val, game_window=game_window)
+                        if fig:
+                            st.pyplot(fig, use_container_width=True)
+                            plt.close(fig)
                 else:
-                    log_df = pdf.copy()
+                    st.info("👈 Set your controls and click **Analyze**.")
 
-                display_cols = [
-                    "season", "game_id", "team",
-                    "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
-                    "rush_attempts", "rush_yards", "rush_tds",
-                    "receptions", "targets", "receiving_yards", "receiving_tds",
-                    "fantasy_points",
-                ]
-                display_cols = [c for c in display_cols if c in log_df.columns]
-                st.dataframe(
-                    log_df[display_cols].reset_index(drop=True),
-                    use_container_width=True, hide_index=True,
-                )
+        # ── MATCHUP EDGE (formerly tab6) — content block follows below ───────
+        with tab6:
+            pass  # filled in below
+
+        # ── MATCHUP FINDER (formerly tab8) — content block follows below ─────
+        with tab8:
+            pass  # filled in below
+
+        # ── PARLAY BUILDER (formerly tab7) — content block follows below ─────
+        with tab7:
+            pass  # filled in below
+
+        # ── STREAK FINDER ────────────────────────────────────────────────────
+        with tab_streak:
+            st.subheader("🔥 Streak Finder")
+            st.caption("Find players on the longest active over/under streak for any prop line.")
+
+            sf_c1, sf_c2 = st.columns([1, 3])
+            with sf_c1:
+                sf_cat    = st.selectbox("Stat Category", list(CAT_MAP.keys()),
+                                          format_func=str.title, key="sf_cat")
+                sf_line   = st.number_input("Prop Line", min_value=0.0, value=65.5,
+                                             step=0.5, format="%.1f", key="sf_line")
+                sf_dir    = st.radio("Streak Direction", ["Over", "Under"], horizontal=True,
+                                      key="sf_dir")
+                sf_season = st.radio("Season", [2025, 2024, "Both"], key="sf_season")
+                sf_min    = st.number_input("Min streak length", min_value=1, value=2,
+                                             step=1, key="sf_min")
+                sf_top    = st.slider("Show top N players", 5, 30, 15, key="sf_top")
+
+            with sf_c2:
+                sf_col = CAT_MAP[sf_cat.lower()][0]
+
+                if sf_season == "Both":
+                    sf_df = nfl_df.copy()
+                else:
+                    sf_df = nfl_df[nfl_df["season"] == int(sf_season)].copy()
+
+                def calc_streak(series, line, direction):
+                    """Return current active streak length (+ = ongoing, 0 = broken last game)."""
+                    vals = series.values
+                    streak = 0
+                    for v in reversed(vals):
+                        hit = (v > line) if direction == "Over" else (v < line)
+                        if hit:
+                            streak += 1
+                        else:
+                            break
+                    return streak
+
+                streak_rows = []
+                for player, grp in sf_df.sort_values(["player_name", "game_id"]).groupby("player_name"):
+                    s = calc_streak(grp[sf_col], sf_line, sf_dir)
+                    if s >= sf_min:
+                        recent_avg = grp[sf_col].tail(s).mean()
+                        season_avg = grp[sf_col].mean()
+                        streak_rows.append({
+                            "Player":      player,
+                            "Team":        grp["team"].iloc[-1],
+                            "Streak":      s,
+                            "Avg During Streak": round(recent_avg, 1),
+                            "Season Avg":  round(season_avg, 1),
+                            "Prop Line":   sf_line,
+                            "Direction":   sf_dir,
+                        })
+
+                if not streak_rows:
+                    st.info(f"No players found with a {sf_min}+ game {sf_dir} streak on {sf_cat.title()} {sf_line}.")
+                else:
+                    streak_df = (
+                        pd.DataFrame(streak_rows)
+                        .sort_values("Streak", ascending=False)
+                        .head(sf_top)
+                        .reset_index(drop=True)
+                    )
+                    streak_df.index = range(1, len(streak_df) + 1)
+
+                    st.markdown(
+                        f"**{len(streak_rows)} players** with an active {sf_dir} streak "
+                        f"≥ {sf_min} games on **{sf_cat.title()} {sf_line}** — showing top {sf_top}."
+                    )
+                    st.dataframe(streak_df, use_container_width=True)
+
+                    # Bar chart of streak lengths
+                    fig_s, ax_s = plt.subplots(figsize=(9, max(3, len(streak_df) * 0.45)))
+                    bar_c_s = C_OVER if sf_dir == "Over" else C_LINE
+                    bars_s = ax_s.barh(
+                        streak_df["Player"][::-1], streak_df["Streak"][::-1],
+                        color=bar_c_s, alpha=0.85, edgecolor="white", linewidth=0.4,
+                    )
+                    for bar, row in zip(bars_s, streak_df.iloc[::-1].itertuples()):
+                        ax_s.text(
+                            bar.get_width() + 0.1,
+                            bar.get_y() + bar.get_height() / 2,
+                            f"{row.Streak}g · avg {row._4:.1f}",
+                            va="center", fontsize=8,
+                        )
+                    ax_s.set_xlabel("Active Streak (games)", fontsize=9)
+                    ax_s.set_title(
+                        f"Active {sf_dir} Streaks — {sf_cat.title()} {sf_line}",
+                        fontsize=11, fontweight="bold",
+                    )
+                    ax_s.spines["top"].set_visible(False)
+                    ax_s.spines["right"].set_visible(False)
+                    ax_s.grid(axis="x", linestyle="--", alpha=0.35)
+                    plt.tight_layout()
+                    st.pyplot(fig_s, use_container_width=True)
+                    plt.close(fig_s)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — TEAM OVERVIEW
+# MAIN TAB 2 — PLAYERS
+# Sub-tabs: Player Profile · League Leaders · Home/Away Splits · Start/Sit Advisor
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+with main_players:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        t_col1, t_col2 = st.columns([1, 3])
-        with t_col1:
-            st.subheader("Filters")
-            to_season = st.radio("Season", [2025, 2024], key="to_season")
-            to_stat   = st.selectbox(
-                "Stat to chart", list(LEADER_COLS.keys()), key="to_stat"
-            )
-            to_team   = st.selectbox(
-                "Team spotlight",
-                ["All"] + sorted(nfl_df["team"].unique().tolist()),
-                key="to_team",
-            )
+        tab2, tab4, tab10, tab11 = st.tabs([
+            "👤 Player Profile",
+            "🏆 League Leaders",
+            "🏠 Home/Away Splits",
+            "🏆 Start/Sit Advisor",
+        ])
 
-        with t_col2:
-            stat_col   = LEADER_COLS[to_stat]
-            stat_label = to_stat
-
-            # ── team bar chart ─────────────────────────────────────────
-            fig3 = team_bar_chart(nfl_df, to_season, stat_col, stat_label)
-            st.pyplot(fig3, use_container_width=True)
-            plt.close(fig3)
-
-            # ── top 10 players for selected team ──────────────────────
-            season_df = nfl_df[nfl_df["season"] == to_season]
-            if to_team != "All":
-                season_df = season_df[season_df["team"] == to_team]
-
-            st.subheader(
-                f"Top 15 Players — {to_stat} ({to_season}"
-                + (f" · {to_team}" if to_team != "All" else "") + ")"
-            )
-            top_players = (
-                season_df.groupby("player_name")[stat_col]
-                .mean()
-                .sort_values(ascending=False)
-                .head(15)
-                .reset_index()
-                .rename(columns={"player_name": "Player", stat_col: f"Avg {to_stat}"})
-            )
-            top_players[f"Avg {to_stat}"] = top_players[f"Avg {to_stat}"].round(2)
-            st.dataframe(top_players, use_container_width=True, hide_index=True)
-
-            # ── team summary table ─────────────────────────────────────
-            st.subheader(f"Team Summary — {to_season}")
-            team_summary = (
-                nfl_df[nfl_df["season"] == to_season]
-                .groupby("team")
-                .agg(
-                    Games=("game_id", "nunique"),
-                    Players=("player_name", "nunique"),
-                    Avg_Fantasy=("fantasy_points", "mean"),
-                    Avg_Pass_Yds=("passing_yards", "mean"),
-                    Avg_Rush_Yds=("rush_yards", "mean"),
-                    Avg_Rec_Yds=("receiving_yards", "mean"),
+        # ── PLAYER PROFILE ────────────────────────────────────────────────────
+        with tab2:
+            all_players2 = sorted(nfl_df["player_name"].unique())
+            col_a, col_b = st.columns([1, 4])
+            with col_a:
+                st.subheader("Player")
+                pp_player = st.selectbox(
+                    "Select player", all_players2,
+                    index=all_players2.index("Drake Maye") if "Drake Maye" in all_players2 else 0,
+                    key="pp_player",
                 )
-                .round(1)
-                .sort_values("Avg_Fantasy", ascending=False)
-                .reset_index()
-                .rename(columns={"team": "Team"})
-            )
-            st.dataframe(team_summary, use_container_width=True, hide_index=True)
+                pp_cat = st.selectbox(
+                    "Trend stat", list(CAT_MAP.keys()),
+                    format_func=str.title, key="pp_cat",
+                )
+                pp_season = st.radio("Season filter", ["Both", "2024", "2025"], key="pp_season")
+
+            with col_b:
+                pdf = find_player(nfl_df, pp_player)
+                if pdf.empty:
+                    st.error("Player not found.")
+                else:
+                    full = pdf["player_name"].iloc[0]
+                    team = pdf.sort_values("game_id")["team"].iloc[-1]
+                    p24  = pdf[pdf["season"] == 2024]
+                    p25  = pdf[pdf["season"] == 2025]
+
+                    st.subheader(f"{full}  ·  {team}")
+                    h1, h2, h3, h4, h5 = st.columns(5)
+                    h1.metric("Games (2025)", len(p25))
+                    h2.metric("Games (2024)", len(p24))
+                    h3.metric("2025 Avg Fantasy", f"{p25['fantasy_points'].mean():.1f}" if not p25.empty else "—")
+                    h4.metric("2024 Avg Fantasy", f"{p24['fantasy_points'].mean():.1f}" if not p24.empty else "—")
+                    changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
+                    h5.metric("Team Change", "Yes ⚠️" if changed else "No")
+
+                    st.subheader(f"{CAT_MAP[pp_cat.lower()][1]} — All Games Trend")
+                    fig2 = trend_chart(nfl_df, pp_player, pp_cat)
+                    if fig2:
+                        st.pyplot(fig2, use_container_width=True)
+                        plt.close(fig2)
+
+                    st.subheader("Game Log")
+                    if pp_season == "2024":
+                        log_df = p24.copy()
+                    elif pp_season == "2025":
+                        log_df = p25.copy()
+                    else:
+                        log_df = pdf.copy()
+
+                    display_cols = [
+                        "season", "game_id", "team",
+                        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
+                        "rush_attempts", "rush_yards", "rush_tds",
+                        "receptions", "targets", "receiving_yards", "receiving_tds",
+                        "fantasy_points",
+                    ]
+                    display_cols = [c for c in display_cols if c in log_df.columns]
+                    st.dataframe(log_df[display_cols].reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+
+        # ── LEAGUE LEADERS ────────────────────────────────────────────────────
+        with tab4:
+            ll_col1, ll_col2 = st.columns([1, 3])
+            with ll_col1:
+                st.subheader("Filters")
+                ll_season = st.radio("Season", ["2025", "2024", "Both"], key="ll_season")
+                ll_stat   = st.selectbox("Stat", list(LEADER_COLS.keys()), key="ll_stat")
+                ll_agg    = st.radio("Aggregate by", ["Average", "Total"], key="ll_agg")
+                ll_min    = st.number_input("Min games played", min_value=1, value=4, step=1, key="ll_min")
+                ll_top    = st.slider("Show top N", 10, 50, 25, key="ll_top")
+
+            with ll_col2:
+                stat_col = LEADER_COLS[ll_stat]
+                if ll_season == "Both":
+                    ll_df = nfl_df.copy()
+                else:
+                    ll_df = nfl_df[nfl_df["season"] == int(ll_season)].copy()
+
+                games_per_player = ll_df.groupby("player_name")["game_id"].count()
+                eligible = games_per_player[games_per_player >= ll_min].index
+                ll_df = ll_df[ll_df["player_name"].isin(eligible)]
+
+                if ll_agg == "Average":
+                    leaders = (ll_df.groupby("player_name")[stat_col].mean()
+                               .sort_values(ascending=False).head(ll_top).reset_index())
+                    val_label = f"Avg {ll_stat}"
+                else:
+                    leaders = (ll_df.groupby("player_name")[stat_col].sum()
+                               .sort_values(ascending=False).head(ll_top).reset_index())
+                    val_label = f"Total {ll_stat}"
+
+                leaders.columns = ["Player", val_label]
+                leaders[val_label] = leaders[val_label].round(1)
+                leaders.index = range(1, len(leaders) + 1)
+
+                st.subheader(f"Top {ll_top} — {val_label}  ({ll_season})")
+
+                fig4, ax4 = plt.subplots(figsize=(9, max(4, len(leaders) * 0.35)))
+                bar_color = C_2025 if ll_season == "2025" else (C_2024 if ll_season == "2024" else C_TREND)
+                bars4 = ax4.barh(leaders["Player"][::-1], leaders[val_label][::-1],
+                                 color=bar_color, alpha=0.85, edgecolor="white", linewidth=0.4)
+                for bar, val in zip(bars4, leaders[val_label][::-1]):
+                    ax4.text(bar.get_width() + leaders[val_label].max() * 0.01,
+                             bar.get_y() + bar.get_height() / 2,
+                             f"{val:.1f}", va="center", fontsize=7.5)
+                ax4.set_xlabel(val_label, fontsize=9)
+                ax4.spines["top"].set_visible(False)
+                ax4.spines["right"].set_visible(False)
+                ax4.grid(axis="x", linestyle="--", alpha=0.35)
+                plt.tight_layout()
+                st.pyplot(fig4, use_container_width=True)
+                plt.close(fig4)
+                st.dataframe(leaders, use_container_width=True)
+
+        # ── HOME/AWAY SPLITS (formerly tab10) — content block follows below ──
+        with tab10:
+            pass  # filled in below
+
+        # ── START/SIT ADVISOR (formerly tab11) — content block follows below ─
+        with tab11:
+            pass  # filled in below
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — LEAGUE LEADERS
+# MAIN TAB 3 — TEAMS & LEAGUE
+# Sub-tabs: Team Overview · Injury Report
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+with main_teams:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        ll_col1, ll_col2 = st.columns([1, 3])
-        with ll_col1:
-            st.subheader("Filters")
-            ll_season = st.radio("Season", ["2025", "2024", "Both"], key="ll_season")
-            ll_stat   = st.selectbox("Stat", list(LEADER_COLS.keys()), key="ll_stat")
-            ll_agg    = st.radio("Aggregate by", ["Average", "Total"], key="ll_agg")
-            ll_min    = st.number_input(
-                "Min games played", min_value=1, value=4, step=1, key="ll_min"
-            )
-            ll_top    = st.slider("Show top N", 10, 50, 25, key="ll_top")
+        tab3, tab9 = st.tabs([
+            "🏟️ Team Overview",
+            "🚑 Injury Report",
+        ])
 
-        with ll_col2:
-            stat_col = LEADER_COLS[ll_stat]
+        # ── TEAM OVERVIEW ─────────────────────────────────────────────────────
+        with tab3:
+            t_col1, t_col2 = st.columns([1, 3])
+            with t_col1:
+                st.subheader("Filters")
+                to_season = st.radio("Season", [2025, 2024], key="to_season")
+                to_stat   = st.selectbox("Stat to chart", list(LEADER_COLS.keys()), key="to_stat")
+                to_team   = st.selectbox("Team spotlight",
+                                          ["All"] + sorted(nfl_df["team"].unique().tolist()),
+                                          key="to_team")
 
-            # filter by season
-            if ll_season == "Both":
-                ll_df = nfl_df.copy()
-            else:
-                ll_df = nfl_df[nfl_df["season"] == int(ll_season)].copy()
+            with t_col2:
+                stat_col   = LEADER_COLS[to_stat]
+                stat_label = to_stat
 
-            # min games filter
-            games_per_player = ll_df.groupby("player_name")["game_id"].count()
-            eligible = games_per_player[games_per_player >= ll_min].index
-            ll_df = ll_df[ll_df["player_name"].isin(eligible)]
+                fig3 = team_bar_chart(nfl_df, to_season, stat_col, stat_label)
+                st.pyplot(fig3, use_container_width=True)
+                plt.close(fig3)
 
-            # aggregate
-            if ll_agg == "Average":
-                leaders = (
-                    ll_df.groupby("player_name")[stat_col].mean()
-                    .sort_values(ascending=False).head(ll_top).reset_index()
+                season_df = nfl_df[nfl_df["season"] == to_season]
+                if to_team != "All":
+                    season_df = season_df[season_df["team"] == to_team]
+
+                st.subheader(
+                    f"Top 15 Players — {to_stat} ({to_season}"
+                    + (f" · {to_team}" if to_team != "All" else "") + ")"
                 )
-                val_label = f"Avg {ll_stat}"
-            else:
-                leaders = (
-                    ll_df.groupby("player_name")[stat_col].sum()
-                    .sort_values(ascending=False).head(ll_top).reset_index()
+                top_players = (
+                    season_df.groupby("player_name")[stat_col]
+                    .mean().sort_values(ascending=False).head(15).reset_index()
+                    .rename(columns={"player_name": "Player", stat_col: f"Avg {to_stat}"})
                 )
-                val_label = f"Total {ll_stat}"
+                top_players[f"Avg {to_stat}"] = top_players[f"Avg {to_stat}"].round(1)
+                st.dataframe(top_players, use_container_width=True, hide_index=True)
 
-            leaders.columns = ["Player", val_label]
-            leaders[val_label] = leaders[val_label].round(2)
-            leaders.index = range(1, len(leaders) + 1)
-
-            st.subheader(f"Top {ll_top} — {val_label}  ({ll_season})")
-
-            # horizontal bar chart
-            fig4, ax4 = plt.subplots(figsize=(9, max(4, len(leaders) * 0.35)))
-            bar_color = C_2025 if ll_season == "2025" else (C_2024 if ll_season == "2024" else C_TREND)
-            bars4 = ax4.barh(
-                leaders["Player"][::-1], leaders[val_label][::-1],
-                color=bar_color, alpha=0.85, edgecolor="white", linewidth=0.4,
-            )
-            for bar, val in zip(bars4, leaders[val_label][::-1]):
-                ax4.text(
-                    bar.get_width() + leaders[val_label].max() * 0.01,
-                    bar.get_y() + bar.get_height() / 2,
-                    f"{val:.2f}", va="center", fontsize=7.5,
+                st.subheader(f"Team Summary — {to_season}")
+                team_summary = (
+                    nfl_df[nfl_df["season"] == to_season]
+                    .groupby("team")
+                    .agg(
+                        Games=("game_id", "nunique"),
+                        Players=("player_name", "nunique"),
+                        Avg_Fantasy=("fantasy_points", "mean"),
+                        Avg_Pass_Yds=("passing_yards", "mean"),
+                        Avg_Rush_Yds=("rush_yards", "mean"),
+                        Avg_Rec_Yds=("receiving_yards", "mean"),
+                    )
+                    .round(1)
+                    .sort_values("Avg_Fantasy", ascending=False)
+                    .reset_index()
+                    .rename(columns={"team": "Team"})
                 )
-            ax4.set_xlabel(val_label, fontsize=9)
-            ax4.spines["top"].set_visible(False)
-            ax4.spines["right"].set_visible(False)
-            ax4.grid(axis="x", linestyle="--", alpha=0.35)
-            plt.tight_layout()
-            st.pyplot(fig4, use_container_width=True)
-            plt.close(fig4)
+                st.dataframe(team_summary, use_container_width=True, hide_index=True)
 
-            st.dataframe(leaders, use_container_width=True)
+        # ── INJURY REPORT (formerly tab9) — content block follows below ───────
+        with tab9:
+            pass  # filled in below
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — DATA REFRESH
+# MAIN TAB 4 — SETTINGS & DATA
+# Sub-tabs: Data Refresh
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
-    import datetime as _dt
+with main_settings:
+    tab5, = st.tabs(["🔄 Data Refresh"])
 
-    st.subheader("🔄 Data Refresh")
-    st.markdown(
-        "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
-        "After 1 hour the cache expires and the next page load automatically "
-        "fetches the latest games — no action needed week-to-week."
-    )
+    with tab5:
+        import datetime as _dt
 
-    # ── Cache status ──────────────────────────────────────────────────────
-    st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### ℹ️ How it works")
+        st.subheader("🔄 Data Refresh")
         st.markdown(
-            """
+            "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
+            "After 1 hour the cache expires and the next page load automatically "
+            "fetches the latest games — no action needed week-to-week."
+        )
+        st.divider()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### ℹ️ How it works")
+            st.markdown(
+                """
 - **First load of the day** → scrapes 2024 + 2025 from ESPN (~5 min)
 - **Everyone else within that hour** → instant load from cache
 - **After 1 hour** → cache expires, next visitor triggers a fresh scrape
 - **New games** appear automatically the next time the cache refreshes
-            """
-        )
-    with c2:
-        st.markdown("### ⚡ Manual Refresh")
-        st.caption(
-            "Force a fresh scrape right now — useful after a big game "
-            "or if data looks out of date."
-        )
-        if data_ok:
-            season_counts = nfl_df.groupby("season")["game_id"].nunique()
-            for season, games in season_counts.items():
-                latest_wk = (
-                    nfl_df[nfl_df["season"] == season]["game_id"]
-                    .str.split("_", expand=True)[1]
-                    .dropna().astype(int).max()
-                )
-                st.success(
-                    f"✅ **{season}** — {games} games loaded  ·  latest week: **{latest_wk}**"
-                )
-            last_player_count = nfl_df["player_name"].nunique()
-            st.metric("Total Players", f"{last_player_count:,}")
-
-        st.divider()
-        if st.button("🔄 Refresh Data Now", type="primary",
-                     use_container_width=True, key="api_refresh"):
-            st.cache_data.clear()
-            time.sleep(0.5)
-            st.rerun()
+                """
+            )
+        with c2:
+            st.markdown("### ⚡ Manual Refresh")
+            st.caption("Force a fresh scrape right now — useful after a big game or if data looks out of date.")
+            if data_ok:
+                season_counts = nfl_df.groupby("season")["game_id"].nunique()
+                for season, games in season_counts.items():
+                    latest_wk = (
+                        nfl_df[nfl_df["season"] == season]["game_id"]
+                        .str.split("_", expand=True)[1]
+                        .dropna().astype(int).max()
+                    )
+                    st.success(f"✅ **{season}** — {games} games loaded  ·  latest week: **{latest_wk}**")
+                st.metric("Total Players", f"{nfl_df['player_name'].nunique():,}")
+            st.divider()
+            if st.button("🔄 Refresh Data Now", type="primary",
+                         use_container_width=True, key="api_refresh"):
+                st.cache_data.clear()
+                time.sleep(0.5)
+                st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — MATCHUP EDGE
-# Evaluates a player's prop vs the opposing team's defensive averages
+# CONTENT BLOCKS FOR SUB-TABS DECLARED INSIDE main_bet / main_players / main_teams
+# These must be filled AFTER the with-blocks that declared the tab objects.
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── MATCHUP EDGE (tab6 inside main_bet) ──────────────────────────────────────
 with tab6:
     if not data_ok:
         st.info("Load data first using the **Data Refresh** tab.")
@@ -1088,13 +1189,13 @@ with tab6:
 
                 # ── key metrics ───────────────────────────────────────────────
                 k1, k2, k3, k4 = st.columns(4)
-                k1.metric("Player Last 3 Avg",        f"{player_last3:.2f}")
-                k2.metric(f"{me_opp} Allows (Avg)",   f"{opp_allowed_avg:.2f}",
-                          delta=f"{opp_allowed_avg - league_def_avg:+.2f} vs league",
+                k1.metric("Player Last 3 Avg",        f"{player_last3:.1f}")
+                k2.metric(f"{me_opp} Allows (Avg)",   f"{opp_allowed_avg:.1f}",
+                          delta=f"{opp_allowed_avg - league_def_avg:+.1f} vs league",
                           delta_color="inverse")
                 k3.metric("Edge vs Defense",
-                          f"{edge:+.2f}" if edge is not None else "N/A")
-                k4.metric("Prop Line Gap",             f"{edge_vs_line:+.2f}")
+                          f"{edge:+.1f}" if edge is not None else "N/A")
+                k4.metric("Prop Line Gap",             f"{edge_vs_line:+.1f}")
 
                 st.divider()
 
@@ -1104,12 +1205,12 @@ with tab6:
                 with d1:
                     st.subheader(f"📌 {full_name}")
                     player_rows = [
-                        {"Metric": "2025 Season Avg",    "Value": f"{player_avg_25:.2f}"  if player_avg_25  is not None else "—"},
-                        {"Metric": "2024 Season Avg",    "Value": f"{player_avg_24:.2f}"  if player_avg_24  is not None else "—"},
-                        {"Metric": "Last 3 Games Avg",   "Value": f"{player_last3:.2f}"},
-                        {"Metric": "Career Avg (both)",  "Value": f"{player_all_avg:.2f}"},
+                        {"Metric": "2025 Season Avg",    "Value": f"{player_avg_25:.1f}"  if player_avg_25  is not None else "—"},
+                        {"Metric": "2024 Season Avg",    "Value": f"{player_avg_24:.1f}"  if player_avg_24  is not None else "—"},
+                        {"Metric": "Last 3 Games Avg",   "Value": f"{player_last3:.1f}"},
+                        {"Metric": "Career Avg (both)",  "Value": f"{player_all_avg:.1f}"},
                         {"Metric": "Prop Line",          "Value": str(me_line)},
-                        {"Metric": "Last-3 vs Line",     "Value": f"{edge_vs_line:+.2f}"},
+                        {"Metric": "Last-3 vs Line",     "Value": f"{edge_vs_line:+.1f}"},
                     ]
                     st.dataframe(pd.DataFrame(player_rows),
                                  use_container_width=True, hide_index=True)
@@ -1117,13 +1218,13 @@ with tab6:
                 with d2:
                     st.subheader(f"🛡️ {me_opp} Defense")
                     def_rows = [
-                        {"Metric": f"Avg {col_label} Allowed",    "Value": f"{opp_allowed_avg:.2f}"},
-                        {"Metric": "Std Dev (allowed)",            "Value": f"{opp_allowed_std:.2f}"},
+                        {"Metric": f"Avg {col_label} Allowed",    "Value": f"{opp_allowed_avg:.1f}"},
+                        {"Metric": "Std Dev (allowed)",            "Value": f"{opp_allowed_std:.1f}"},
                         {"Metric": "Sample Games",                 "Value": str(opp_games)},
-                        {"Metric": "League Avg Allowed",           "Value": f"{league_def_avg:.2f}"},
+                        {"Metric": "League Avg Allowed",           "Value": f"{league_def_avg:.1f}"},
                         {"Metric": f"Defensive Rank (of {total_teams})",
                                                                    "Value": f"#{opp_rank}" if opp_rank else "N/A"},
-                        {"Metric": "Edge vs Defense",              "Value": f"{edge:+.2f}" if edge is not None else "N/A"},
+                        {"Metric": "Edge vs Defense",              "Value": f"{edge:+.1f}" if edge is not None else "N/A"},
                     ]
                     st.dataframe(pd.DataFrame(def_rows),
                                  use_container_width=True, hide_index=True)
@@ -1151,12 +1252,12 @@ with tab6:
                 if opp_allowed_avg:
                     ax6.axhline(opp_allowed_avg, color="#f59e0b", linewidth=1.8,
                                 linestyle="--",
-                                label=f"{me_opp} Avg Allowed: {opp_allowed_avg:.2f}",
+                                label=f"{me_opp} Avg Allowed: {opp_allowed_avg:.1f}",
                                 zorder=4)
 
                 # player season avg
                 ax6.axhline(player_all_avg, color=C_AVG, linewidth=1.4,
-                            linestyle=":", label=f"Player Avg: {player_all_avg:.2f}",
+                            linestyle=":", label=f"Player Avg: {player_all_avg:.1f}",
                             zorder=3)
 
                 # season boundary
@@ -1194,13 +1295,11 @@ with tab6:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — PARLAY BUILDER
-# Add up to 8 legs. Each leg scores its own prop, then the parlay is evaluated
-# as a whole: combined probability, estimated payout, and a confidence rating.
+# PARLAY BUILDER (tab7 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab7:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         # ── session-state parlay list ─────────────────────────────────────────
         if "parlay_legs" not in st.session_state:
@@ -1482,13 +1581,11 @@ with tab7:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 8 — MATCHUP FINDER
-# Fetches this week's NFL schedule, ranks every team defense by yards allowed,
-# and generates a specific player + prop line suggestion for each game.
+# MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab8:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         # ── helpers ───────────────────────────────────────────────────────────
         @st.cache_data(show_spinner=False)
@@ -1724,9 +1821,9 @@ with tab8:
                             f'<b>{col_label} {r["Pick"]} {r["Suggested Line"]}</b> '
                             f'<span style="color:#3b82d4;font-weight:600;">({r["Odds"]})</span>'
                             f'&nbsp;&nbsp;·&nbsp;&nbsp;'
-                            f'vs {r["Defense"]} {r["Matchup"]} (allows {r["Def Allows"]:.2f}/gm)'
+                            f'vs {r["Defense"]} {r["Matchup"]} (allows {r["Def Allows"]:.1f}/gm)'
                             f'&nbsp;&nbsp;·&nbsp;&nbsp;'
-                            f'Player avg: {r["Player Avg"]:.2f} &nbsp;|&nbsp; Last 3: {r["Last 3 Avg"]:.2f}'
+                            f'Player avg: {r["Player Avg"]:.1f} &nbsp;|&nbsp; Last 3: {r["Last 3 Avg"]:.1f}'
                             f'</div>',
                             unsafe_allow_html=True,
                         )
@@ -1752,11 +1849,11 @@ with tab8:
                         color=bar_colors8[::-1], alpha=0.85, edgecolor="white", linewidth=0.4
                     )
                     ax8.axvline(league_avg, color=C_AVG, linewidth=1.5, linestyle="--",
-                                label=f"League avg: {league_avg:.2f}")
+                                label=f"League avg: {league_avg:.1f}")
                     for bar, val in zip(bars8, chart_df8["avg_allowed"][::-1]):
                         ax8.text(bar.get_width() + chart_df8["avg_allowed"].max() * 0.01,
                                  bar.get_y() + bar.get_height() / 2,
-                                 f"{val:.2f}", va="center", fontsize=8)
+                                 f"{val:.1f}", va="center", fontsize=8)
                     ax8.set_title(
                         f"Avg {col_label} Allowed per Game — Softest to Toughest",
                         fontsize=11, fontweight="bold"
@@ -1772,12 +1869,11 @@ with tab8:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 9 — INJURY REPORT
-# Pulls live injury data from ESPN's public API
+# INJURY REPORT (tab9 inside main_teams)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab9:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         @st.cache_data(ttl=1800, show_spinner=False)  # refresh every 30 min
         def fetch_injuries():
@@ -1876,12 +1972,11 @@ with tab9:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 10 — HOME / AWAY SPLITS
-# Breaks down player stats by home vs away games using game_id
+# HOME / AWAY SPLITS (tab10 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab10:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         @st.cache_data(show_spinner=False)
         def build_home_away(nfl):
@@ -1933,8 +2028,8 @@ with tab10:
 
                 # Summary metrics
                 m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("Home Avg",    f"{home_games[col].mean():.2f}" if not home_games.empty else "—")
-                m2.metric("Away Avg",    f"{away_games[col].mean():.2f}" if not away_games.empty else "—")
+                m1.metric("Home Avg",    f"{home_games[col].mean():.1f}" if not home_games.empty else "—")
+                m2.metric("Away Avg",    f"{away_games[col].mean():.1f}" if not away_games.empty else "—")
                 m3.metric("Home Games",  len(home_games))
                 m4.metric("Away Games",  len(away_games))
                 diff = (home_games[col].mean() - away_games[col].mean()) if (not home_games.empty and not away_games.empty) else 0
@@ -1963,7 +2058,7 @@ with tab10:
                                     edgecolor="white", linewidth=0.5)
                     avg10 = vals.mean()
                     ax.axhline(avg10, color=C_AVG, linewidth=1.6, linestyle="--",
-                               label=f"Avg: {avg10:.2f}")
+                               label=f"Avg: {avg10:.1f}")
                     if ha_line > 0:
                         ax.axhline(ha_line, color=C_LINE, linewidth=1.6,
                                    linestyle="-", label=f"Line: {ha_line}")
@@ -2000,13 +2095,11 @@ with tab10:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 11 — START / SIT ADVISOR  (Fantasy)
-# Compare two players at the same position and get a start recommendation
-# based on weighted avg, recent form, and matchup difficulty
+# START / SIT ADVISOR (tab11 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab11:
     if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         @st.cache_data(show_spinner=False)
         def build_opp_defense(nfl):
@@ -2128,15 +2221,15 @@ with tab11:
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-                    col_disp.metric("Weighted Avg",     f"{s['w_avg']:.2f}")
-                    col_disp.metric("Last 3 Avg",       f"{s['last3']:.2f}")
-                    col_disp.metric("Season Avg",       f"{s['season_avg']:.2f}")
-                    col_disp.metric(f"{s['opponent']} Allows", f"{s['opp_allowed']:.2f}",
-                                     delta=f"{s['opp_allowed']-s['league_avg']:+.2f} vs league",
+                    col_disp.metric("Weighted Avg",     f"{s['w_avg']:.1f}")
+                    col_disp.metric("Last 3 Avg",       f"{s['last3']:.1f}")
+                    col_disp.metric("Season Avg",       f"{s['season_avg']:.1f}")
+                    col_disp.metric(f"{s['opponent']} Allows", f"{s['opp_allowed']:.1f}",
+                                     delta=f"{s['opp_allowed']-s['league_avg']:+.1f} vs league",
                                      delta_color="inverse")
                     col_disp.metric("Matchup Factor",   f"{s['matchup_factor']:.2f}x")
                     col_disp.metric("Form Boost",       f"{s['form_boost']:.2f}x")
-                    col_disp.metric("Final Score",      f"{s['final_score']:.2f}",
+                    col_disp.metric("Final Score",      f"{s['final_score']:.1f}",
                                      delta="START" if is_winner else "SIT",
                                      delta_color="normal" if is_winner else "inverse")
 
