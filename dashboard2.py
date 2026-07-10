@@ -312,30 +312,35 @@ def hit_rate(df, col, line):
     return (over / len(df)) * 100, over, len(df)
 
 
-def prop_analysis(nfl, player_name, category, line, use_weighted=True):
+def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_window="Season"):
     col = CAT_MAP[category.lower()][0]
     pdf = find_player(nfl, player_name)
     if pdf.empty:
         return None
 
-    full   = pdf["player_name"].iloc[0]
-    p25    = pdf[pdf["season"] == 2025]
-    p24    = pdf[pdf["season"] == 2024]
+    full    = pdf["player_name"].iloc[0]
+    p25     = pdf[pdf["season"] == 2025]
+    p24     = pdf[pdf["season"] == 2024]
     changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
 
     hr25, ov25, tot25 = hit_rate(p25, col, line)
     hr24, ov24, tot24 = hit_rate(p24, col, line)
 
-    vals = pdf[col].values
-    wts  = pdf["weight"].values
-    if use_weighted:
-        w_avg = np.average(vals, weights=wts)
-        w_hit = np.average((vals > line).astype(float), weights=wts) * 100
-    else:
-        w_avg = vals.mean()
-        w_hit = (vals > line).mean() * 100
+    # Window slice — tail of the combined sorted dataframe
+    n_games = {"Last 3": 3, "Last 5": 5, "Season": None}[game_window]
+    window_df = pdf.tail(n_games) if n_games is not None else pdf
 
-    last3 = p25[col].tail(3).mean() if not p25.empty else pdf[col].tail(3).mean()
+    vals = window_df[col].values
+    wts  = window_df["weight"].values
+    if use_weighted:
+        w_avg = np.average(vals, weights=wts) if len(vals) else 0.0
+        w_hit = np.average((vals > line).astype(float), weights=wts) * 100 if len(vals) else 0.0
+    else:
+        w_avg = vals.mean() if len(vals) else 0.0
+        w_hit = (vals > line).mean() * 100 if len(vals) else 0.0
+
+    window_avg = window_df[col].mean() if not window_df.empty else 0.0
+    window_hit = (window_df[col] > line).mean() * 100 if not window_df.empty else 0.0
 
     return {
         "full_name":     full,
@@ -349,8 +354,11 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True):
         "w_avg":         w_avg,
         "w_hit":         w_hit,
         "weight_label":  "0.3" if changed else "0.6",
-        "last_3_avg":    last3,
-        "std_dev":       pdf[col].std(),
+        "window_avg":    window_avg,
+        "window_hit":    window_hit,
+        "window_label":  game_window,
+        "window_games":  len(window_df),
+        "std_dev":       window_df[col].std() if not window_df.empty else 0.0,
         "recommendation": "OVER" if w_avg > line else "UNDER",
     }
 
@@ -358,15 +366,23 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True):
 # ──────────────────────────────────────────────────────────────────────────────
 # CHART HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def bar_chart(nfl, player_name, category, line=None):
+def bar_chart(nfl, player_name, category, line=None, game_window="Season"):
     col, col_label = CAT_MAP[category.lower()]
     pdf = find_player(nfl, player_name)
     if pdf.empty:
         return None
 
-    full  = pdf["player_name"].iloc[0]
-    p24   = pdf[pdf["season"] == 2024].reset_index(drop=True)
-    p25   = pdf[pdf["season"] == 2025].reset_index(drop=True)
+    full    = pdf["player_name"].iloc[0]
+    n_games = {"Last 3": 3, "Last 5": 5, "Season": None}[game_window]
+
+    if n_games is not None:
+        combined = pdf.tail(n_games).copy()
+        p24 = combined[combined["season"] == 2024].reset_index(drop=True)
+        p25 = combined[combined["season"] == 2025].reset_index(drop=True)
+    else:
+        p24 = pdf[pdf["season"] == 2024].reset_index(drop=True)
+        p25 = pdf[pdf["season"] == 2025].reset_index(drop=True)
+
     p24["week"] = range(1, len(p24) + 1)
     p25["week"] = range(1, len(p25) + 1)
 
@@ -376,7 +392,8 @@ def bar_chart(nfl, player_name, category, line=None):
     if ncols == 1:
         axes = [axes]
 
-    fig.suptitle(f"{full}  —  {col_label}  |  Week-by-Week",
+    window_str = f"Last {n_games} Games" if n_games else "Full Season"
+    fig.suptitle(f"{full}  —  {col_label}  |  {window_str}",
                  fontsize=13, fontweight="bold", y=1.02)
 
     def _draw(ax, sdf, label, bar_color):
@@ -573,6 +590,14 @@ with tab1:
             )
             weighted = st.toggle("Season Weighting", value=True,
                                  help="2025 × 1.0 · 2024 × 0.6 · team-changer × 0.3")
+            game_window = st.radio(
+                "Game Window",
+                options=["Last 3", "Last 5", "Season"],
+                index=2,
+                horizontal=True,
+                help="Limit analysis and chart to the most recent N games.",
+                key="pa_window",
+            )
             go = st.button("Analyze", type="primary", use_container_width=True, key="pa_go")
 
             st.divider()
@@ -583,7 +608,7 @@ with tab1:
 
         with c_right:
             if go:
-                res = prop_analysis(nfl_df, player_sel, cat_sel, line_val, weighted)
+                res = prop_analysis(nfl_df, player_sel, cat_sel, line_val, weighted, game_window)
                 if res is None:
                     st.error("Player not found.")
                 else:
@@ -604,10 +629,14 @@ with tab1:
                     )
 
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Weighted Avg",      f"{res['w_avg']:.2f}")
-                    m2.metric("Weighted Hit Rate", f"{res['w_hit']:.1f}%")
-                    m3.metric("Last 3 Avg",        f"{res['last_3_avg']:.2f}")
-                    m4.metric("Std Deviation",     f"{res['std_dev']:.2f}")
+                    m1.metric("Weighted Avg",      f"{res['w_avg']:.2f}",
+                              help=f"Weighted avg over {res['window_label']} ({res['window_games']} games)")
+                    m2.metric("Weighted Hit Rate", f"{res['w_hit']:.1f}%",
+                              help=f"Hit rate over {res['window_label']} ({res['window_games']} games)")
+                    m3.metric(f"{res['window_label']} Avg", f"{res['window_avg']:.2f}",
+                              help=f"Simple avg over {res['window_label']} ({res['window_games']} games)")
+                    m4.metric("Std Deviation",     f"{res['std_dev']:.2f}",
+                              help=f"Std dev over {res['window_label']} ({res['window_games']} games)")
 
                     st.subheader("Season Split")
                     split_rows = []
@@ -632,7 +661,7 @@ with tab1:
                                      use_container_width=True, hide_index=True)
 
                     st.subheader("Week-by-Week Chart")
-                    fig = bar_chart(nfl_df, player_sel, cat_sel, line=line_val)
+                    fig = bar_chart(nfl_df, player_sel, cat_sel, line=line_val, game_window=game_window)
                     if fig:
                         st.pyplot(fig, use_container_width=True)
                         plt.close(fig)
