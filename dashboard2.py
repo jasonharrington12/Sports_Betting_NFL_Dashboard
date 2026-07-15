@@ -657,7 +657,22 @@ with main_bet:
 
         # ── PROP ANALYZER ────────────────────────────────────────────────────
         with tab1:
-            all_players = sorted(nfl_df["player_name"].unique())
+            all_players  = sorted(nfl_df["player_name"].unique())
+            all_teams_pa = ["None (skip matchup)"] + sorted(nfl_df["team"].dropna().unique().tolist())
+
+            # Build opponent defense lookup once (reuse Matchup Edge logic)
+            @st.cache_data(show_spinner=False)
+            def build_opp_pa(nfl):
+                df = nfl.copy()
+                def _opp(row):
+                    parts = str(row["game_id"]).split("_")
+                    if len(parts) < 4: return "UNK"
+                    away, home = parts[2], parts[3]
+                    return home if row["team"] == away else away
+                df["opponent"] = df.apply(_opp, axis=1)
+                return df
+            nfl_opp_pa = build_opp_pa(nfl_df)
+
             c_left, c_right = st.columns([1, 3])
             with c_left:
                 st.subheader("Controls")
@@ -673,6 +688,13 @@ with main_bet:
                 line_val = st.number_input(
                     "Prop Line", min_value=0.0, value=200.5, step=0.5,
                     format="%.1f", key="pa_line",
+                )
+                opp_sel = st.selectbox(
+                    "Opponent this week",
+                    all_teams_pa,
+                    index=0,
+                    key="pa_opp",
+                    help="Select the opposing defense to factor matchup difficulty into the recommendation.",
                 )
                 weighted = st.toggle("Season Weighting", value=True,
                                      help="2025 × 1.0 · 2024 × 0.6 · team-changer × 0.3")
@@ -698,22 +720,79 @@ with main_bet:
                     if res is None:
                         st.error("Player not found.")
                     else:
+                        pa_col = CAT_MAP[cat_sel.lower()][0]
+
+                        # ── Matchup analysis ──────────────────────────────────
+                        matchup_info = None
+                        if opp_sel != "None (skip matchup)":
+                            vs_opp   = nfl_opp_pa[nfl_opp_pa["opponent"] == opp_sel]
+                            lg_avg   = nfl_opp_pa.groupby("opponent")[pa_col].mean().mean()
+                            opp_avg  = vs_opp[pa_col].mean() if not vs_opp.empty else lg_avg
+                            def_rank_series = (
+                                nfl_opp_pa.groupby("opponent")[pa_col]
+                                .mean().sort_values(ascending=False)
+                            )
+                            rank = list(def_rank_series.index).index(opp_sel) + 1 if opp_sel in def_rank_series.index else None
+                            n_teams = len(def_rank_series)
+                            factor  = opp_avg / lg_avg if lg_avg > 0 else 1.0
+                            if factor > 1.10:
+                                grade = "🟢 Soft"
+                                grade_color = "#2DC653"
+                            elif factor < 0.90:
+                                grade = "🔴 Tough"
+                                grade_color = "#D62828"
+                            else:
+                                grade = "🟡 Average"
+                                grade_color = "#f59e0b"
+                            matchup_info = {
+                                "opp": opp_sel, "opp_avg": opp_avg, "lg_avg": lg_avg,
+                                "factor": factor, "grade": grade,
+                                "grade_color": grade_color,
+                                "rank": rank, "n_teams": n_teams,
+                            }
+
+                        # ── Team change warning ───────────────────────────────
                         if res["changed"]:
                             st.warning(
                                 f"⚠️ Team change: **{res['team_24']}** (2024) → "
                                 f"**{res['team_25']}** (2025) — 2024 weight = {res['weight_label']}"
                             )
 
+                        # ── Matchup banner ────────────────────────────────────
+                        if matchup_info:
+                            st.markdown(
+                                f'<div style="background:{matchup_info["grade_color"]}22;'
+                                f'border-left:5px solid {matchup_info["grade_color"]};'
+                                f'padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:14px;">'
+                                f'<b>Matchup vs {matchup_info["opp"]}:</b> {matchup_info["grade"]} &nbsp;·&nbsp; '
+                                f'Allows <b>{matchup_info["opp_avg"]:.1f}</b> {CAT_MAP[cat_sel.lower()][1]}/gm '
+                                f'(league avg {matchup_info["lg_avg"]:.1f}) &nbsp;·&nbsp; '
+                                f'Def rank <b>#{matchup_info["rank"]}</b> of {matchup_info["n_teams"]}'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        # ── Recommendation banner (matchup-adjusted if applicable) ──
                         rec = res["recommendation"]
+                        if matchup_info:
+                            # Adjust weighted avg by matchup factor for final rec
+                            adj_avg = res["w_avg"] * matchup_info["factor"]
+                            rec = "OVER" if adj_avg > line_val else "UNDER"
+                            rec_label = f"Suggested Bet: {rec} &nbsp;{line_val} &nbsp;<span style='font-size:16px;font-weight:400;opacity:0.9;'>({matchup_info['grade']} matchup)</span>"
+                        else:
+                            adj_avg = res["w_avg"]
+                            rec_label = f"Suggested Bet: {rec} &nbsp;{line_val}"
+
                         color = "#2DC653" if rec == "OVER" else "#D62828"
                         st.markdown(
                             f'<div style="background:{color};color:#fff;padding:14px 20px;'
                             f'border-radius:8px;font-size:22px;font-weight:700;'
                             f'text-align:center;margin-bottom:16px;">'
-                            f'Suggested Bet: {rec} &nbsp;{line_val}</div>',
+                            f'{rec_label}</div>',
                             unsafe_allow_html=True,
                         )
 
+                        # ── Key metrics ───────────────────────────────────────
                         m1, m2, m3, m4 = st.columns(4)
                         m1.metric("Weighted Avg",      f"{res['w_avg']:.1f}",
                                   help=f"Weighted avg over {res['window_label']} ({res['window_games']} games)")
@@ -724,6 +803,28 @@ with main_bet:
                         m4.metric("Std Deviation",     f"{res['std_dev']:.1f}",
                                   help=f"Std dev over {res['window_label']} ({res['window_games']} games)")
 
+                        # ── Matchup-adjusted avg metric ───────────────────────
+                        if matchup_info:
+                            ma1, ma2, ma3 = st.columns(3)
+                            ma1.metric(
+                                "Matchup-Adj Avg",
+                                f"{adj_avg:.1f}",
+                                delta=f"{adj_avg - res['w_avg']:+.1f} vs base avg",
+                                help="Weighted avg × opponent's defensive factor",
+                            )
+                            ma2.metric(
+                                f"{opp_sel} Allows",
+                                f"{matchup_info['opp_avg']:.1f}",
+                                delta=f"{matchup_info['opp_avg'] - matchup_info['lg_avg']:+.1f} vs league",
+                                delta_color="inverse",
+                            )
+                            ma3.metric(
+                                "Def Rank",
+                                f"#{matchup_info['rank']}" if matchup_info['rank'] else "N/A",
+                                help=f"#{matchup_info['rank']} of {matchup_info['n_teams']} teams (higher = softer defense)",
+                            )
+
+                        # ── Season split table ────────────────────────────────
                         st.subheader("Season Split")
                         split_rows = []
                         if res["hr_2025"] is not None:
