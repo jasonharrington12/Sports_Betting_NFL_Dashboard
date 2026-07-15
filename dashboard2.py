@@ -1972,6 +1972,7 @@ with tab8:
                         # Prefer depth-chart starters; fall back to historical leaders
                         dc_names = depth_chart_players(offense_team, col, max_rank=3)
 
+                        # ── Step 1: players who played for this team in 2025/2024 ──
                         team_players = nfl_def[
                             (nfl_def["team"] == offense_team) &
                             (nfl_def["season"] == 2025) &
@@ -1983,46 +1984,99 @@ with tab8:
                                 (nfl_def["season"] == 2024) &
                                 (nfl_def[col] > 0)
                             ]
-                        if team_players.empty:
-                            continue
 
-                        p_agg = (
-                            team_players.groupby("player_name")[col]
-                            .agg(["mean", "count", "std"])
-                            .reset_index()
-                        )
-                        p_agg = p_agg[p_agg["count"] >= mf_min_player]
+                        # ── Step 2: for depth chart players not found on this team,
+                        #    look them up by name across ALL teams (team changers / new signings)
+                        new_signings = []   # rows for players found on other teams
+                        if dc_names:
+                            found_names = set(team_players["player_name"].unique()) if not team_players.empty else set()
+                            for dc_name in dc_names:
+                                if dc_name not in found_names:
+                                    # fuzzy-ish: try exact match first, then last-name match
+                                    anywhere = nfl_def[
+                                        (nfl_def["player_name"] == dc_name) &
+                                        (nfl_def[col] > 0)
+                                    ]
+                                    if anywhere.empty:
+                                        last_nm = dc_name.split(" ")[-1]
+                                        anywhere = nfl_def[
+                                            nfl_def["player_name"].str.endswith(last_nm, na=False) &
+                                            (nfl_def[col] > 0)
+                                        ]
+                                    if not anywhere.empty:
+                                        new_signings.append(anywhere)
+
+                        if new_signings:
+                            signing_df = pd.concat(new_signings)
+                            # Down-weight new signings: multiply their mean by 0.75
+                            # (they're on a new team/system — less predictable)
+                            signing_agg = (
+                                signing_df.groupby("player_name")[col]
+                                .agg(["mean", "count", "std"])
+                                .reset_index()
+                            )
+                            signing_agg["mean"] = signing_agg["mean"] * 0.75
+                            signing_agg["new_signing"] = True
+                            if not team_players.empty:
+                                team_agg = (
+                                    team_players.groupby("player_name")[col]
+                                    .agg(["mean", "count", "std"])
+                                    .reset_index()
+                                )
+                                team_agg["new_signing"] = False
+                                team_players_combined = pd.concat([team_agg, signing_agg])
+                            else:
+                                team_players_combined = signing_agg
+                        else:
+                            if team_players.empty:
+                                continue
+                            team_players_combined = (
+                                team_players.groupby("player_name")[col]
+                                .agg(["mean", "count", "std"])
+                                .reset_index()
+                            )
+                            team_players_combined["new_signing"] = False
+
+                        p_agg = team_players_combined[team_players_combined["count"] >= mf_min_player]
+                        if p_agg.empty:
+                            # relax min games for new signings
+                            p_agg = team_players_combined[team_players_combined["count"] >= 1]
                         if p_agg.empty:
                             continue
 
-                        # If depth chart data available, keep only depth chart players
-                        # and pick the starter (rank 1). Otherwise fall back to avg leader.
+                        # ── Step 3: sort by depth chart order if available ──
                         if dc_names:
                             dc_filtered = p_agg[p_agg["player_name"].isin(dc_names)]
                             if not dc_filtered.empty:
-                                # Sort by depth chart order (starter first)
                                 dc_filtered = dc_filtered.copy()
                                 dc_filtered["dc_rank"] = dc_filtered["player_name"].apply(
                                     lambda n: dc_names.index(n) if n in dc_names else 99
                                 )
                                 p_agg = dc_filtered.sort_values("dc_rank")
+                            else:
+                                p_agg = p_agg.sort_values("mean", ascending=False)
+                        else:
+                            p_agg = p_agg.sort_values("mean", ascending=False)
 
-                        p_agg = p_agg.sort_values("mean", ascending=False) if not dc_names else p_agg
-                        best  = p_agg.iloc[0]
+                        best = p_agg.iloc[0]
+                        is_new_signing = bool(best.get("new_signing", False))
 
                         # Prop line = player's weighted avg adjusted for matchup
                         player_avg = float(best["mean"])
+                        # Undo the 0.75 down-weight for display purposes
+                        if is_new_signing:
+                            player_avg_display = player_avg / 0.75
+                        else:
+                            player_avg_display = player_avg
                         matchup_factor = def_avg / league_avg if league_avg > 0 else 1.0
 
-                        # Get last-3 avg for this player
+                        # Get last-3 avg for this player (from any team)
                         p_df   = nfl_def[nfl_def["player_name"] == best["player_name"]]
                         p_2025 = p_df[p_df["season"] == 2025]
-                        last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg
+                        last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg_display
 
                         # ── Realistic sportsbook line ─────────────────────────
-                        # Pick the closest standard increment used by books,
-                        # biased slightly toward the matchup-adjusted projection.
-                        proj = player_avg * matchup_factor
+                        proj = player_avg_display * matchup_factor
                         if col == "passing_yards":
                             increments = [i + 0.5 for i in range(50, 500, 25)]
                         elif col in ("rush_yards", "receiving_yards"):
@@ -2057,9 +2111,9 @@ with tab8:
                             "Game O/U":     f"{ou}" if ou else "—",
                             "Offense":      offense_team,
                             "Defense":      defense_team,
-                            "Player":       best["player_name"],
+                            "Player":       best["player_name"] + (" 🆕" if is_new_signing else ""),
                             "Stat":         col_label,
-                            "Player Avg":   round(player_avg, 1),
+                            "Player Avg":   round(player_avg_display, 1),
                             "Last 3 Avg":   round(last3, 1),
                             "Def Allows":   round(def_avg, 1),
                             "Def Rank":     f"#{def_rank}",
