@@ -3200,8 +3200,8 @@ Lines containing `#` are treated as comments and ignored.
 
                     styled = (
                         disp_df.style
-                        .applymap(_color_edge, subset=["Edge"])
-                        .applymap(_color_pick, subset=["Pick"])
+                        .map(_color_edge, subset=["Edge"])
+                        .map(_color_pick, subset=["Pick"])
                     )
                     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -3673,7 +3673,7 @@ with main_tracker:
                     "line":"Line","pick":"Pick","stake":"Stake","odds":"Odds",
                     "result":"Result","actual":"Actual","pnl":"P&L","notes":"Notes",
                 })
-                .style.applymap(_pnl_color, subset=["P&L"])
+                .style.map(_pnl_color, subset=["P&L"])
             )
             st.dataframe(styled_bt, use_container_width=True, hide_index=True)
 
