@@ -99,6 +99,78 @@ def _get_json(url):
         pass
     return None
 
+# ESPN team abbreviation → numeric ID (all 32 teams)
+_TEAM_IDS = {
+    "ARI": 22, "ATL": 1,  "BAL": 33, "BUF": 2,  "CAR": 29, "CHI": 3,
+    "CIN": 4,  "CLE": 5,  "DAL": 6,  "DEN": 7,  "DET": 8,  "GB":  9,
+    "HOU": 34, "IND": 11, "JAX": 30, "KC":  12, "LV":  13, "LAC": 24,
+    "LAR": 14, "MIA": 15, "MIN": 16, "NE":  17, "NO":  18, "NYG": 19,
+    "NYJ": 20, "PHI": 21, "PIT": 23, "SF":  25, "SEA": 26, "TB":  27,
+    "TEN": 10, "WSH": 28,
+}
+
+# Positions relevant for prop betting
+_PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
+
+@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours
+def fetch_all_depth_charts():
+    """
+    Pull the current depth chart for all 32 NFL teams from ESPN.
+    Returns a dict:
+        { "NE": { "QB": ["Drake Maye", "Tommy DeVito"],
+                  "RB": ["Rhamondre Stevenson", ...],
+                  "WR": ["Ja'Lynn Polk", ...],
+                  "TE": ["Hunter Henry", ...] },
+          "KC": { ... }, ... }
+    Uses the 3WR 1TE offensive scheme (most common); falls back to any scheme.
+    Players are ordered starter-first (rank 1, 2, 3…).
+    """
+    result = {}
+    for abbr, team_id in _TEAM_IDS.items():
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+            f"/teams/{team_id}/depthcharts"
+        )
+        data = _get_json(url)
+        if not data:
+            result[abbr] = {}
+            continue
+
+        schemes = data.get("depthchart", [])
+        # Prefer the 3WR 1TE pass-heavy scheme; fall back to first scheme
+        scheme = next(
+            (s for s in schemes if "WR" in s.get("name", "").upper()),
+            schemes[0] if schemes else None,
+        )
+        if scheme is None:
+            result[abbr] = {}
+            continue
+
+        positions = scheme.get("positions", {})
+        team_chart = {}
+        for pos_data in positions.values():
+            pos_abbr = pos_data.get("position", {}).get("abbreviation", "")
+            if pos_abbr not in _PROP_POSITIONS:
+                continue
+            # Athletes are already in depth order; sort by rank to be safe
+            athletes = sorted(
+                pos_data.get("athletes", []),
+                key=lambda a: a.get("rank", 99),
+            )
+            names = [a.get("displayName", "") for a in athletes if a.get("displayName")]
+            if names:
+                # WR can appear multiple times (WR1/WR2/WR3 slots) — merge & dedupe
+                existing = team_chart.get(pos_abbr, [])
+                for n in names:
+                    if n not in existing:
+                        existing.append(n)
+                team_chart[pos_abbr] = existing
+
+        result[abbr] = team_chart
+        _time.sleep(0.1)   # be polite to ESPN
+
+    return result
+
 def _scrape_game(game_id, season, week, home, away):
     data = _get_json(_ESPN_SUMMARY.format(game_id=game_id))
     if not data:
@@ -922,14 +994,15 @@ with main_players:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN TAB 3 — TEAMS & LEAGUE
-# Sub-tabs: Team Overview · Injury Report
+# Sub-tabs: Team Overview · Depth Charts · Injury Report
 # ══════════════════════════════════════════════════════════════════════════════
 with main_teams:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        tab3, tab9 = st.tabs([
+        tab3, tab_depth, tab9 = st.tabs([
             "🏟️ Team Overview",
+            "📋 Depth Charts",
             "🚑 Injury Report",
         ])
 
@@ -986,6 +1059,74 @@ with main_teams:
                     .rename(columns={"team": "Team"})
                 )
                 st.dataframe(team_summary, use_container_width=True, hide_index=True)
+
+        # ── DEPTH CHARTS ─────────────────────────────────────────────────────
+        with tab_depth:
+            st.subheader("📋 Current NFL Depth Charts")
+            st.caption("Live from ESPN · QB / RB / WR / TE starters & backups · cached 6 hours")
+
+            with st.spinner("Loading depth charts for all 32 teams…"):
+                dc_data = fetch_all_depth_charts()
+
+            if not dc_data:
+                st.warning("Could not load depth charts from ESPN. Try again in a moment.")
+            else:
+                dc_c1, dc_c2 = st.columns([1, 3])
+                with dc_c1:
+                    dc_team = st.selectbox(
+                        "Select Team",
+                        sorted(dc_data.keys()),
+                        key="dc_team",
+                    )
+                    dc_pos_filter = st.multiselect(
+                        "Positions",
+                        ["QB", "RB", "WR", "TE"],
+                        default=["QB", "RB", "WR", "TE"],
+                        key="dc_pos",
+                    )
+
+                with dc_c2:
+                    chart = dc_data.get(dc_team, {})
+                    if not chart:
+                        st.info(f"No depth chart data available for {dc_team}.")
+                    else:
+                        for pos in ["QB", "RB", "WR", "TE"]:
+                            if pos not in dc_pos_filter:
+                                continue
+                            players = chart.get(pos, [])
+                            if not players:
+                                continue
+                            st.markdown(f"**{pos}**")
+                            rows = []
+                            for i, name in enumerate(players, 1):
+                                # Cross-reference with our game log data
+                                p_data = nfl_df[nfl_df["player_name"].str.contains(
+                                    name.split(" ")[-1], case=False, na=False
+                                )]
+                                p_data = p_data[p_data["player_name"].str.contains(
+                                    name.split(" ")[0], case=False, na=False
+                                )]
+                                if not p_data.empty:
+                                    p25 = p_data[p_data["season"] == 2025]
+                                    p24 = p_data[p_data["season"] == 2024]
+                                    stat_col_map = {"QB": "passing_yards", "RB": "rush_yards",
+                                                    "WR": "receiving_yards", "TE": "receiving_yards"}
+                                    sc = stat_col_map[pos]
+                                    avg_25 = f"{p25[sc].mean():.1f}" if not p25.empty else "—"
+                                    avg_24 = f"{p24[sc].mean():.1f}" if not p24.empty else "—"
+                                    games  = len(p_data)
+                                else:
+                                    avg_25 = avg_24 = "New/No data"
+                                    games  = 0
+                                rows.append({
+                                    "Depth": f"#{i}",
+                                    "Player": name,
+                                    "2025 Avg": avg_25,
+                                    "2024 Avg": avg_24,
+                                    "Games in DB": games,
+                                })
+                            st.dataframe(pd.DataFrame(rows),
+                                         use_container_width=True, hide_index=True)
 
         # ── INJURY REPORT (formerly tab9) — content block follows below ───────
         with tab9:
@@ -1732,16 +1873,35 @@ with tab8:
             def_avgs  = dict(zip(def_agg["opponent"], def_agg["avg_allowed"]))
             total_teams = len(def_agg)
 
-            # Fetch schedule + odds
-            with st.spinner("Fetching this week's schedule and odds from ESPN..."):
+            # Fetch schedule, odds, and depth charts
+            with st.spinner("Fetching schedule, odds, and depth charts from ESPN..."):
                 games = fetch_this_weeks_games()
-                # Pull odds for each game (cached per game ID)
                 for g in games:
                     if g.get("espn_id"):
                         g["odds"] = fetch_game_odds(g["espn_id"])
                     else:
                         g["odds"] = {"over_under": None, "home_spread": None,
                                      "away_spread": None, "book_name": None}
+                depth_charts = fetch_all_depth_charts()
+
+            # Helper: map stat col → depth chart position(s)
+            _COL_TO_POS = {
+                "passing_yards":   ["QB"],
+                "passing_tds":     ["QB"],
+                "rush_yards":      ["RB"],
+                "receiving_yards": ["WR", "TE", "RB"],
+                "receptions":      ["WR", "TE", "RB"],
+                "fantasy_points":  ["QB", "RB", "WR", "TE"],
+            }
+
+            def depth_chart_players(team, stat_col, max_rank=3):
+                """Return the top-N depth chart players for a team/stat combo."""
+                chart = depth_charts.get(team, {})
+                positions = _COL_TO_POS.get(stat_col, [])
+                players = []
+                for pos in positions:
+                    players.extend(chart.get(pos, [])[:max_rank])
+                return players   # ordered starter-first; empty = no depth data
 
             if not games:
                 st.warning("No schedule data available. ESPN API may be temporarily unavailable.")
@@ -1787,14 +1947,15 @@ with tab8:
                         )
 
                         # Find best player on offense_team for this stat
+                        # Prefer depth-chart starters; fall back to historical leaders
+                        dc_names = depth_chart_players(offense_team, col, max_rank=3)
+
                         team_players = nfl_def[
                             (nfl_def["team"] == offense_team) &
-                            (nfl_def["season"] == 2025)
+                            (nfl_def["season"] == 2025) &
+                            (nfl_def[col] > 0)
                         ]
-                        # Filter to players who actually produce in this stat
-                        team_players = team_players[team_players[col] > 0]
                         if team_players.empty:
-                            # Try 2024 data
                             team_players = nfl_def[
                                 (nfl_def["team"] == offense_team) &
                                 (nfl_def["season"] == 2024) &
@@ -1803,7 +1964,6 @@ with tab8:
                         if team_players.empty:
                             continue
 
-                        # Aggregate by player, keep those with enough games
                         p_agg = (
                             team_players.groupby("player_name")[col]
                             .agg(["mean", "count", "std"])
@@ -1813,7 +1973,19 @@ with tab8:
                         if p_agg.empty:
                             continue
 
-                        p_agg = p_agg.sort_values("mean", ascending=False)
+                        # If depth chart data available, keep only depth chart players
+                        # and pick the starter (rank 1). Otherwise fall back to avg leader.
+                        if dc_names:
+                            dc_filtered = p_agg[p_agg["player_name"].isin(dc_names)]
+                            if not dc_filtered.empty:
+                                # Sort by depth chart order (starter first)
+                                dc_filtered = dc_filtered.copy()
+                                dc_filtered["dc_rank"] = dc_filtered["player_name"].apply(
+                                    lambda n: dc_names.index(n) if n in dc_names else 99
+                                )
+                                p_agg = dc_filtered.sort_values("dc_rank")
+
+                        p_agg = p_agg.sort_values("mean", ascending=False) if not dc_names else p_agg
                         best  = p_agg.iloc[0]
 
                         # Prop line = player's weighted avg adjusted for matchup
@@ -2005,7 +2177,18 @@ with tab8:
                                         if p_agg2.empty:
                                             continue
 
-                                        best2 = p_agg2.sort_values("mean", ascending=False).iloc[0]
+                                        # Apply depth chart filter for auto-parlay too
+                                        ap_dc_names = depth_chart_players(offense_team, ap_col, max_rank=3)
+                                        if ap_dc_names:
+                                            ap_dc_filtered = p_agg2[p_agg2["player_name"].isin(ap_dc_names)]
+                                            if not ap_dc_filtered.empty:
+                                                ap_dc_filtered = ap_dc_filtered.copy()
+                                                ap_dc_filtered["dc_rank"] = ap_dc_filtered["player_name"].apply(
+                                                    lambda n: ap_dc_names.index(n) if n in ap_dc_names else 99
+                                                )
+                                                p_agg2 = ap_dc_filtered.sort_values("dc_rank")
+
+                                        best2 = p_agg2.iloc[0]
                                         if best2["player_name"] in seen_players:
                                             continue
 
