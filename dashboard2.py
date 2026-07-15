@@ -1765,7 +1765,13 @@ with tab8:
             next_year = cur_year + 1
 
             def _scrape_year(year):
-                upcoming, last_completed = [], []
+                """
+                Walk weeks 1-18 for the given year.
+                Returns (upcoming_this_week, last_completed_list).
+                Stops as soon as it finds the first week that has ANY upcoming
+                (not-yet-played) game — so we never accumulate the whole season.
+                """
+                last_completed = []
                 for week in range(1, 19):
                     url = (
                         "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
@@ -1777,6 +1783,7 @@ with tab8:
                     events = data.get("events", [])
                     if not events:
                         break
+                    week_upcoming = []
                     for e in events:
                         comp  = e["competitions"][0]
                         done  = comp["status"]["type"]["completed"]
@@ -1793,10 +1800,13 @@ with tab8:
                             "espn_id":   e.get("id", ""),
                         }
                         if not done:
-                            upcoming.append(entry)
+                            week_upcoming.append(entry)
                         else:
                             last_completed.append(entry)
-                return upcoming, last_completed
+                    # As soon as we find a week with upcoming games, return just those
+                    if week_upcoming:
+                        return week_upcoming, last_completed
+                return [], last_completed
 
             # Try current season first
             upcoming, last_completed = _scrape_year(cur_year)
