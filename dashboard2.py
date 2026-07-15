@@ -1896,91 +1896,196 @@ with tab8:
                     # ── Auto-Parlay from top suggestions ──────────────────────
                     st.divider()
                     st.subheader("🎰 Auto-Generated Parlay")
-                    st.caption("Built from the top soft-matchup suggestions above. Adjust legs then send to Parlay Builder.")
+                    st.caption("Picks the best legs from soft matchups. Use **Mixed** mode to combine passing, rushing, receiving and more.")
 
                     ap_c1, ap_c2 = st.columns([1, 3])
                     with ap_c1:
-                        ap_legs  = st.slider("Number of legs", 2, min(8, len(prop_df)), 3, key="ap_legs")
-                        ap_stake = st.number_input("Stake ($)", min_value=1.0, value=10.0,
-                                                   step=5.0, format="%.2f", key="ap_stake")
+                        ap_mode = st.radio(
+                            "Stat mode",
+                            ["Single stat", "Mixed stats"],
+                            horizontal=True,
+                            key="ap_mode",
+                            help="Single = current stat only. Mixed = best leg from each selected stat type.",
+                        )
+                        ap_stat_options = list(CAT_MAP.keys())
+                        if ap_mode == "Mixed stats":
+                            ap_stats = st.multiselect(
+                                "Stats to include",
+                                ap_stat_options,
+                                default=["pass yards", "rush yards", "rec yards"],
+                                format_func=str.title,
+                                key="ap_stats",
+                            )
+                        else:
+                            ap_stats = [mf_stat]
+
+                        ap_legs     = st.slider("Max legs", 2, 8, 3, key="ap_legs")
+                        ap_stake    = st.number_input("Stake ($)", min_value=1.0, value=10.0,
+                                                      step=5.0, format="%.2f", key="ap_stake")
                         ap_weighted = st.toggle("Season weighting", value=True, key="ap_weighted")
-                        ap_build = st.button("⚡ Build Auto-Parlay", type="primary",
-                                             use_container_width=True, key="ap_build")
-                        ap_send  = st.button("➕ Send to Parlay Builder", use_container_width=True,
-                                             key="ap_send",
-                                             help="Loads these legs into the Parlay Builder tab")
+                        ap_build    = st.button("⚡ Build Auto-Parlay", type="primary",
+                                                use_container_width=True, key="ap_build")
+                        ap_send     = st.button("➕ Send to Parlay Builder", use_container_width=True,
+                                                key="ap_send",
+                                                help="Loads these legs into the Parlay Builder tab")
 
                     with ap_c2:
-                        # Take top N unique-player rows (prefer soft matchups)
-                        soft_rows = prop_df[prop_df["Matchup"] == "🟢 Soft"]
-                        pool = soft_rows if len(soft_rows) >= ap_legs else prop_df
-                        # Deduplicate by player so same player doesn't appear twice
-                        pool_unique = pool.drop_duplicates(subset="Player").head(ap_legs)
-
-                        # Score each leg using the existing score_leg helper
-                        auto_legs = []
-                        for _, row in pool_unique.iterrows():
-                            leg = score_leg(
-                                nfl_df,
-                                row["Player"],
-                                mf_stat,
-                                float(row["Suggested Line"]),
-                                ap_weighted,
-                            )
-                            if leg:
-                                auto_legs.append(leg)
-
-                        if len(auto_legs) < 2:
-                            st.info("Not enough scoreable legs — try lowering the leg count or switching stat.")
+                        if not ap_stats:
+                            st.info("Select at least one stat to include.")
                         else:
-                            # Combined probability & payout
-                            combined_prob = 1.0
-                            for lg in auto_legs:
-                                combined_prob *= lg["implied_prob"]
+                            # ── Build candidate pool across all selected stats ──
+                            # For each stat, run the same defense-rank logic and
+                            # collect the single best unique-player soft matchup.
+                            candidate_legs = []
+                            seen_players   = set()
 
-                            combined_american = prob_to_american(combined_prob)
-                            payout  = parlay_payout([lg["american_odds"] for lg in auto_legs], ap_stake)
-                            profit  = round(payout - ap_stake, 2)
-                            conf_label_ap, conf_color_ap = confidence_label(combined_prob)
+                            for ap_stat in ap_stats:
+                                ap_col = CAT_MAP[ap_stat.lower()][0]
 
-                            # Confidence banner
-                            st.markdown(
-                                f'<div style="background:{conf_color_ap};color:#fff;'
-                                f'padding:10px 18px;border-radius:8px;font-size:18px;'
-                                f'font-weight:700;text-align:center;margin-bottom:12px;">'
-                                f'Auto-Parlay Confidence: {conf_label_ap} &nbsp;·&nbsp; '
-                                f'{combined_prob*100:.1f}% est. probability'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
+                                # Build defense ranks for this stat
+                                if mf_season == "Both":
+                                    ap_def_sample = nfl_def.copy()
+                                else:
+                                    ap_def_sample = nfl_def[nfl_def["season"] == int(mf_season)]
 
-                            # Summary metrics
-                            pm1, pm2, pm3, pm4 = st.columns(4)
-                            pm1.metric("Legs",             len(auto_legs))
-                            pm2.metric("Combined Odds",    f"+{combined_american}" if combined_american > 0 else str(combined_american))
-                            pm3.metric("Potential Payout", f"${payout:,.2f}")
-                            pm4.metric("Potential Profit", f"${profit:,.2f}")
+                                ap_def_agg = (
+                                    ap_def_sample.groupby("opponent")
+                                    .agg(avg_allowed=(ap_col, "mean"), games=(ap_col, "count"))
+                                    .reset_index()
+                                )
+                                ap_def_agg = ap_def_agg[ap_def_agg["games"] >= mf_min_games]
+                                if ap_def_agg.empty:
+                                    continue
+                                ap_league_avg = ap_def_agg["avg_allowed"].mean()
+                                ap_def_avgs   = dict(zip(ap_def_agg["opponent"], ap_def_agg["avg_allowed"]))
 
-                            # Leg detail table
-                            leg_rows = []
-                            for lg in auto_legs:
-                                leg_rows.append({
-                                    "Player":    lg["player"],
-                                    "Stat":      lg["category"].title(),
-                                    "Line":      lg["line"],
-                                    "Pick":      lg["recommendation"],
-                                    "Wtd Avg":   lg["w_avg"],
-                                    "Hit Rate":  f"{lg['hit_rate_pct']}%",
-                                    "Leg Odds":  f"+{lg['american_odds']}" if lg["american_odds"] > 0 else str(lg["american_odds"]),
-                                    "Leg Prob":  f"{lg['implied_prob']*100:.1f}%",
-                                })
-                            st.dataframe(pd.DataFrame(leg_rows),
-                                         use_container_width=True, hide_index=True)
+                                # Find best player for this stat across all this week's games
+                                for game in games:
+                                    for offense_team, defense_team in [
+                                        (game["away"], game["home"]),
+                                        (game["home"], game["away"]),
+                                    ]:
+                                        ap_def_avg = ap_def_avgs.get(defense_team, ap_league_avg)
+                                        # Only soft matchups in mixed mode
+                                        if ap_mode == "Mixed stats" and ap_def_avg <= ap_league_avg * 1.05:
+                                            continue
 
-                            # Send to Parlay Builder button logic
-                            if ap_send or ap_build:
+                                        team_p = nfl_def[
+                                            (nfl_def["team"] == offense_team) &
+                                            (nfl_def["season"] == 2025) &
+                                            (nfl_def[ap_col] > 0)
+                                        ]
+                                        if team_p.empty:
+                                            team_p = nfl_def[
+                                                (nfl_def["team"] == offense_team) &
+                                                (nfl_def["season"] == 2024) &
+                                                (nfl_def[ap_col] > 0)
+                                            ]
+                                        if team_p.empty:
+                                            continue
+
+                                        p_agg2 = (
+                                            team_p.groupby("player_name")[ap_col]
+                                            .agg(["mean", "count"])
+                                            .reset_index()
+                                        )
+                                        p_agg2 = p_agg2[p_agg2["count"] >= mf_min_player]
+                                        if p_agg2.empty:
+                                            continue
+
+                                        best2 = p_agg2.sort_values("mean", ascending=False).iloc[0]
+                                        if best2["player_name"] in seen_players:
+                                            continue
+
+                                        # Calculate suggested line for this stat
+                                        matchup_f = ap_def_avg / ap_league_avg if ap_league_avg > 0 else 1.0
+                                        proj2 = float(best2["mean"]) * matchup_f
+                                        if ap_col == "passing_yards":
+                                            incs = [i + 0.5 for i in range(50, 500, 25)]
+                                        elif ap_col in ("rush_yards", "receiving_yards"):
+                                            incs = [i + 0.5 for i in range(0, 250, 10)]
+                                        elif ap_col == "receptions":
+                                            incs = [i + 0.5 for i in range(0, 20, 1)]
+                                        elif ap_col == "passing_tds":
+                                            incs = [0.5, 1.5, 2.5, 3.5]
+                                        else:
+                                            incs = [i + 0.5 for i in range(0, 60, 5)]
+                                        sug_line = min(incs, key=lambda x: abs(x - proj2))
+
+                                        leg = score_leg(
+                                            nfl_df,
+                                            best2["player_name"],
+                                            ap_stat,
+                                            sug_line,
+                                            ap_weighted,
+                                        )
+                                        if leg:
+                                            leg["defense"]  = defense_team
+                                            leg["def_avg"]  = round(ap_def_avg, 1)
+                                            leg["matchup"]  = "🟢 Soft" if ap_def_avg > ap_league_avg * 1.10 else "🟡 Average"
+                                            candidate_legs.append(leg)
+                                            seen_players.add(best2["player_name"])
+                                            break  # one best leg per stat per pass
+                                    else:
+                                        continue
+                                    break
+
+                            # Sort by implied prob descending, take top ap_legs
+                            candidate_legs.sort(key=lambda x: x["implied_prob"], reverse=True)
+                            auto_legs = candidate_legs[:ap_legs]
+
+                            if len(auto_legs) < 2:
+                                st.info("Not enough soft matchups found. Try **Single stat** mode, lower the leg count, or switch to **Both** seasons in the Defensive sample filter.")
+                            else:
+                                # Combined probability & payout
+                                combined_prob = 1.0
+                                for lg in auto_legs:
+                                    combined_prob *= lg["implied_prob"]
+
+                                combined_american = prob_to_american(combined_prob)
+                                payout  = parlay_payout([lg["american_odds"] for lg in auto_legs], ap_stake)
+                                profit  = round(payout - ap_stake, 2)
+                                conf_label_ap, conf_color_ap = confidence_label(combined_prob)
+
+                                # Confidence banner
+                                st.markdown(
+                                    f'<div style="background:{conf_color_ap};color:#fff;'
+                                    f'padding:10px 18px;border-radius:8px;font-size:18px;'
+                                    f'font-weight:700;text-align:center;margin-bottom:12px;">'
+                                    f'Auto-Parlay Confidence: {conf_label_ap} &nbsp;·&nbsp; '
+                                    f'{combined_prob*100:.1f}% est. probability'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                                # Summary metrics
+                                pm1, pm2, pm3, pm4 = st.columns(4)
+                                pm1.metric("Legs",             len(auto_legs))
+                                pm2.metric("Combined Odds",    f"+{combined_american}" if combined_american > 0 else str(combined_american))
+                                pm3.metric("Potential Payout", f"${payout:,.2f}")
+                                pm4.metric("Potential Profit", f"${profit:,.2f}")
+
+                                # Leg detail table
+                                leg_rows = []
+                                for lg in auto_legs:
+                                    leg_rows.append({
+                                        "Player":    lg["player"],
+                                        "Stat":      lg["category"].title(),
+                                        "Line":      lg["line"],
+                                        "Pick":      lg["recommendation"],
+                                        "vs Defense": lg.get("defense", "—"),
+                                        "Def Allows": lg.get("def_avg", "—"),
+                                        "Matchup":   lg.get("matchup", "—"),
+                                        "Wtd Avg":   lg["w_avg"],
+                                        "Hit Rate":  f"{lg['hit_rate_pct']}%",
+                                        "Leg Odds":  f"+{lg['american_odds']}" if lg["american_odds"] > 0 else str(lg["american_odds"]),
+                                        "Leg Prob":  f"{lg['implied_prob']*100:.1f}%",
+                                    })
+                                st.dataframe(pd.DataFrame(leg_rows),
+                                             use_container_width=True, hide_index=True)
+
+                                # Send to Parlay Builder
                                 if ap_send:
-                                    # Merge into existing parlay legs (skip duplicates)
                                     existing = st.session_state.get("parlay_legs", [])
                                     added = 0
                                     for lg in auto_legs:
