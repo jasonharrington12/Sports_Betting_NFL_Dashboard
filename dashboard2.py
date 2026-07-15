@@ -1893,6 +1893,112 @@ with tab8:
                             unsafe_allow_html=True,
                         )
 
+                    # ── Auto-Parlay from top suggestions ──────────────────────
+                    st.divider()
+                    st.subheader("🎰 Auto-Generated Parlay")
+                    st.caption("Built from the top soft-matchup suggestions above. Adjust legs then send to Parlay Builder.")
+
+                    ap_c1, ap_c2 = st.columns([1, 3])
+                    with ap_c1:
+                        ap_legs  = st.slider("Number of legs", 2, min(8, len(prop_df)), 3, key="ap_legs")
+                        ap_stake = st.number_input("Stake ($)", min_value=1.0, value=10.0,
+                                                   step=5.0, format="%.2f", key="ap_stake")
+                        ap_weighted = st.toggle("Season weighting", value=True, key="ap_weighted")
+                        ap_build = st.button("⚡ Build Auto-Parlay", type="primary",
+                                             use_container_width=True, key="ap_build")
+                        ap_send  = st.button("➕ Send to Parlay Builder", use_container_width=True,
+                                             key="ap_send",
+                                             help="Loads these legs into the Parlay Builder tab")
+
+                    with ap_c2:
+                        # Take top N unique-player rows (prefer soft matchups)
+                        soft_rows = prop_df[prop_df["Matchup"] == "🟢 Soft"]
+                        pool = soft_rows if len(soft_rows) >= ap_legs else prop_df
+                        # Deduplicate by player so same player doesn't appear twice
+                        pool_unique = pool.drop_duplicates(subset="Player").head(ap_legs)
+
+                        # Score each leg using the existing score_leg helper
+                        auto_legs = []
+                        for _, row in pool_unique.iterrows():
+                            leg = score_leg(
+                                nfl_df,
+                                row["Player"],
+                                mf_stat,
+                                float(row["Suggested Line"]),
+                                ap_weighted,
+                            )
+                            if leg:
+                                auto_legs.append(leg)
+
+                        if len(auto_legs) < 2:
+                            st.info("Not enough scoreable legs — try lowering the leg count or switching stat.")
+                        else:
+                            # Combined probability & payout
+                            combined_prob = 1.0
+                            for lg in auto_legs:
+                                combined_prob *= lg["implied_prob"]
+
+                            combined_american = prob_to_american(combined_prob)
+                            payout  = parlay_payout([lg["american_odds"] for lg in auto_legs], ap_stake)
+                            profit  = round(payout - ap_stake, 2)
+                            conf_label_ap, conf_color_ap = confidence_label(combined_prob)
+
+                            # Confidence banner
+                            st.markdown(
+                                f'<div style="background:{conf_color_ap};color:#fff;'
+                                f'padding:10px 18px;border-radius:8px;font-size:18px;'
+                                f'font-weight:700;text-align:center;margin-bottom:12px;">'
+                                f'Auto-Parlay Confidence: {conf_label_ap} &nbsp;·&nbsp; '
+                                f'{combined_prob*100:.1f}% est. probability'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                            # Summary metrics
+                            pm1, pm2, pm3, pm4 = st.columns(4)
+                            pm1.metric("Legs",             len(auto_legs))
+                            pm2.metric("Combined Odds",    f"+{combined_american}" if combined_american > 0 else str(combined_american))
+                            pm3.metric("Potential Payout", f"${payout:,.2f}")
+                            pm4.metric("Potential Profit", f"${profit:,.2f}")
+
+                            # Leg detail table
+                            leg_rows = []
+                            for lg in auto_legs:
+                                leg_rows.append({
+                                    "Player":    lg["player"],
+                                    "Stat":      lg["category"].title(),
+                                    "Line":      lg["line"],
+                                    "Pick":      lg["recommendation"],
+                                    "Wtd Avg":   lg["w_avg"],
+                                    "Hit Rate":  f"{lg['hit_rate_pct']}%",
+                                    "Leg Odds":  f"+{lg['american_odds']}" if lg["american_odds"] > 0 else str(lg["american_odds"]),
+                                    "Leg Prob":  f"{lg['implied_prob']*100:.1f}%",
+                                })
+                            st.dataframe(pd.DataFrame(leg_rows),
+                                         use_container_width=True, hide_index=True)
+
+                            # Send to Parlay Builder button logic
+                            if ap_send or ap_build:
+                                if ap_send:
+                                    # Merge into existing parlay legs (skip duplicates)
+                                    existing = st.session_state.get("parlay_legs", [])
+                                    added = 0
+                                    for lg in auto_legs:
+                                        dup = any(
+                                            e["player"] == lg["player"] and
+                                            e["category"] == lg["category"] and
+                                            e["line"] == lg["line"]
+                                            for e in existing
+                                        )
+                                        if not dup and len(existing) < 8:
+                                            existing.append(lg)
+                                            added += 1
+                                    st.session_state["parlay_legs"] = existing
+                                    if added:
+                                        st.success(f"✅ {added} leg{'s' if added > 1 else ''} added to Parlay Builder — switch to the 🎰 Parlay Builder tab.")
+                                    else:
+                                        st.info("All legs already in Parlay Builder (or builder is full at 8 legs).")
+
                     # ── Full table ────────────────────────────────────────────
                     st.divider()
                     st.subheader(f"All {col_label} Props — {label}")
