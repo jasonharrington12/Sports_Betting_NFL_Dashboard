@@ -62,9 +62,19 @@ C_TREND = "#7c5cd8"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ESPN API HELPERS
+# ESPN API HELPERS  +  ODDS API HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 import re as _re, time as _time, requests as _requests
+
+# ── Odds API market map (must be defined before fetch_odds_api_props) ─────────
+_ODDS_MARKET_MAP = {
+    "player_pass_yds":      "pass yards",
+    "player_rush_yds":      "rush yards",
+    "player_reception_yds": "rec yards",
+    "player_receptions":    "receptions",
+    "player_pass_tds":      "pass tds",
+}
+_ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
 
 _ESPN_SCOREBOARD = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
@@ -181,6 +191,94 @@ def fetch_all_depth_charts():
         _time.sleep(0.1)   # be polite to ESPN
 
     return result
+
+
+@st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
+def fetch_odds_api_props(api_key: str) -> list:
+    """
+    Pull live NFL player prop lines from The Odds API.
+    Returns a list of dicts: {player_raw, cat, line, bookmaker, home, away}
+    """
+    events_url = (
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+        f"?apiKey={api_key}&dateFormat=iso"
+    )
+    events_data = _get_json(events_url)
+    if not events_data or not isinstance(events_data, list):
+        return []
+
+    rows = []
+    for event in events_data[:16]:
+        event_id  = event.get("id", "")
+        home_team = event.get("home_team", "")
+        away_team = event.get("away_team", "")
+
+        props_url = (
+            f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
+            f"/events/{event_id}/odds"
+            f"?apiKey={api_key}&regions=us&markets={_ODDS_MARKETS}"
+            f"&oddsFormat=american&dateFormat=iso"
+        )
+        props_data = _get_json(props_url)
+        if not props_data:
+            continue
+
+        bookmakers = props_data.get("bookmakers", [])
+        bm = next((b for b in bookmakers if b["key"] == "draftkings"), None)
+        if bm is None and bookmakers:
+            bm = bookmakers[0]
+        if bm is None:
+            continue
+
+        bm_name = bm.get("title", "Book")
+        for market in bm.get("markets", []):
+            market_key = market.get("key", "")
+            cat = _ODDS_MARKET_MAP.get(market_key)
+            if cat is None:
+                continue
+            for outcome in market.get("outcomes", []):
+                if outcome.get("name", "").lower() != "over":
+                    continue
+                player_name = outcome.get("description", outcome.get("player", ""))
+                point       = outcome.get("point")
+                if not player_name or point is None:
+                    continue
+                rows.append({
+                    "player_raw": player_name,
+                    "cat":        cat,
+                    "line":       float(point),
+                    "opp":        None,
+                    "home":       home_team,
+                    "away":       away_team,
+                    "bookmaker":  bm_name,
+                })
+        _time.sleep(0.2)
+
+    return rows
+
+
+def _full_team_name_to_abbr(full: str) -> str:
+    """Best-effort map of full NFL team name → 2-3 letter abbreviation."""
+    _MAP = {
+        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL",
+        "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+        "Carolina Panthers": "CAR", "Chicago Bears": "CHI",
+        "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN",
+        "Detroit Lions": "DET", "Green Bay Packers": "GB",
+        "Houston Texans": "HOU", "Indianapolis Colts": "IND",
+        "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC",
+        "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
+        "Minnesota Vikings": "MIN", "New England Patriots": "NE",
+        "New Orleans Saints": "NO", "New York Giants": "NYG",
+        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI",
+        "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
+        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB",
+        "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
+    }
+    return _MAP.get(full, full[:3].upper())
+
 
 def _scrape_game(game_id, season, week, home, away):
     data = _get_json(_ESPN_SUMMARY.format(game_id=game_id))
@@ -2989,111 +3087,6 @@ with tab11:
 # Auto-fetches live NFL player props from The Odds API (free tier).
 # Falls back to manual paste if no API key is set.
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ── Odds API helpers ──────────────────────────────────────────────────────────
-# Map Odds API market keys → our internal CAT_MAP keys
-_ODDS_MARKET_MAP = {
-    "player_pass_yds":     "pass yards",
-    "player_rush_yds":     "rush yards",
-    "player_reception_yds":"rec yards",
-    "player_receptions":   "receptions",
-    "player_pass_tds":     "pass tds",
-}
-# Markets to request (comma-joined for the API call)
-_ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
-
-@st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
-def fetch_odds_api_props(api_key: str) -> list:
-    """
-    Pull live NFL player prop lines from The Odds API.
-    Returns a list of dicts: {player, cat, line, bookmaker, opp}
-    opp = the opposing team abbreviation derived from the game matchup.
-    """
-    # Step 1: get event IDs for upcoming NFL games
-    events_url = (
-        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-        f"?apiKey={api_key}&dateFormat=iso"
-    )
-    events_data = _get_json(events_url)
-    if not events_data or not isinstance(events_data, list):
-        return []
-
-    # Step 2: for each event fetch player props
-    rows = []
-    for event in events_data[:16]:   # max 16 games/week; respect quota
-        event_id   = event.get("id", "")
-        home_team  = event.get("home_team", "")
-        away_team  = event.get("away_team", "")
-
-        props_url = (
-            f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
-            f"/events/{event_id}/odds"
-            f"?apiKey={api_key}&regions=us&markets={_ODDS_MARKETS}"
-            f"&oddsFormat=american&dateFormat=iso"
-        )
-        props_data = _get_json(props_url)
-        if not props_data:
-            continue
-
-        bookmakers = props_data.get("bookmakers", [])
-        # Prefer DraftKings, fall back to first available
-        bm = next((b for b in bookmakers if b["key"] == "draftkings"), None)
-        if bm is None and bookmakers:
-            bm = bookmakers[0]
-        if bm is None:
-            continue
-
-        bm_name = bm.get("title", "Book")
-        for market in bm.get("markets", []):
-            market_key = market.get("key", "")
-            cat = _ODDS_MARKET_MAP.get(market_key)
-            if cat is None:
-                continue
-            for outcome in market.get("outcomes", []):
-                if outcome.get("name", "").lower() != "over":
-                    continue   # only grab the Over line (we store one line per player/stat)
-                player_name = outcome.get("description", outcome.get("player", ""))
-                point       = outcome.get("point")
-                if not player_name or point is None:
-                    continue
-                # Determine opponent: if player is on home team, opp = away, and vice versa.
-                # We don't know the player's team from this endpoint, so store both teams.
-                rows.append({
-                    "player_raw": player_name,
-                    "cat":        cat,
-                    "line":       float(point),
-                    "opp":        None,          # filled below where we can
-                    "home":       home_team,
-                    "away":       away_team,
-                    "bookmaker":  bm_name,
-                })
-        _time.sleep(0.2)   # be polite
-
-    return rows
-
-
-def _full_team_name_to_abbr(full: str) -> str:
-    """Best-effort map of ESPN full team name → our 2-3 letter abbreviation."""
-    _MAP = {
-        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL",
-        "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
-        "Carolina Panthers": "CAR", "Chicago Bears": "CHI",
-        "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
-        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN",
-        "Detroit Lions": "DET", "Green Bay Packers": "GB",
-        "Houston Texans": "HOU", "Indianapolis Colts": "IND",
-        "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
-        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC",
-        "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
-        "Minnesota Vikings": "MIN", "New England Patriots": "NE",
-        "New Orleans Saints": "NO", "New York Giants": "NYG",
-        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI",
-        "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
-        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB",
-        "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
-    }
-    return _MAP.get(full, full[:3].upper())
-
 
 with tab_vegas:
     if not data_ok:
