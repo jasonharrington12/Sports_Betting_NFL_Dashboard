@@ -631,10 +631,11 @@ with st.spinner("Loading data…"):
 # ──────────────────────────────────────────────────────────────────────────────
 # TABS
 # ──────────────────────────────────────────────────────────────────────────────
-main_bet, main_players, main_teams, main_settings = st.tabs([
+main_bet, main_players, main_teams, main_tracker, main_settings = st.tabs([
     "🎯 Betting Tools",
     "👤 Players",
     "🏟️ Teams & League",
+    "📒 Bet Tracker",
     "⚙️ Settings & Data",
 ])
 
@@ -647,12 +648,13 @@ with main_bet:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        tab1, tab6, tab8, tab7, tab_streak = st.tabs([
+        tab1, tab6, tab8, tab7, tab_streak, tab_vegas = st.tabs([
             "📊 Prop Analyzer",
             "🆚 Matchup Edge",
             "🎯 Matchup Finder",
             "🎰 Parlay Builder",
             "🔥 Streak Finder",
+            "📈 Vegas Lines",
         ])
 
         # ── PROP ANALYZER ────────────────────────────────────────────────────
@@ -963,6 +965,10 @@ with main_bet:
                     plt.tight_layout()
                     st.pyplot(fig_s, use_container_width=True)
                     plt.close(fig_s)
+
+        # ── VEGAS LINES (tab_vegas) — content block follows below ────────────
+        with tab_vegas:
+            pass  # filled in below
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2911,3 +2917,764 @@ with tab11:
                 )
         else:
             st.info("👈 Select two players, their opponents this week, and click **Get Recommendation**.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VEGAS LINE IMPORTER (tab_vegas inside main_bet)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_vegas:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
+        st.subheader("📈 Vegas Line Importer")
+        st.caption(
+            "Paste a slate of prop lines (one per row) and the model will score each one "
+            "against historical data, showing where it finds the biggest edge vs the book."
+        )
+
+        # ── Format instructions ───────────────────────────────────────────────
+        with st.expander("📋 Input format instructions", expanded=False):
+            st.markdown(
+                """
+**Paste lines in CSV format** — one prop per row:
+
+```
+Player Name, stat category, line
+```
+
+**Stat categories** (exact spelling): `pass yards`, `rush yards`, `rec yards`,
+`receptions`, `pass tds`, `fantasy`
+
+**Example:**
+```
+Patrick Mahomes, pass yards, 287.5
+Saquon Barkley, rush yards, 84.5
+Ja'Marr Chase, rec yards, 74.5
+Travis Kelce, receptions, 5.5
+```
+
+Lines containing `#` are treated as comments and ignored.
+"""
+            )
+
+        # ── Controls ──────────────────────────────────────────────────────────
+        vl_c1, vl_c2 = st.columns([1, 3])
+
+        with vl_c1:
+            st.markdown("#### Settings")
+            vl_weighted  = st.toggle("Season weighting", value=True, key="vl_weighted")
+            vl_window    = st.radio("Game window", ["Last 3", "Last 5", "Season"],
+                                    index=2, horizontal=True, key="vl_window")
+            vl_opp_mode  = st.toggle(
+                "Include opponent defense",
+                value=False, key="vl_opp_mode",
+                help="When ON, add an 'Opponent' column to each row and factor in matchup difficulty.",
+            )
+            vl_min_edge  = st.number_input(
+                "Min edge to highlight (units)",
+                min_value=0.0, value=5.0, step=1.0, format="%.1f",
+                key="vl_min_edge",
+                help="Rows where |model avg – book line| ≥ this value are highlighted.",
+            )
+            vl_go = st.button("⚡ Run Analysis", type="primary",
+                              use_container_width=True, key="vl_go")
+
+        with vl_c2:
+            vl_paste = st.text_area(
+                "Paste prop lines here",
+                height=220,
+                key="vl_paste",
+                placeholder=(
+                    "Patrick Mahomes, pass yards, 287.5\n"
+                    "Saquon Barkley, rush yards, 84.5\n"
+                    "Ja'Marr Chase, rec yards, 74.5\n"
+                    "Travis Kelce, receptions, 5.5"
+                ),
+            )
+
+            if vl_go and vl_paste.strip():
+                # ── Parse input ───────────────────────────────────────────────
+                parse_errors = []
+                parsed_rows  = []
+                for raw_line in vl_paste.strip().splitlines():
+                    raw_line = raw_line.strip()
+                    if not raw_line or raw_line.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in raw_line.split(",")]
+                    if len(parts) < 3:
+                        parse_errors.append(f"⚠️ Skipped (not enough columns): `{raw_line}`")
+                        continue
+                    player_raw = parts[0]
+                    cat_raw    = parts[1].lower().strip()
+                    try:
+                        line_raw = float(parts[2])
+                    except ValueError:
+                        parse_errors.append(f"⚠️ Skipped (bad line value): `{raw_line}`")
+                        continue
+                    opp_raw = parts[3] if len(parts) >= 4 else None
+
+                    if cat_raw not in CAT_MAP:
+                        # try partial match
+                        cat_raw = next((k for k in CAT_MAP if k.startswith(cat_raw[:4])), None)
+                    if cat_raw is None:
+                        parse_errors.append(f"⚠️ Skipped (unknown category): `{raw_line}`")
+                        continue
+
+                    parsed_rows.append({
+                        "player_raw": player_raw,
+                        "cat":        cat_raw,
+                        "line":       line_raw,
+                        "opp":        opp_raw,
+                    })
+
+                if parse_errors:
+                    for e in parse_errors:
+                        st.warning(e)
+
+                if not parsed_rows:
+                    st.error("No valid rows to analyse. Check the format above.")
+                else:
+                    # ── Build opponent lookup once ────────────────────────────
+                    @st.cache_data(show_spinner=False)
+                    def _build_opp_vl(nfl):
+                        df = nfl.copy()
+                        def _opp(row):
+                            parts = str(row["game_id"]).split("_")
+                            if len(parts) < 4: return "UNK"
+                            away, home = parts[2], parts[3]
+                            return home if row["team"] == away else away
+                        df["opponent"] = df.apply(_opp, axis=1)
+                        return df
+                    nfl_vl_opp = _build_opp_vl(nfl_df)
+
+                    # ── Score each line ───────────────────────────────────────
+                    result_rows = []
+                    for pr in parsed_rows:
+                        res = prop_analysis(
+                            nfl_df,
+                            pr["player_raw"], pr["cat"],
+                            pr["line"], vl_weighted, vl_window,
+                        )
+                        if res is None:
+                            result_rows.append({
+                                "Player":      pr["player_raw"],
+                                "Stat":        pr["cat"].title(),
+                                "Book Line":   pr["line"],
+                                "Model Avg":   "—",
+                                "Edge":        "—",
+                                "Hit Rate":    "—",
+                                "Std Dev":     "—",
+                                "Pick":        "NOT FOUND",
+                                "Confidence":  "—",
+                                "_edge_val":   0.0,
+                                "_found":      False,
+                            })
+                            continue
+
+                        col_name = CAT_MAP[pr["cat"]][0]
+                        model_avg = res["w_avg"]
+                        edge      = model_avg - pr["line"]
+                        hit_rate  = res["w_hit"]
+                        std_dev   = res["std_dev"]
+                        pick      = "OVER" if edge > 0 else "UNDER"
+
+                        # Matchup adjustment if opponent supplied
+                        matchup_grade = ""
+                        if vl_opp_mode and pr["opp"]:
+                            opp = pr["opp"].strip().upper()
+                            vs_opp   = nfl_vl_opp[nfl_vl_opp["opponent"] == opp]
+                            lg_avg_d = nfl_vl_opp.groupby("opponent")[col_name].mean().mean()
+                            opp_avg  = vs_opp[col_name].mean() if not vs_opp.empty else lg_avg_d
+                            factor   = opp_avg / lg_avg_d if lg_avg_d > 0 else 1.0
+                            model_avg_adj = model_avg * factor
+                            edge     = model_avg_adj - pr["line"]
+                            pick     = "OVER" if edge > 0 else "UNDER"
+                            if factor > 1.10:   matchup_grade = "🟢 Soft"
+                            elif factor < 0.90: matchup_grade = "🔴 Tough"
+                            else:               matchup_grade = "🟡 Avg"
+
+                        # Confidence: how far is hit-rate from 50%?
+                        conf_dist = abs(hit_rate - 50.0)
+                        if conf_dist >= 20:   conf = "★★★ High"
+                        elif conf_dist >= 10: conf = "★★  Med"
+                        else:                 conf = "★    Low"
+
+                        row = {
+                            "Player":     res["full_name"],
+                            "Stat":       pr["cat"].title(),
+                            "Book Line":  pr["line"],
+                            "Model Avg":  round(model_avg, 1),
+                            "Edge":       round(edge, 1),
+                            "Hit Rate":   f"{hit_rate:.1f}%",
+                            "Std Dev":    round(std_dev, 1),
+                            "Pick":       pick,
+                            "Confidence": conf,
+                            "_edge_val":  abs(edge),
+                            "_found":     True,
+                        }
+                        if vl_opp_mode and pr["opp"]:
+                            row["Opponent"]     = pr["opp"].strip().upper()
+                            row["Matchup"]      = matchup_grade
+                        result_rows.append(row)
+
+                    # ── Sort by edge descending ───────────────────────────────
+                    result_rows.sort(key=lambda r: r["_edge_val"], reverse=True)
+                    disp_df = pd.DataFrame(result_rows).drop(columns=["_edge_val", "_found"])
+
+                    # ── Summary KPIs ──────────────────────────────────────────
+                    found     = [r for r in result_rows if r["_found"]]
+                    n_over    = sum(1 for r in found if r["Pick"] == "OVER")
+                    n_under   = sum(1 for r in found if r["Pick"] == "UNDER")
+                    n_high    = sum(1 for r in found if "High" in r["Confidence"])
+                    avg_edge  = (sum(r["_edge_val"] for r in found) / len(found)) if found else 0
+
+                    k1, k2, k3, k4, k5 = st.columns(5)
+                    k1.metric("Lines analysed", len(found))
+                    k2.metric("OVER picks",  n_over)
+                    k3.metric("UNDER picks", n_under)
+                    k4.metric("High confidence", n_high)
+                    k5.metric("Avg edge", f"{avg_edge:.1f}")
+
+                    # ── Top edges banner ──────────────────────────────────────
+                    top_edges = [r for r in found if r["_edge_val"] >= vl_min_edge]
+                    if top_edges:
+                        st.markdown(f"**{len(top_edges)} bet(s) with edge ≥ {vl_min_edge:.0f} units:**")
+                        for r in top_edges[:6]:
+                            pick_color = "#2DC653" if r["Pick"] == "OVER" else "#D62828"
+                            edge_str   = f"+{r['Edge']:.1f}" if r["Edge"] > 0 else f"{r['Edge']:.1f}"
+                            opp_str    = f" &nbsp;·&nbsp; vs {r.get('Opponent','')} {r.get('Matchup','')}" if vl_opp_mode else ""
+                            st.markdown(
+                                f'<div style="border-left:5px solid {pick_color};'
+                                f'padding:8px 14px;background:#f7f8fa;border-radius:6px;'
+                                f'margin-bottom:6px;font-size:14px;">'
+                                f'<b>{r["Player"]}</b> &nbsp;|&nbsp; '
+                                f'{r["Stat"]} <span style="color:{pick_color};font-weight:700;">'
+                                f'{r["Pick"]} {r["Book Line"]}</span>'
+                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Model avg: <b>{r["Model Avg"]}</b>'
+                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Edge: <b>{edge_str}</b>'
+                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Hit rate: {r["Hit Rate"]}'
+                                f'&nbsp;&nbsp;·&nbsp;&nbsp;{r["Confidence"]}'
+                                f'{opp_str}'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.info(f"No lines found with edge ≥ {vl_min_edge:.0f} units. "
+                                "Try lowering the minimum edge threshold.")
+
+                    st.divider()
+                    st.subheader("Full Slate Results")
+
+                    # Colour-map edge column using pandas Styler
+                    def _color_edge(val):
+                        try:
+                            v = float(val)
+                        except (TypeError, ValueError):
+                            return ""
+                        if v >= vl_min_edge:   return "background-color:#d4f5dc"
+                        if v <= -vl_min_edge:  return "background-color:#fde8e8"
+                        return ""
+
+                    def _color_pick(val):
+                        if val == "OVER":       return "color:#2DC653;font-weight:700"
+                        if val == "UNDER":      return "color:#D62828;font-weight:700"
+                        if val == "NOT FOUND":  return "color:#888"
+                        return ""
+
+                    styled = (
+                        disp_df.style
+                        .applymap(_color_edge, subset=["Edge"])
+                        .applymap(_color_pick, subset=["Pick"])
+                    )
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                    # ── Send best legs straight to Parlay Builder ─────────────
+                    st.divider()
+                    vl_send_n = st.slider("Send top N edges to Parlay Builder", 2, 8, 3,
+                                          key="vl_send_n")
+                    if st.button("➕ Send to Parlay Builder", key="vl_send",
+                                 help="Loads the top-N edge legs into the Parlay Builder tab"):
+                        sendable = [r for r in found if r["Pick"] in ("OVER","UNDER")]
+                        sendable.sort(key=lambda r: r["_edge_val"], reverse=True)
+                        existing = st.session_state.get("parlay_legs", [])
+                        added = 0
+                        for r in sendable[:vl_send_n]:
+                            leg = score_leg(nfl_df, r["Player"], r["Stat"].lower(),
+                                            r["Book Line"], vl_weighted)
+                            if leg is None:
+                                continue
+                            dup = any(
+                                e["player"] == leg["player"] and
+                                e["category"] == leg["category"] and
+                                e["line"] == leg["line"]
+                                for e in existing
+                            )
+                            if not dup and len(existing) < 8:
+                                existing.append(leg)
+                                added += 1
+                        st.session_state["parlay_legs"] = existing
+                        if added:
+                            st.success(f"✅ {added} leg(s) added — switch to the 🎰 Parlay Builder tab.")
+                        else:
+                            st.info("All legs already in Parlay Builder (or it's full at 8 legs).")
+
+            elif vl_go:
+                st.warning("Paste some lines above first.")
+            else:
+                st.info("👈 Configure settings, paste your lines, and click **Run Analysis**.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BET TRACKER  (main_tracker — 4th main tab)
+# ══════════════════════════════════════════════════════════════════════════════
+import json as _json, os as _os
+
+_BET_FILE = _os.path.join(_os.path.dirname(__file__), "bets.json")
+
+
+def _load_bets() -> list:
+    """Load bets from the JSON file; return empty list if missing or corrupt."""
+    if not _os.path.exists(_BET_FILE):
+        return []
+    try:
+        with open(_BET_FILE, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_bets(bets: list):
+    """Persist bet list to disk."""
+    with open(_BET_FILE, "w", encoding="utf-8") as f:
+        _json.dump(bets, f, indent=2)
+
+
+# Keep a single copy in session state so edits are instant without re-reading disk
+if "bt_bets" not in st.session_state:
+    st.session_state["bt_bets"] = _load_bets()
+
+
+with main_tracker:
+    st.title("📒 Bet Tracker")
+    st.caption(
+        "Log your prop bets, mark results, and track P&L / ROI over time. "
+        "Data is saved to **bets.json** in the project folder."
+    )
+
+    import datetime as _dtbt
+
+    # ── helper: rebuild DataFrame from session state ──────────────────────────
+    def _bets_df() -> pd.DataFrame:
+        bets = st.session_state["bt_bets"]
+        if not bets:
+            return pd.DataFrame(columns=[
+                "id","date","player","stat","line","pick","stake",
+                "odds","result","actual","pnl","notes",
+            ])
+        return pd.DataFrame(bets)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Sub-tabs
+    # ══════════════════════════════════════════════════════════════════════════
+    bt_log_tab, bt_results_tab, bt_stats_tab = st.tabs([
+        "➕ Log Bet",
+        "✅ Mark Results",
+        "📊 P&L Dashboard",
+    ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LOG BET
+    # ─────────────────────────────────────────────────────────────────────────
+    with bt_log_tab:
+        st.subheader("➕ Log a New Bet")
+
+        if data_ok:
+            all_players_bt = ["(type manually)"] + sorted(nfl_df["player_name"].unique())
+        else:
+            all_players_bt = ["(type manually)"]
+
+        bl_c1, bl_c2 = st.columns([1, 1])
+
+        with bl_c1:
+            bt_date    = st.date_input("Date", value=_dtbt.date.today(), key="bt_date")
+            bt_player_sel = st.selectbox("Player (from data)", all_players_bt, key="bt_player_sel")
+            bt_player_txt = st.text_input(
+                "Player name (manual override)",
+                value="" if bt_player_sel == "(type manually)" else bt_player_sel,
+                key="bt_player_txt",
+            )
+            bt_stat    = st.selectbox("Stat category", list(CAT_MAP.keys()),
+                                       format_func=str.title, key="bt_stat")
+            bt_line    = st.number_input("Prop Line", min_value=0.0, value=65.5,
+                                          step=0.5, format="%.1f", key="bt_line")
+
+        with bl_c2:
+            bt_pick    = st.radio("Pick", ["OVER", "UNDER"], horizontal=True, key="bt_pick")
+            bt_odds    = st.number_input(
+                "American Odds (e.g. -110 or +130)",
+                min_value=-10000, max_value=10000, value=-110, step=5,
+                key="bt_odds",
+            )
+            bt_stake   = st.number_input("Stake ($)", min_value=0.01, value=10.0,
+                                          step=5.0, format="%.2f", key="bt_stake")
+            bt_notes   = st.text_input("Notes (optional)", key="bt_notes",
+                                        placeholder="e.g. Soft matchup vs DET run D")
+
+            # Model suggestion quick-look
+            if data_ok and bt_player_txt and bt_player_txt != "(type manually)":
+                res_bt = prop_analysis(nfl_df, bt_player_txt, bt_stat, bt_line,
+                                       use_weighted=True, game_window="Season")
+                if res_bt:
+                    rec_color = "#2DC653" if res_bt["recommendation"] == "OVER" else "#D62828"
+                    st.markdown(
+                        f'<div style="background:{rec_color}22;border-left:4px solid {rec_color};'
+                        f'padding:8px 12px;border-radius:5px;font-size:13px;">'
+                        f'Model says: <b style="color:{rec_color}">{res_bt["recommendation"]}</b>'
+                        f' &nbsp;·&nbsp; Wtd avg: <b>{res_bt["w_avg"]:.1f}</b>'
+                        f' &nbsp;·&nbsp; Hit rate: <b>{res_bt["w_hit"]:.1f}%</b>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # Potential payout preview
+        if bt_odds > 0:
+            potential_win = round(bt_stake * bt_odds / 100, 2)
+        else:
+            potential_win = round(bt_stake * 100 / abs(bt_odds), 2)
+        potential_payout = round(bt_stake + potential_win, 2)
+
+        st.caption(
+            f"Potential payout: **${potential_payout:.2f}** "
+            f"(win ${potential_win:.2f} on ${bt_stake:.2f} stake)"
+        )
+
+        if st.button("➕ Log Bet", type="primary", use_container_width=True, key="bt_log_btn"):
+            player_final = bt_player_txt.strip() if bt_player_txt.strip() else bt_player_sel
+            if not player_final or player_final == "(type manually)":
+                st.error("Enter a player name.")
+            else:
+                new_bet = {
+                    "id":     len(st.session_state["bt_bets"]) + 1,
+                    "date":   str(bt_date),
+                    "player": player_final,
+                    "stat":   bt_stat,
+                    "line":   bt_line,
+                    "pick":   bt_pick,
+                    "stake":  round(bt_stake, 2),
+                    "odds":   bt_odds,
+                    "result": "Pending",
+                    "actual": None,
+                    "pnl":    None,
+                    "notes":  bt_notes.strip(),
+                }
+                st.session_state["bt_bets"].append(new_bet)
+                _save_bets(st.session_state["bt_bets"])
+                st.success(
+                    f"✅ Logged: **{player_final}** {bt_stat.title()} "
+                    f"{bt_pick} {bt_line} @ {bt_odds:+d} for ${bt_stake:.2f}"
+                )
+                st.rerun()
+
+        # ── Pending bets quick view ───────────────────────────────────────────
+        df_bt = _bets_df()
+        pending = df_bt[df_bt["result"] == "Pending"] if not df_bt.empty else pd.DataFrame()
+        if not pending.empty:
+            st.divider()
+            st.markdown(f"**{len(pending)} pending bet(s):**")
+            st.dataframe(
+                pending[["date","player","stat","line","pick","stake","odds","notes"]]
+                .rename(columns={"date":"Date","player":"Player","stat":"Stat",
+                                  "line":"Line","pick":"Pick","stake":"Stake ($)",
+                                  "odds":"Odds","notes":"Notes"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MARK RESULTS
+    # ─────────────────────────────────────────────────────────────────────────
+    with bt_results_tab:
+        st.subheader("✅ Mark Results")
+        df_bt = _bets_df()
+        pending_r = df_bt[df_bt["result"] == "Pending"] if not df_bt.empty else pd.DataFrame()
+
+        if pending_r.empty:
+            st.info("No pending bets. Log some bets first using the ➕ Log Bet tab.")
+        else:
+            st.caption(
+                f"{len(pending_r)} pending bet(s). Enter the actual stat value and the result "
+                "will be calculated automatically."
+            )
+
+            for idx, row_r in pending_r.iterrows():
+                with st.expander(
+                    f"#{row_r['id']} · {row_r['date']} · {row_r['player']} "
+                    f"— {row_r['stat'].title()} {row_r['pick']} {row_r['line']} "
+                    f"@ {int(row_r['odds']):+d}  (${row_r['stake']:.2f})",
+                    expanded=False,
+                ):
+                    rc1, rc2 = st.columns(2)
+                    actual_val = rc1.number_input(
+                        "Actual stat value",
+                        min_value=0.0, value=0.0, step=0.5,
+                        format="%.1f",
+                        key=f"bt_actual_{row_r['id']}",
+                    )
+                    void_check = rc2.checkbox("Void / No action", key=f"bt_void_{row_r['id']}")
+
+                    if st.button("Save Result", key=f"bt_save_{row_r['id']}"):
+                        bets = st.session_state["bt_bets"]
+                        bet_to_update = next((b for b in bets if b["id"] == row_r["id"]), None)
+                        if bet_to_update is not None:
+                            if void_check:
+                                bet_to_update["result"] = "Void"
+                                bet_to_update["actual"] = None
+                                bet_to_update["pnl"]    = 0.0
+                            else:
+                                # Determine win/loss
+                                hit = (
+                                    (actual_val > row_r["line"] and row_r["pick"] == "OVER") or
+                                    (actual_val < row_r["line"] and row_r["pick"] == "UNDER")
+                                )
+                                if actual_val == row_r["line"]:
+                                    bet_to_update["result"] = "Push"
+                                    bet_to_update["pnl"]    = 0.0
+                                elif hit:
+                                    odds_v = int(row_r["odds"])
+                                    win    = (row_r["stake"] * odds_v / 100) if odds_v > 0 \
+                                             else (row_r["stake"] * 100 / abs(odds_v))
+                                    bet_to_update["result"] = "Win"
+                                    bet_to_update["pnl"]    = round(win, 2)
+                                else:
+                                    bet_to_update["result"] = "Loss"
+                                    bet_to_update["pnl"]    = -round(row_r["stake"], 2)
+                                bet_to_update["actual"] = round(actual_val, 1)
+                            _save_bets(bets)
+                            st.session_state["bt_bets"] = bets
+                            st.success(
+                                f"Saved: {bet_to_update['result']} "
+                                f"(P&L: {'+' if (bet_to_update['pnl'] or 0) >= 0 else ''}"
+                                f"${bet_to_update['pnl']:.2f})"
+                            )
+                            st.rerun()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # P&L DASHBOARD
+    # ─────────────────────────────────────────────────────────────────────────
+    with bt_stats_tab:
+        st.subheader("📊 P&L Dashboard")
+        df_bt = _bets_df()
+
+        if df_bt.empty or df_bt[df_bt["result"] != "Pending"].empty:
+            st.info("No settled bets yet. Log and settle some bets first.")
+        else:
+            settled = df_bt[df_bt["result"].isin(["Win","Loss","Push","Void"])].copy()
+            settled["pnl"]   = pd.to_numeric(settled["pnl"],   errors="coerce").fillna(0)
+            settled["stake"] = pd.to_numeric(settled["stake"],  errors="coerce").fillna(0)
+            settled["date"]  = pd.to_datetime(settled["date"],  errors="coerce")
+
+            total_bets   = len(settled)
+            wins         = (settled["result"] == "Win").sum()
+            losses       = (settled["result"] == "Loss").sum()
+            pushes       = (settled["result"] == "Push").sum()
+            total_staked = settled["stake"].sum()
+            total_pnl    = settled["pnl"].sum()
+            roi          = (total_pnl / total_staked * 100) if total_staked > 0 else 0
+            win_rate     = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+            avg_odds     = settled[settled["result"].isin(["Win","Loss"])]["odds"].mean()
+            best_win     = settled[settled["result"] == "Win"]["pnl"].max() if wins else 0
+            worst_loss   = settled[settled["result"] == "Loss"]["pnl"].min() if losses else 0
+
+            # ── Top-line KPIs ─────────────────────────────────────────────────
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Total P&L",    f"{'+'if total_pnl>=0 else ''}${total_pnl:.2f}",
+                      delta=f"ROI {roi:+.1f}%",
+                      delta_color="normal" if total_pnl >= 0 else "inverse")
+            k2.metric("Win Rate",     f"{win_rate:.1f}%",
+                      delta=f"{wins}W / {losses}L / {pushes}P")
+            k3.metric("Total Staked", f"${total_staked:.2f}",
+                      delta=f"{total_bets} bets")
+            k4.metric("Avg Odds",     f"{avg_odds:+.0f}" if not pd.isna(avg_odds) else "—")
+
+            k5, k6, k7, k8 = st.columns(4)
+            k5.metric("Best Win",    f"+${best_win:.2f}"  if wins   else "—")
+            k6.metric("Worst Loss",  f"${worst_loss:.2f}" if losses  else "—")
+            k7.metric("Avg Stake",   f"${settled['stake'].mean():.2f}")
+            k8.metric("Avg P&L/bet", f"{'+'if total_pnl/total_bets>=0 else ''}${total_pnl/total_bets:.2f}")
+
+            st.divider()
+
+            # ── Cumulative P&L chart ──────────────────────────────────────────
+            st.subheader("Cumulative P&L")
+            cum = settled.sort_values("date").copy()
+            cum["cum_pnl"] = cum["pnl"].cumsum()
+            cum["bet_num"] = range(1, len(cum) + 1)
+
+            fig_pnl, ax_pnl = plt.subplots(figsize=(11, 3.5))
+            line_color = C_OVER if total_pnl >= 0 else C_LINE
+            ax_pnl.plot(cum["bet_num"], cum["cum_pnl"], color=line_color,
+                        linewidth=2.2, zorder=3)
+            ax_pnl.fill_between(cum["bet_num"], cum["cum_pnl"], 0,
+                                 alpha=0.12, color=line_color)
+            ax_pnl.axhline(0, color="#888", linewidth=1, linestyle="--")
+            ax_pnl.scatter(cum["bet_num"], cum["cum_pnl"],
+                           c=[C_OVER if p > 0 else (C_LINE if p < 0 else "#888")
+                              for p in cum["pnl"]],
+                           s=28, zorder=4, edgecolors="white", linewidths=0.4)
+            ax_pnl.set_xlabel("Bet #", fontsize=9)
+            ax_pnl.set_ylabel("Cumulative P&L ($)", fontsize=9)
+            ax_pnl.set_title("Cumulative P&L Over Time", fontsize=11, fontweight="bold")
+            ax_pnl.spines["top"].set_visible(False)
+            ax_pnl.spines["right"].set_visible(False)
+            ax_pnl.grid(axis="y", linestyle="--", alpha=0.35)
+            plt.tight_layout()
+            st.pyplot(fig_pnl, use_container_width=True)
+            plt.close(fig_pnl)
+
+            # ── Per-stat breakdown ────────────────────────────────────────────
+            st.divider()
+            stat_cols_bt, chart_col_bt = st.columns([1, 2])
+
+            with stat_cols_bt:
+                st.subheader("By Stat Category")
+                stat_summary = (
+                    settled.groupby("stat")
+                    .agg(
+                        Bets   =("pnl", "count"),
+                        Wins   =("result", lambda x: (x == "Win").sum()),
+                        Losses =("result", lambda x: (x == "Loss").sum()),
+                        PnL    =("pnl", "sum"),
+                        Staked =("stake", "sum"),
+                    )
+                    .reset_index()
+                )
+                stat_summary["ROI %"] = (
+                    stat_summary["PnL"] / stat_summary["Staked"] * 100
+                ).round(1)
+                stat_summary["Win %"] = (
+                    stat_summary["Wins"] / (stat_summary["Wins"] + stat_summary["Losses"])
+                    .replace(0, pd.NA) * 100
+                ).round(1)
+                stat_summary["PnL"]   = stat_summary["PnL"].round(2)
+                stat_summary["stat"]  = stat_summary["stat"].str.title()
+                stat_summary = stat_summary.rename(columns={"stat": "Stat"})
+                st.dataframe(stat_summary[["Stat","Bets","Wins","Losses","Win %","PnL","ROI %"]],
+                             use_container_width=True, hide_index=True)
+
+            with chart_col_bt:
+                st.subheader("P&L by Stat Category")
+                fig_sc, ax_sc = plt.subplots(figsize=(7, max(3, len(stat_summary) * 0.6)))
+                bar_cols_sc = [C_OVER if v >= 0 else C_LINE
+                               for v in stat_summary["PnL"]]
+                ax_sc.barh(stat_summary["Stat"][::-1], stat_summary["PnL"][::-1],
+                           color=bar_cols_sc[::-1], alpha=0.85,
+                           edgecolor="white", linewidth=0.4)
+                ax_sc.axvline(0, color="#888", linewidth=1)
+                for i, (val, label) in enumerate(zip(
+                    stat_summary["PnL"][::-1], stat_summary["Stat"][::-1]
+                )):
+                    ax_sc.text(
+                        val + (stat_summary["PnL"].abs().max() * 0.02 if val >= 0
+                               else -stat_summary["PnL"].abs().max() * 0.02),
+                        i, f"${val:+.2f}", va="center", fontsize=8,
+                        ha="left" if val >= 0 else "right",
+                    )
+                ax_sc.set_xlabel("P&L ($)", fontsize=9)
+                ax_sc.spines["top"].set_visible(False)
+                ax_sc.spines["right"].set_visible(False)
+                ax_sc.grid(axis="x", linestyle="--", alpha=0.35)
+                plt.tight_layout()
+                st.pyplot(fig_sc, use_container_width=True)
+                plt.close(fig_sc)
+
+            # ── Model accuracy: did the model agree with result? ───────────────
+            st.divider()
+            st.subheader("Model Accuracy Check")
+            st.caption(
+                "For each settled bet, was the model's recommendation (from the Prop Analyzer) "
+                "on the same side as the winning outcome?"
+            )
+            win_loss = settled[settled["result"].isin(["Win","Loss"])].copy()
+            if not win_loss.empty and data_ok:
+                model_correct = 0
+                model_checked = 0
+                for _, bet_row in win_loss.iterrows():
+                    res_chk = prop_analysis(
+                        nfl_df, bet_row["player"], bet_row["stat"],
+                        bet_row["line"], use_weighted=True, game_window="Season",
+                    )
+                    if res_chk is None:
+                        continue
+                    model_pick = res_chk["recommendation"]
+                    actual_win = bet_row["result"] == "Win"
+                    # Bet won means our pick was correct
+                    model_matched = (model_pick == bet_row["pick"])
+                    outcome_correct = (model_matched and actual_win) or (not model_matched and not actual_win)
+                    model_correct += int(outcome_correct)
+                    model_checked += 1
+
+                if model_checked > 0:
+                    model_acc = model_correct / model_checked * 100
+                    acc_color = "#2DC653" if model_acc >= 55 else ("#f59e0b" if model_acc >= 45 else "#D62828")
+                    st.markdown(
+                        f'<div style="background:{acc_color}22;border-left:5px solid {acc_color};'
+                        f'padding:12px 16px;border-radius:6px;font-size:15px;">'
+                        f'Model agreed with winning outcome in '
+                        f'<b>{model_correct} / {model_checked}</b> bets '
+                        f'= <b style="color:{acc_color}">{model_acc:.1f}% accuracy</b>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.info("Not enough data to compute model accuracy yet.")
+            else:
+                st.info("No settled Win/Loss bets to check yet." if not data_ok else
+                        "Stats data needed to compute model accuracy.")
+
+            # ── Full bet history table ────────────────────────────────────────
+            st.divider()
+            st.subheader("Full Bet History")
+            show_all_bt = st.checkbox("Show all bets (including pending)", key="bt_show_all")
+            display_bt  = df_bt if show_all_bt else settled.sort_values("date", ascending=False)
+
+            def _pnl_color(val):
+                try:
+                    v = float(val)
+                    if v > 0:  return "color:#2DC653;font-weight:700"
+                    if v < 0:  return "color:#D62828;font-weight:700"
+                except Exception:
+                    pass
+                return ""
+
+            disp_bt_cols = ["id","date","player","stat","line","pick",
+                            "stake","odds","result","actual","pnl","notes"]
+            disp_bt_cols = [c for c in disp_bt_cols if c in display_bt.columns]
+            styled_bt = (
+                display_bt[disp_bt_cols]
+                .rename(columns={
+                    "id":"#","date":"Date","player":"Player","stat":"Stat",
+                    "line":"Line","pick":"Pick","stake":"Stake","odds":"Odds",
+                    "result":"Result","actual":"Actual","pnl":"P&L","notes":"Notes",
+                })
+                .style.applymap(_pnl_color, subset=["P&L"])
+            )
+            st.dataframe(styled_bt, use_container_width=True, hide_index=True)
+
+            # ── Export / Danger zone ─────────────────────────────────────────
+            st.divider()
+            ex_c1, ex_c2 = st.columns(2)
+            with ex_c1:
+                csv_bt = display_bt[disp_bt_cols].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download bet history CSV",
+                    data=csv_bt,
+                    file_name="bet_history.csv",
+                    mime="text/csv",
+                    key="bt_download",
+                )
+            with ex_c2:
+                if st.button("🗑️ Clear ALL bets (irreversible)", key="bt_clear_all"):
+                    st.session_state["bt_bets"] = []
+                    _save_bets([])
+                    st.success("All bets cleared.")
+                    st.rerun()
