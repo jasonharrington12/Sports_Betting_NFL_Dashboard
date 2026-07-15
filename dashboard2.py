@@ -394,7 +394,7 @@ def hit_rate(df, col, line):
     try:
         over = (df[col] > float(line)).sum()
         return (over / len(df)) * 100, over, len(df)
-    except (TypeError, ValueError):
+    except Exception:
         return None, None, None
 
 
@@ -417,8 +417,14 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_wind
     p24     = pdf[pdf["season"] == 2024]
     changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
 
-    hr25, ov25, tot25 = hit_rate(p25, col, line)
-    hr24, ov24, tot24 = hit_rate(p24, col, line)
+    try:
+        hr25, ov25, tot25 = hit_rate(p25, col, line)
+    except Exception:
+        hr25, ov25, tot25 = None, None, None
+    try:
+        hr24, ov24, tot24 = hit_rate(p24, col, line)
+    except Exception:
+        hr24, ov24, tot24 = None, None, None
 
     # Window slice — tail of the combined sorted dataframe
     n_games = {"Last 3": 3, "Last 5": 5, "Season": None}.get(game_window, None)
