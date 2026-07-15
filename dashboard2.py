@@ -2938,307 +2938,485 @@ with tab11:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VEGAS LINE IMPORTER (tab_vegas inside main_bet)
+# Auto-fetches live NFL player props from The Odds API (free tier).
+# Falls back to manual paste if no API key is set.
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Odds API helpers ──────────────────────────────────────────────────────────
+# Map Odds API market keys → our internal CAT_MAP keys
+_ODDS_MARKET_MAP = {
+    "player_pass_yds":     "pass yards",
+    "player_rush_yds":     "rush yards",
+    "player_reception_yds":"rec yards",
+    "player_receptions":   "receptions",
+    "player_pass_tds":     "pass tds",
+}
+# Markets to request (comma-joined for the API call)
+_ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
+
+@st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
+def fetch_odds_api_props(api_key: str) -> list:
+    """
+    Pull live NFL player prop lines from The Odds API.
+    Returns a list of dicts: {player, cat, line, bookmaker, opp}
+    opp = the opposing team abbreviation derived from the game matchup.
+    """
+    # Step 1: get event IDs for upcoming NFL games
+    events_url = (
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+        f"?apiKey={api_key}&dateFormat=iso"
+    )
+    events_data = _get_json(events_url)
+    if not events_data or not isinstance(events_data, list):
+        return []
+
+    # Step 2: for each event fetch player props
+    rows = []
+    for event in events_data[:16]:   # max 16 games/week; respect quota
+        event_id   = event.get("id", "")
+        home_team  = event.get("home_team", "")
+        away_team  = event.get("away_team", "")
+
+        props_url = (
+            f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
+            f"/events/{event_id}/odds"
+            f"?apiKey={api_key}&regions=us&markets={_ODDS_MARKETS}"
+            f"&oddsFormat=american&dateFormat=iso"
+        )
+        props_data = _get_json(props_url)
+        if not props_data:
+            continue
+
+        bookmakers = props_data.get("bookmakers", [])
+        # Prefer DraftKings, fall back to first available
+        bm = next((b for b in bookmakers if b["key"] == "draftkings"), None)
+        if bm is None and bookmakers:
+            bm = bookmakers[0]
+        if bm is None:
+            continue
+
+        bm_name = bm.get("title", "Book")
+        for market in bm.get("markets", []):
+            market_key = market.get("key", "")
+            cat = _ODDS_MARKET_MAP.get(market_key)
+            if cat is None:
+                continue
+            for outcome in market.get("outcomes", []):
+                if outcome.get("name", "").lower() != "over":
+                    continue   # only grab the Over line (we store one line per player/stat)
+                player_name = outcome.get("description", outcome.get("player", ""))
+                point       = outcome.get("point")
+                if not player_name or point is None:
+                    continue
+                # Determine opponent: if player is on home team, opp = away, and vice versa.
+                # We don't know the player's team from this endpoint, so store both teams.
+                rows.append({
+                    "player_raw": player_name,
+                    "cat":        cat,
+                    "line":       float(point),
+                    "opp":        None,          # filled below where we can
+                    "home":       home_team,
+                    "away":       away_team,
+                    "bookmaker":  bm_name,
+                })
+        _time.sleep(0.2)   # be polite
+
+    return rows
+
+
+def _full_team_name_to_abbr(full: str) -> str:
+    """Best-effort map of ESPN full team name → our 2-3 letter abbreviation."""
+    _MAP = {
+        "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL",
+        "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+        "Carolina Panthers": "CAR", "Chicago Bears": "CHI",
+        "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+        "Dallas Cowboys": "DAL", "Denver Broncos": "DEN",
+        "Detroit Lions": "DET", "Green Bay Packers": "GB",
+        "Houston Texans": "HOU", "Indianapolis Colts": "IND",
+        "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+        "Las Vegas Raiders": "LV", "Los Angeles Chargers": "LAC",
+        "Los Angeles Rams": "LA", "Miami Dolphins": "MIA",
+        "Minnesota Vikings": "MIN", "New England Patriots": "NE",
+        "New Orleans Saints": "NO", "New York Giants": "NYG",
+        "New York Jets": "NYJ", "Philadelphia Eagles": "PHI",
+        "Pittsburgh Steelers": "PIT", "San Francisco 49ers": "SF",
+        "Seattle Seahawks": "SEA", "Tampa Bay Buccaneers": "TB",
+        "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
+    }
+    return _MAP.get(full, full[:3].upper())
+
+
 with tab_vegas:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        st.subheader("📈 Vegas Line Importer")
+        st.subheader("📈 Vegas Lines — Live Prop Odds")
         st.caption(
-            "Paste a slate of prop lines (one per row) and the model will score each one "
-            "against historical data, showing where it finds the biggest edge vs the book."
+            "Pulls live NFL player prop lines from The Odds API (DraftKings / consensus) "
+            "and scores each one against the historical model. "
+            "Free tier: 500 requests/month · lines refresh every 15 min."
         )
 
-        # ── Format instructions ───────────────────────────────────────────────
-        with st.expander("📋 Input format instructions", expanded=False):
-            st.markdown(
-                """
-**Paste lines in CSV format** — one prop per row:
+        # ── Build opponent lookup once (shared) ───────────────────────────────
+        @st.cache_data(show_spinner=False)
+        def _build_opp_vl(nfl):
+            df = nfl.copy()
+            def _opp(row):
+                parts = str(row["game_id"]).split("_")
+                if len(parts) < 4: return "UNK"
+                away, home = parts[2], parts[3]
+                return home if row["team"] == away else away
+            df["opponent"] = df.apply(_opp, axis=1)
+            return df
+        nfl_vl_opp = _build_opp_vl(nfl_df)
 
-```
-Player Name, stat category, line
-```
+        # ── Shared scoring helper ─────────────────────────────────────────────
+        def _score_parsed_rows(parsed_rows, vl_weighted, vl_window, vl_opp_mode, vl_min_edge):
+            """Score a list of {player_raw, cat, line, opp} dicts. Returns result_rows list."""
+            result_rows = []
+            for pr in parsed_rows:
+                res = prop_analysis(
+                    nfl_df,
+                    pr["player_raw"], pr["cat"],
+                    pr["line"], vl_weighted, vl_window,
+                )
+                if res is None:
+                    result_rows.append({
+                        "Player":     pr["player_raw"],
+                        "Stat":       pr["cat"].title(),
+                        "Book Line":  pr["line"],
+                        "Bookmaker":  pr.get("bookmaker", "—"),
+                        "Model Avg":  "—",
+                        "Edge":       "—",
+                        "Hit Rate":   "—",
+                        "Std Dev":    "—",
+                        "Pick":       "NOT FOUND",
+                        "Confidence": "—",
+                        "_edge_val":  0.0,
+                        "_found":     False,
+                    })
+                    continue
 
-**Stat categories** (exact spelling): `pass yards`, `rush yards`, `rec yards`,
-`receptions`, `pass tds`, `fantasy`
+                col_name  = CAT_MAP[pr["cat"]][0]
+                model_avg = res["w_avg"]
+                edge      = model_avg - pr["line"]
+                hr_val    = res["w_hit"]
+                std_dev   = res["std_dev"]
+                pick      = "OVER" if edge > 0 else "UNDER"
 
-**Example:**
-```
-Patrick Mahomes, pass yards, 287.5
-Saquon Barkley, rush yards, 84.5
-Ja'Marr Chase, rec yards, 74.5
-Travis Kelce, receptions, 5.5
-```
+                matchup_grade = ""
+                if vl_opp_mode and pr.get("opp"):
+                    opp = str(pr["opp"]).strip().upper()
+                    vs_opp   = nfl_vl_opp[nfl_vl_opp["opponent"] == opp]
+                    lg_avg_d = nfl_vl_opp.groupby("opponent")[col_name].mean().mean()
+                    opp_avg  = vs_opp[col_name].mean() if not vs_opp.empty else lg_avg_d
+                    factor   = opp_avg / lg_avg_d if lg_avg_d > 0 else 1.0
+                    edge     = (model_avg * factor) - pr["line"]
+                    pick     = "OVER" if edge > 0 else "UNDER"
+                    if factor > 1.10:   matchup_grade = "🟢 Soft"
+                    elif factor < 0.90: matchup_grade = "🔴 Tough"
+                    else:               matchup_grade = "🟡 Avg"
 
-Lines containing `#` are treated as comments and ignored.
-"""
-            )
+                conf_dist = abs(hr_val - 50.0)
+                if conf_dist >= 20:   conf = "★★★ High"
+                elif conf_dist >= 10: conf = "★★  Med"
+                else:                 conf = "★    Low"
 
-        # ── Controls ──────────────────────────────────────────────────────────
+                row = {
+                    "Player":     res["full_name"],
+                    "Stat":       pr["cat"].title(),
+                    "Book Line":  pr["line"],
+                    "Bookmaker":  pr.get("bookmaker", "—"),
+                    "Model Avg":  round(model_avg, 1),
+                    "Edge":       round(edge, 1),
+                    "Hit Rate":   f"{hr_val:.1f}%",
+                    "Std Dev":    round(std_dev, 1),
+                    "Pick":       pick,
+                    "Confidence": conf,
+                    "_edge_val":  abs(edge),
+                    "_found":     True,
+                }
+                if vl_opp_mode and pr.get("opp"):
+                    row["Opponent"] = str(pr["opp"]).strip().upper()
+                    row["Matchup"]  = matchup_grade
+                result_rows.append(row)
+            return result_rows
+
+        def _render_results(result_rows, vl_min_edge, vl_opp_mode, vl_weighted):
+            """Render KPIs, top-edge banners, full table, and send-to-parlay for a result set."""
+            result_rows.sort(key=lambda r: r["_edge_val"], reverse=True)
+            found = [r for r in result_rows if r["_found"]]
+            not_found = [r for r in result_rows if not r["_found"]]
+
+            if not found and not_found:
+                st.warning(
+                    f"{len(not_found)} player(s) not found in the dataset. "
+                    "They may be rookies or have no game log data yet."
+                )
+                return
+
+            # KPIs
+            n_over   = sum(1 for r in found if r["Pick"] == "OVER")
+            n_under  = sum(1 for r in found if r["Pick"] == "UNDER")
+            n_high   = sum(1 for r in found if "High" in r["Confidence"])
+            avg_edge = (sum(r["_edge_val"] for r in found) / len(found)) if found else 0
+
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Lines analysed",  len(found))
+            k2.metric("OVER picks",      n_over)
+            k3.metric("UNDER picks",     n_under)
+            k4.metric("High confidence", n_high)
+            k5.metric("Avg edge",        f"{avg_edge:.1f}")
+
+            if not_found:
+                with st.expander(f"⚠️ {len(not_found)} player(s) not found in dataset"):
+                    st.write(", ".join(r["Player"] for r in not_found))
+
+            # Top-edge banners
+            top_edges = [r for r in found if r["_edge_val"] >= vl_min_edge]
+            if top_edges:
+                st.markdown(f"**{len(top_edges)} bet(s) with edge ≥ {vl_min_edge:.0f} units:**")
+                for r in top_edges[:8]:
+                    pick_color = "#2DC653" if r["Pick"] == "OVER" else "#D62828"
+                    edge_str   = f"+{r['Edge']:.1f}" if r["Edge"] > 0 else f"{r['Edge']:.1f}"
+                    opp_str    = f" &nbsp;·&nbsp; vs {r.get('Opponent','')} {r.get('Matchup','')}" if vl_opp_mode and r.get("Opponent") else ""
+                    bk_str     = f" &nbsp;·&nbsp; {r['Bookmaker']}" if r.get("Bookmaker") and r["Bookmaker"] != "—" else ""
+                    st.markdown(
+                        f'<div style="border-left:5px solid {pick_color};padding:8px 14px;'
+                        f'background:#f7f8fa;border-radius:6px;margin-bottom:6px;font-size:14px;">'
+                        f'<b>{r["Player"]}</b> &nbsp;|&nbsp; '
+                        f'{r["Stat"]} <span style="color:{pick_color};font-weight:700;">'
+                        f'{r["Pick"]} {r["Book Line"]}</span>'
+                        f'&nbsp;&nbsp;·&nbsp;&nbsp;Model avg: <b>{r["Model Avg"]}</b>'
+                        f'&nbsp;&nbsp;·&nbsp;&nbsp;Edge: <b>{edge_str}</b>'
+                        f'&nbsp;&nbsp;·&nbsp;&nbsp;Hit rate: {r["Hit Rate"]}'
+                        f'&nbsp;&nbsp;·&nbsp;&nbsp;{r["Confidence"]}'
+                        f'{opp_str}{bk_str}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info(f"No lines with edge ≥ {vl_min_edge:.0f} units. Try lowering the threshold.")
+
+            st.divider()
+            st.subheader("Full Slate Results")
+
+            disp_df = pd.DataFrame(result_rows).drop(columns=["_edge_val", "_found"])
+
+            def _color_edge(val):
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    return ""
+                if v >= vl_min_edge:  return "background-color:#d4f5dc"
+                if v <= -vl_min_edge: return "background-color:#fde8e8"
+                return ""
+
+            def _color_pick(val):
+                if val == "OVER":      return "color:#2DC653;font-weight:700"
+                if val == "UNDER":     return "color:#D62828;font-weight:700"
+                if val == "NOT FOUND": return "color:#888"
+                return ""
+
+            styled = disp_df.style.map(_color_edge, subset=["Edge"]).map(_color_pick, subset=["Pick"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # Send to Parlay Builder
+            st.divider()
+            vl_send_n = st.slider("Send top N edges to Parlay Builder", 2, 8, 3, key="vl_send_n")
+            if st.button("➕ Send to Parlay Builder", key="vl_send",
+                         help="Loads the top-N edge legs into the Parlay Builder tab"):
+                sendable = sorted([r for r in found if r["Pick"] in ("OVER","UNDER")],
+                                  key=lambda r: r["_edge_val"], reverse=True)
+                existing = st.session_state.get("parlay_legs", [])
+                added = 0
+                for r in sendable[:vl_send_n]:
+                    leg = score_leg(nfl_df, r["Player"], r["Stat"].lower(),
+                                    r["Book Line"], vl_weighted)
+                    if leg is None:
+                        continue
+                    dup = any(
+                        e["player"] == leg["player"] and
+                        e["category"] == leg["category"] and
+                        e["line"] == leg["line"]
+                        for e in existing
+                    )
+                    if not dup and len(existing) < 8:
+                        existing.append(leg)
+                        added += 1
+                st.session_state["parlay_legs"] = existing
+                if added:
+                    st.success(f"✅ {added} leg(s) added — switch to the 🎰 Parlay Builder tab.")
+                else:
+                    st.info("All legs already in Parlay Builder (or it's full at 8 legs).")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # CONTROLS PANEL
+        # ═════════════════════════════════════════════════════════════════════
         vl_c1, vl_c2 = st.columns([1, 3])
 
         with vl_c1:
             st.markdown("#### Settings")
-            vl_weighted  = st.toggle("Season weighting", value=True, key="vl_weighted")
-            vl_window    = st.radio("Game window", ["Last 3", "Last 5", "Season"],
-                                    index=2, horizontal=True, key="vl_window")
-            vl_opp_mode  = st.toggle(
-                "Include opponent defense",
-                value=False, key="vl_opp_mode",
-                help="When ON, add an 'Opponent' column to each row and factor in matchup difficulty.",
+            vl_weighted = st.toggle("Season weighting", value=True, key="vl_weighted")
+            vl_window   = st.radio("Game window", ["Last 3", "Last 5", "Season"],
+                                   index=2, horizontal=True, key="vl_window")
+            vl_opp_mode = st.toggle(
+                "Matchup adjustment",
+                value=True, key="vl_opp_mode",
+                help="Factor in opponent defensive strength.",
             )
-            vl_min_edge  = st.number_input(
-                "Min edge to highlight (units)",
+            vl_min_edge = st.number_input(
+                "Min edge to highlight",
                 min_value=0.0, value=5.0, step=1.0, format="%.1f",
                 key="vl_min_edge",
                 help="Rows where |model avg – book line| ≥ this value are highlighted.",
             )
-            vl_go = st.button("⚡ Run Analysis", type="primary",
-                              use_container_width=True, key="vl_go")
 
-        with vl_c2:
-            vl_paste = st.text_area(
-                "Paste prop lines here",
-                height=220,
-                key="vl_paste",
-                placeholder=(
-                    "Patrick Mahomes, pass yards, 287.5\n"
-                    "Saquon Barkley, rush yards, 84.5\n"
-                    "Ja'Marr Chase, rec yards, 74.5\n"
-                    "Travis Kelce, receptions, 5.5"
-                ),
+            st.divider()
+            st.markdown("#### API Key")
+            st.caption(
+                "Get a free key at [the-odds-api.com](https://the-odds-api.com). "
+                "Add it to Streamlit secrets as `ODDS_API_KEY`, or paste it below."
+            )
+            # Read from st.secrets first, allow manual override
+            _secret_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+            vl_api_key  = st.text_input(
+                "The Odds API key",
+                value=_secret_key,
+                type="password",
+                key="vl_api_key",
+                placeholder="Paste key here or set ODDS_API_KEY in secrets",
             )
 
-            if vl_go and vl_paste.strip():
-                # ── Parse input ───────────────────────────────────────────────
-                parse_errors = []
-                parsed_rows  = []
-                for raw_line in vl_paste.strip().splitlines():
-                    raw_line = raw_line.strip()
-                    if not raw_line or raw_line.startswith("#"):
-                        continue
-                    parts = [p.strip() for p in raw_line.split(",")]
-                    if len(parts) < 3:
-                        parse_errors.append(f"⚠️ Skipped (not enough columns): `{raw_line}`")
-                        continue
-                    player_raw = parts[0]
-                    cat_raw    = parts[1].lower().strip()
-                    try:
-                        line_raw = float(parts[2])
-                    except ValueError:
-                        parse_errors.append(f"⚠️ Skipped (bad line value): `{raw_line}`")
-                        continue
-                    opp_raw = parts[3] if len(parts) >= 4 else None
+            vl_fetch_btn = st.button("🔄 Fetch Live Lines", type="primary",
+                                     use_container_width=True, key="vl_fetch")
+            vl_manual_mode = st.toggle("Manual paste mode", value=False, key="vl_manual",
+                                       help="Skip the API and paste lines yourself instead.")
 
-                    if cat_raw not in CAT_MAP:
-                        # try partial match
-                        cat_raw = next((k for k in CAT_MAP if k.startswith(cat_raw[:4])), None)
-                    if cat_raw is None:
-                        parse_errors.append(f"⚠️ Skipped (unknown category): `{raw_line}`")
-                        continue
+        with vl_c2:
+            # ── AUTO FETCH MODE ───────────────────────────────────────────────
+            if not vl_manual_mode:
+                if vl_fetch_btn or st.session_state.get("vl_auto_rows"):
+                    if vl_fetch_btn:
+                        if not vl_api_key.strip():
+                            st.error(
+                                "No API key set. Add `ODDS_API_KEY` to your Streamlit secrets "
+                                "or paste a key in the field on the left."
+                            )
+                            st.stop()
+                        with st.spinner("Fetching live prop lines from The Odds API…"):
+                            raw_rows = fetch_odds_api_props(vl_api_key.strip())
+                        if not raw_rows:
+                            st.warning(
+                                "No prop lines returned. The API key may be invalid, "
+                                "quota may be exhausted, or there are no NFL games this week."
+                            )
+                            st.stop()
+                        # Convert full team names → abbreviations for opp lookup
+                        for r in raw_rows:
+                            r["opp"] = None   # we don't know player team from API; skip opp adjust
+                        st.session_state["vl_auto_rows"] = raw_rows
+                        st.session_state["vl_auto_key"]  = vl_api_key.strip()
 
-                    parsed_rows.append({
-                        "player_raw": player_raw,
-                        "cat":        cat_raw,
-                        "line":       line_raw,
-                        "opp":        opp_raw,
-                    })
+                    cached_rows = st.session_state.get("vl_auto_rows", [])
+                    if not cached_rows:
+                        st.info("👈 Enter your API key and click **Fetch Live Lines**.")
+                    else:
+                        # Filter controls
+                        all_stats_vl = sorted({r["cat"] for r in cached_rows})
+                        sel_stats_vl = st.multiselect(
+                            "Filter stat categories",
+                            options=all_stats_vl,
+                            default=all_stats_vl,
+                            format_func=str.title,
+                            key="vl_stat_filter",
+                        )
+                        filtered_rows = [r for r in cached_rows if r["cat"] in sel_stats_vl]
 
-                if parse_errors:
+                        st.caption(
+                            f"**{len(filtered_rows)} prop lines** fetched from "
+                            f"{cached_rows[0].get('bookmaker','book') if cached_rows else '—'} · "
+                            "cached 15 min · toggle **Manual paste mode** to add custom lines"
+                        )
+
+                        if filtered_rows:
+                            result_rows = _score_parsed_rows(
+                                filtered_rows, vl_weighted, vl_window,
+                                vl_opp_mode, vl_min_edge,
+                            )
+                            _render_results(result_rows, vl_min_edge, vl_opp_mode, vl_weighted)
+                else:
+                    st.info(
+                        "👈 Enter your [The Odds API](https://the-odds-api.com) key and click "
+                        "**Fetch Live Lines** to automatically pull this week's NFL prop lines.\n\n"
+                        "Or enable **Manual paste mode** to enter lines yourself."
+                    )
+
+            # ── MANUAL PASTE MODE ─────────────────────────────────────────────
+            else:
+                with st.expander("📋 Input format", expanded=False):
+                    st.markdown(
+                        "One prop per row: `Player Name, stat, line` — optional 4th column for opponent.\n\n"
+                        "**Stats:** `pass yards` · `rush yards` · `rec yards` · `receptions` · `pass tds` · `fantasy`"
+                    )
+                vl_paste = st.text_area(
+                    "Paste prop lines",
+                    height=200,
+                    key="vl_paste",
+                    placeholder=(
+                        "Patrick Mahomes, pass yards, 287.5\n"
+                        "Saquon Barkley, rush yards, 84.5, PHI\n"
+                        "Ja'Marr Chase, rec yards, 74.5\n"
+                        "Travis Kelce, receptions, 5.5"
+                    ),
+                )
+                vl_go = st.button("⚡ Run Analysis", type="primary",
+                                  use_container_width=True, key="vl_go")
+
+                if vl_go and vl_paste.strip():
+                    parse_errors = []
+                    parsed_rows  = []
+                    for raw_line in vl_paste.strip().splitlines():
+                        raw_line = raw_line.strip()
+                        if not raw_line or raw_line.startswith("#"):
+                            continue
+                        parts = [p.strip() for p in raw_line.split(",")]
+                        if len(parts) < 3:
+                            parse_errors.append(f"⚠️ Skipped: `{raw_line}`")
+                            continue
+                        cat_raw = parts[1].lower().strip()
+                        try:
+                            line_raw = float(parts[2])
+                        except ValueError:
+                            parse_errors.append(f"⚠️ Bad line value: `{raw_line}`")
+                            continue
+                        if cat_raw not in CAT_MAP:
+                            cat_raw = next((k for k in CAT_MAP if k.startswith(cat_raw[:4])), None)
+                        if cat_raw is None:
+                            parse_errors.append(f"⚠️ Unknown category: `{raw_line}`")
+                            continue
+                        parsed_rows.append({
+                            "player_raw": parts[0],
+                            "cat":        cat_raw,
+                            "line":       line_raw,
+                            "opp":        parts[3] if len(parts) >= 4 else None,
+                            "bookmaker":  "Manual",
+                        })
                     for e in parse_errors:
                         st.warning(e)
-
-                if not parsed_rows:
-                    st.error("No valid rows to analyse. Check the format above.")
-                else:
-                    # ── Build opponent lookup once ────────────────────────────
-                    @st.cache_data(show_spinner=False)
-                    def _build_opp_vl(nfl):
-                        df = nfl.copy()
-                        def _opp(row):
-                            parts = str(row["game_id"]).split("_")
-                            if len(parts) < 4: return "UNK"
-                            away, home = parts[2], parts[3]
-                            return home if row["team"] == away else away
-                        df["opponent"] = df.apply(_opp, axis=1)
-                        return df
-                    nfl_vl_opp = _build_opp_vl(nfl_df)
-
-                    # ── Score each line ───────────────────────────────────────
-                    result_rows = []
-                    for pr in parsed_rows:
-                        res = prop_analysis(
-                            nfl_df,
-                            pr["player_raw"], pr["cat"],
-                            pr["line"], vl_weighted, vl_window,
+                    if parsed_rows:
+                        result_rows = _score_parsed_rows(
+                            parsed_rows, vl_weighted, vl_window,
+                            vl_opp_mode, vl_min_edge,
                         )
-                        if res is None:
-                            result_rows.append({
-                                "Player":      pr["player_raw"],
-                                "Stat":        pr["cat"].title(),
-                                "Book Line":   pr["line"],
-                                "Model Avg":   "—",
-                                "Edge":        "—",
-                                "Hit Rate":    "—",
-                                "Std Dev":     "—",
-                                "Pick":        "NOT FOUND",
-                                "Confidence":  "—",
-                                "_edge_val":   0.0,
-                                "_found":      False,
-                            })
-                            continue
-
-                        col_name = CAT_MAP[pr["cat"]][0]
-                        model_avg = res["w_avg"]
-                        edge      = model_avg - pr["line"]
-                        hit_rate  = res["w_hit"]
-                        std_dev   = res["std_dev"]
-                        pick      = "OVER" if edge > 0 else "UNDER"
-
-                        # Matchup adjustment if opponent supplied
-                        matchup_grade = ""
-                        if vl_opp_mode and pr["opp"]:
-                            opp = pr["opp"].strip().upper()
-                            vs_opp   = nfl_vl_opp[nfl_vl_opp["opponent"] == opp]
-                            lg_avg_d = nfl_vl_opp.groupby("opponent")[col_name].mean().mean()
-                            opp_avg  = vs_opp[col_name].mean() if not vs_opp.empty else lg_avg_d
-                            factor   = opp_avg / lg_avg_d if lg_avg_d > 0 else 1.0
-                            model_avg_adj = model_avg * factor
-                            edge     = model_avg_adj - pr["line"]
-                            pick     = "OVER" if edge > 0 else "UNDER"
-                            if factor > 1.10:   matchup_grade = "🟢 Soft"
-                            elif factor < 0.90: matchup_grade = "🔴 Tough"
-                            else:               matchup_grade = "🟡 Avg"
-
-                        # Confidence: how far is hit-rate from 50%?
-                        conf_dist = abs(hit_rate - 50.0)
-                        if conf_dist >= 20:   conf = "★★★ High"
-                        elif conf_dist >= 10: conf = "★★  Med"
-                        else:                 conf = "★    Low"
-
-                        row = {
-                            "Player":     res["full_name"],
-                            "Stat":       pr["cat"].title(),
-                            "Book Line":  pr["line"],
-                            "Model Avg":  round(model_avg, 1),
-                            "Edge":       round(edge, 1),
-                            "Hit Rate":   f"{hit_rate:.1f}%",
-                            "Std Dev":    round(std_dev, 1),
-                            "Pick":       pick,
-                            "Confidence": conf,
-                            "_edge_val":  abs(edge),
-                            "_found":     True,
-                        }
-                        if vl_opp_mode and pr["opp"]:
-                            row["Opponent"]     = pr["opp"].strip().upper()
-                            row["Matchup"]      = matchup_grade
-                        result_rows.append(row)
-
-                    # ── Sort by edge descending ───────────────────────────────
-                    result_rows.sort(key=lambda r: r["_edge_val"], reverse=True)
-                    disp_df = pd.DataFrame(result_rows).drop(columns=["_edge_val", "_found"])
-
-                    # ── Summary KPIs ──────────────────────────────────────────
-                    found     = [r for r in result_rows if r["_found"]]
-                    n_over    = sum(1 for r in found if r["Pick"] == "OVER")
-                    n_under   = sum(1 for r in found if r["Pick"] == "UNDER")
-                    n_high    = sum(1 for r in found if "High" in r["Confidence"])
-                    avg_edge  = (sum(r["_edge_val"] for r in found) / len(found)) if found else 0
-
-                    k1, k2, k3, k4, k5 = st.columns(5)
-                    k1.metric("Lines analysed", len(found))
-                    k2.metric("OVER picks",  n_over)
-                    k3.metric("UNDER picks", n_under)
-                    k4.metric("High confidence", n_high)
-                    k5.metric("Avg edge", f"{avg_edge:.1f}")
-
-                    # ── Top edges banner ──────────────────────────────────────
-                    top_edges = [r for r in found if r["_edge_val"] >= vl_min_edge]
-                    if top_edges:
-                        st.markdown(f"**{len(top_edges)} bet(s) with edge ≥ {vl_min_edge:.0f} units:**")
-                        for r in top_edges[:6]:
-                            pick_color = "#2DC653" if r["Pick"] == "OVER" else "#D62828"
-                            edge_str   = f"+{r['Edge']:.1f}" if r["Edge"] > 0 else f"{r['Edge']:.1f}"
-                            opp_str    = f" &nbsp;·&nbsp; vs {r.get('Opponent','')} {r.get('Matchup','')}" if vl_opp_mode else ""
-                            st.markdown(
-                                f'<div style="border-left:5px solid {pick_color};'
-                                f'padding:8px 14px;background:#f7f8fa;border-radius:6px;'
-                                f'margin-bottom:6px;font-size:14px;">'
-                                f'<b>{r["Player"]}</b> &nbsp;|&nbsp; '
-                                f'{r["Stat"]} <span style="color:{pick_color};font-weight:700;">'
-                                f'{r["Pick"]} {r["Book Line"]}</span>'
-                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Model avg: <b>{r["Model Avg"]}</b>'
-                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Edge: <b>{edge_str}</b>'
-                                f'&nbsp;&nbsp;·&nbsp;&nbsp;Hit rate: {r["Hit Rate"]}'
-                                f'&nbsp;&nbsp;·&nbsp;&nbsp;{r["Confidence"]}'
-                                f'{opp_str}'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
+                        _render_results(result_rows, vl_min_edge, vl_opp_mode, vl_weighted)
                     else:
-                        st.info(f"No lines found with edge ≥ {vl_min_edge:.0f} units. "
-                                "Try lowering the minimum edge threshold.")
-
-                    st.divider()
-                    st.subheader("Full Slate Results")
-
-                    # Colour-map edge column using pandas Styler
-                    def _color_edge(val):
-                        try:
-                            v = float(val)
-                        except (TypeError, ValueError):
-                            return ""
-                        if v >= vl_min_edge:   return "background-color:#d4f5dc"
-                        if v <= -vl_min_edge:  return "background-color:#fde8e8"
-                        return ""
-
-                    def _color_pick(val):
-                        if val == "OVER":       return "color:#2DC653;font-weight:700"
-                        if val == "UNDER":      return "color:#D62828;font-weight:700"
-                        if val == "NOT FOUND":  return "color:#888"
-                        return ""
-
-                    styled = (
-                        disp_df.style
-                        .map(_color_edge, subset=["Edge"])
-                        .map(_color_pick, subset=["Pick"])
-                    )
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-                    # ── Send best legs straight to Parlay Builder ─────────────
-                    st.divider()
-                    vl_send_n = st.slider("Send top N edges to Parlay Builder", 2, 8, 3,
-                                          key="vl_send_n")
-                    if st.button("➕ Send to Parlay Builder", key="vl_send",
-                                 help="Loads the top-N edge legs into the Parlay Builder tab"):
-                        sendable = [r for r in found if r["Pick"] in ("OVER","UNDER")]
-                        sendable.sort(key=lambda r: r["_edge_val"], reverse=True)
-                        existing = st.session_state.get("parlay_legs", [])
-                        added = 0
-                        for r in sendable[:vl_send_n]:
-                            leg = score_leg(nfl_df, r["Player"], r["Stat"].lower(),
-                                            r["Book Line"], vl_weighted)
-                            if leg is None:
-                                continue
-                            dup = any(
-                                e["player"] == leg["player"] and
-                                e["category"] == leg["category"] and
-                                e["line"] == leg["line"]
-                                for e in existing
-                            )
-                            if not dup and len(existing) < 8:
-                                existing.append(leg)
-                                added += 1
-                        st.session_state["parlay_legs"] = existing
-                        if added:
-                            st.success(f"✅ {added} leg(s) added — switch to the 🎰 Parlay Builder tab.")
-                        else:
-                            st.info("All legs already in Parlay Builder (or it's full at 8 legs).")
-
-            elif vl_go:
-                st.warning("Paste some lines above first.")
-            else:
-                st.info("👈 Configure settings, paste your lines, and click **Run Analysis**.")
+                        st.error("No valid rows. Check the format above.")
+                elif vl_go:
+                    st.warning("Paste some lines above first.")
+                else:
+                    st.info("👈 Paste lines above and click **Run Analysis**.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
