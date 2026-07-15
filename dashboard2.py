@@ -1981,7 +1981,8 @@ with tab8:
         st.subheader("🎯 Matchup Finder — This Week's Best Props")
         st.caption(
             "Pulls this week's schedule from ESPN, finds the softest defensive matchup "
-            "for each game, and suggests the best player + prop line to target."
+            "for each game, and suggests the best player + prop line to target. "
+            "Add your Odds API key to show **real book lines** instead of model projections."
         )
 
         # ── controls ──────────────────────────────────────────────────────────
@@ -1995,6 +1996,16 @@ with tab8:
                                             key="mf_min")
             mf_min_player = st.number_input("Min player games", 1, 18, 3,
                                              key="mf_min_player")
+            st.divider()
+            st.caption("**Odds API key** — optional. When set, uses real DraftKings prop lines instead of model projections.")
+            _mf_secret_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+            mf_api_key = st.text_input(
+                "The Odds API key",
+                value=_mf_secret_key,
+                type="password",
+                key="mf_api_key",
+                placeholder="Leave blank to use model-projected lines",
+            )
 
         with mf_c2:
             col, col_label = CAT_MAP[mf_stat.lower()]
@@ -2018,7 +2029,7 @@ with tab8:
             def_avgs  = dict(zip(def_agg["opponent"], def_agg["avg_allowed"]))
             total_teams = len(def_agg)
 
-            # Fetch schedule, odds, and depth charts
+            # Fetch schedule, odds, depth charts, and (optionally) real prop lines
             with st.spinner("Fetching schedule, odds, and depth charts from ESPN..."):
                 games = fetch_this_weeks_games()
                 for g in games:
@@ -2028,6 +2039,25 @@ with tab8:
                         g["odds"] = {"over_under": None, "home_spread": None,
                                      "away_spread": None, "book_name": None}
                 depth_charts = fetch_all_depth_charts()
+
+            # Build a lookup: player name (lower) → {cat → real book line}
+            # Only populated when an Odds API key is provided.
+            mf_real_lines: dict = {}   # {"patrick mahomes": {"pass yards": 287.5, ...}, ...}
+            if mf_api_key.strip():
+                with st.spinner("Fetching real prop lines from The Odds API…"):
+                    raw_prop_rows = fetch_odds_api_props(mf_api_key.strip())
+                for rr in raw_prop_rows:
+                    key = rr["player_raw"].lower().strip()
+                    if key not in mf_real_lines:
+                        mf_real_lines[key] = {}
+                    mf_real_lines[key][rr["cat"]] = rr["line"]
+                if mf_real_lines:
+                    st.success(
+                        f"✅ Real prop lines loaded for **{len(mf_real_lines)}** players "
+                        f"from {raw_prop_rows[0]['bookmaker'] if raw_prop_rows else 'book'}."
+                    )
+                else:
+                    st.warning("Odds API returned no prop lines — using model-projected lines.")
 
             # Helper: map stat col → depth chart position(s)
             _COL_TO_POS = {
@@ -2199,20 +2229,37 @@ with tab8:
                         p_2025 = p_df[p_df["season"] == 2025]
                         last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg_display
 
-                        # ── Realistic sportsbook line ─────────────────────────
+                        # ── Line: real book line if available, else model projection ──
                         proj = player_avg_display * matchup_factor
-                        if col == "passing_yards":
-                            increments = [i + 0.5 for i in range(50, 500, 25)]
-                        elif col in ("rush_yards", "receiving_yards"):
-                            increments = [i + 0.5 for i in range(0, 250, 10)]
-                        elif col == "receptions":
-                            increments = [i + 0.5 for i in range(0, 20, 1)]
-                        elif col == "passing_tds":
-                            increments = [0.5, 1.5, 2.5, 3.5]
-                        else:  # fantasy points
-                            increments = [i + 0.5 for i in range(0, 60, 5)]
+                        player_key = best["player_name"].lower().strip()
+                        real_line = mf_real_lines.get(player_key, {}).get(
+                            CAT_MAP[mf_stat.lower()][1].lower()  # try label first
+                            if False else mf_stat.lower(),        # use cat key
+                        )
+                        # Also try partial name match (handles "Patrick Mahomes" vs "P. Mahomes")
+                        if real_line is None:
+                            last_name = player_key.split()[-1]
+                            for k, v in mf_real_lines.items():
+                                if k.endswith(last_name) and mf_stat.lower() in v:
+                                    real_line = v[mf_stat.lower()]
+                                    break
 
-                        suggested_line = min(increments, key=lambda x: abs(x - proj))
+                        if real_line is not None:
+                            suggested_line = real_line
+                            line_source    = "📖 Book"
+                        else:
+                            if col == "passing_yards":
+                                increments = [i + 0.5 for i in range(50, 500, 25)]
+                            elif col in ("rush_yards", "receiving_yards"):
+                                increments = [i + 0.5 for i in range(0, 250, 10)]
+                            elif col == "receptions":
+                                increments = [i + 0.5 for i in range(0, 20, 1)]
+                            elif col == "passing_tds":
+                                increments = [0.5, 1.5, 2.5, 3.5]
+                            else:
+                                increments = [i + 0.5 for i in range(0, 60, 5)]
+                            suggested_line = min(increments, key=lambda x: abs(x - proj))
+                            line_source    = "📐 Model"
 
                         rec = "OVER" if proj > suggested_line else "UNDER"
                         confidence = abs(proj - suggested_line)
@@ -2243,6 +2290,7 @@ with tab8:
                             "Def Rank":     f"#{def_rank}",
                             "Matchup":      matchup_grade,
                             "Suggested Line": suggested_line,
+                            "Line Source":  line_source,
                             "Pick":         rec,
                             "Odds":         odds_str,
                             "_conf":        confidence,
