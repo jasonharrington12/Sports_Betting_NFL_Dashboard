@@ -99,6 +99,17 @@ def _get_json(url):
         pass
     return None
 
+# Normalise ESPN schedule abbreviations → what's stored in the CSV game logs
+# ESPN scoreboard uses LAR / WSH; our scraped data uses LA / WAS
+_TEAM_NORM = {
+    "LAR": "LA",
+    "WSH": "WAS",
+}
+
+def _norm_team(abbr):
+    """Map ESPN schedule abbreviations to our internal team codes."""
+    return _TEAM_NORM.get(abbr, abbr)
+
 # ESPN team abbreviation → numeric ID (all 32 teams)
 _TEAM_IDS = {
     "ARI": 22, "ATL": 1,  "BAL": 33, "BUF": 2,  "CAR": 29, "CHI": 3,
@@ -1936,7 +1947,8 @@ with tab8:
                 # ── Per-game prop suggestions ─────────────────────────────────
                 prop_rows = []
                 for game in games:
-                    home, away = game["home"], game["away"]
+                    home_disp, away_disp = game["home"], game["away"]   # original for display
+                    home, away = _norm_team(home_disp), _norm_team(away_disp)  # normalised for data lookup
 
                     for offense_team, defense_team in [(away, home), (home, away)]:
                         def_avg = def_avgs.get(defense_team, league_avg)
@@ -2030,7 +2042,7 @@ with tab8:
 
                         ou = game["odds"].get("over_under")
                         prop_rows.append({
-                            "Game":         f"{away} @ {home}",
+                            "Game":         f"{away_disp} @ {home_disp}",
                             "Date":         game["date"],
                             "Game O/U":     f"{ou}" if ou else "—",
                             "Offense":      offense_team,
@@ -2146,8 +2158,8 @@ with tab8:
                                 # Find best player for this stat across all this week's games
                                 for game in games:
                                     for offense_team, defense_team in [
-                                        (game["away"], game["home"]),
-                                        (game["home"], game["away"]),
+                                        (_norm_team(game["away"]), _norm_team(game["home"])),
+                                        (_norm_team(game["home"]), _norm_team(game["away"])),
                                     ]:
                                         ap_def_avg = ap_def_avgs.get(defense_team, ap_league_avg)
                                         # Only soft matchups in mixed mode
