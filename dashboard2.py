@@ -391,12 +391,23 @@ def find_player(nfl, name):
 def hit_rate(df, col, line):
     if df.empty:
         return None, None, None
-    over = (df[col] > line).sum()
-    return (over / len(df)) * 100, over, len(df)
+    try:
+        over = (df[col] > float(line)).sum()
+        return (over / len(df)) * 100, over, len(df)
+    except (TypeError, ValueError):
+        return None, None, None
 
 
 def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_window="Season"):
-    col = CAT_MAP[category.lower()][0]
+    cat_key = category.lower().strip()
+    if cat_key not in CAT_MAP:
+        return None
+    col = CAT_MAP[cat_key][0]
+    try:
+        line = float(line)
+    except (TypeError, ValueError):
+        return None
+
     pdf = find_player(nfl, player_name)
     if pdf.empty:
         return None
@@ -410,7 +421,7 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_wind
     hr24, ov24, tot24 = hit_rate(p24, col, line)
 
     # Window slice — tail of the combined sorted dataframe
-    n_games = {"Last 3": 3, "Last 5": 5, "Season": None}[game_window]
+    n_games = {"Last 3": 3, "Last 5": 5, "Season": None}.get(game_window, None)
     window_df = pdf.tail(n_games) if n_games is not None else pdf
 
     vals = window_df[col].values
