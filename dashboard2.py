@@ -763,13 +763,14 @@ with main_bet:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        tab1, tab6, tab8, tab7, tab_streak, tab_vegas = st.tabs([
+        tab1, tab6, tab8, tab7, tab_streak, tab_vegas, tab_sgp = st.tabs([
             "📊 Prop Analyzer",
             "🆚 Matchup Edge",
             "🎯 Matchup Finder",
             "🎰 Parlay Builder",
             "🔥 Streak Finder",
             "📈 Vegas Lines",
+            "🏟️ Same-Game Parlay",
         ])
 
         # ── PROP ANALYZER ────────────────────────────────────────────────────
@@ -1083,6 +1084,10 @@ with main_bet:
 
         # ── VEGAS LINES (tab_vegas) — content block follows below ────────────
         with tab_vegas:
+            pass  # filled in below
+
+        # ── SAME-GAME PARLAY (tab_sgp) — content block follows below ─────────
+        with tab_sgp:
             pass  # filled in below
 
 
@@ -3914,3 +3919,487 @@ with main_tracker:
                     _save_bets([])
                     st.success("All bets cleared.")
                     st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SAME-GAME PARLAY BUILDER  (tab_sgp inside main_bet)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_sgp:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
+        st.subheader("🏟️ Same-Game Parlay Builder")
+        st.caption(
+            "Pick a live or upcoming game, add prop legs for players in that game, "
+            "and set a **max parlay odds** cap so your slip stays within your risk limit. "
+            "Add your Odds API key to pre-fill **real DraftKings lines** instead of model projections."
+        )
+
+        # ── Session state for SGP legs ─────────────────────────────────────────
+        if "sgp_legs" not in st.session_state:
+            st.session_state["sgp_legs"] = []
+
+        # ── Top-level controls: game selector · max odds · API key ────────────
+        sgp_top_l, sgp_top_m, sgp_top_r = st.columns([2, 1, 1])
+
+        with sgp_top_l:
+            # Fetch this week's games (reuses cached fetch_this_weeks_games)
+            with st.spinner("Fetching schedule from ESPN…"):
+                sgp_games = fetch_this_weeks_games()
+
+            if not sgp_games:
+                st.warning("No schedule data available right now. Try again shortly.")
+                st.stop()
+
+            sgp_game_labels = [
+                f"Week {g['week']} · {g['away']} @ {g['home']}  ({g['date']})"
+                for g in sgp_games
+            ]
+            sgp_game_idx = st.selectbox(
+                "Select a game",
+                range(len(sgp_game_labels)),
+                format_func=lambda i: sgp_game_labels[i],
+                key="sgp_game_idx",
+            )
+
+        with sgp_top_m:
+            sgp_max_odds = st.number_input(
+                "Max parlay odds (+)",
+                min_value=100, max_value=100000, value=600, step=50,
+                key="sgp_max_odds",
+                help=(
+                    "If combined odds exceed this value the slip turns red. "
+                    "Keeps you from building lottery-ticket parlays."
+                ),
+            )
+
+        with sgp_top_r:
+            st.caption("**Odds API key** — optional. Pre-fills real DraftKings lines.")
+            _sgp_secret_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+            sgp_api_key = st.text_input(
+                "The Odds API key",
+                value=_sgp_secret_key,
+                type="password",
+                key="sgp_api_key",
+                placeholder="Leave blank to use model lines",
+            )
+
+        # ── Fetch live prop lines if API key present ───────────────────────────
+        sgp_real_lines: dict = {}   # {player_name_lower: {cat: line}}
+        if sgp_api_key.strip():
+            with st.spinner("Fetching live prop lines from The Odds API…"):
+                sgp_raw_props = fetch_odds_api_props(sgp_api_key.strip())
+            for rr in sgp_raw_props:
+                _k = rr["player_raw"].lower().strip()
+                if _k not in sgp_real_lines:
+                    sgp_real_lines[_k] = {}
+                sgp_real_lines[_k][rr["cat"]] = rr["line"]
+            if sgp_real_lines:
+                st.success(
+                    f"✅ Live lines loaded for **{len(sgp_real_lines)}** players "
+                    f"from {sgp_raw_props[0]['bookmaker'] if sgp_raw_props else 'book'} "
+                    f"· cached 15 min"
+                )
+            else:
+                st.warning("Odds API returned no lines — using model-projected lines.")
+
+        sgp_game  = sgp_games[sgp_game_idx]
+        home_raw  = sgp_game["home"]
+        away_raw  = sgp_game["away"]
+        home_norm = _norm_team(home_raw)
+        away_norm = _norm_team(away_raw)
+
+        # ── Roster: players from either team in our dataset ───────────────────
+        @st.cache_data(show_spinner=False)
+        def _sgp_roster(nfl, home, away):
+            """Return sorted player list for a game (both teams, 2025 first, then 2024)."""
+            mask = nfl["team"].isin([home, away])
+            names25 = set(nfl[(nfl["season"] == 2025) & mask]["player_name"].unique())
+            names24 = set(nfl[(nfl["season"] == 2024) & mask]["player_name"].unique())
+            return sorted(names25 | names24)
+
+        sgp_roster = _sgp_roster(nfl_df, home_norm, away_norm)
+
+        if not sgp_roster:
+            st.info(
+                f"No player data found for {away_raw} or {home_raw}. "
+                "They may not yet have 2024/2025 game logs in the dataset."
+            )
+        else:
+            # ── Helper: resolve real book line for a player + cat ─────────────
+            def _sgp_real_line(player_name: str, cat: str) -> float | None:
+                """Look up a real book line from the Odds API cache; try exact then last-name."""
+                key = player_name.lower().strip()
+                line = sgp_real_lines.get(key, {}).get(cat)
+                if line is None:
+                    last = key.split()[-1]
+                    for k, v in sgp_real_lines.items():
+                        if k.endswith(last) and cat in v:
+                            line = v[cat]
+                            break
+                return line
+
+            st.markdown(
+                f"**{away_raw} @ {home_raw}** · "
+                f"{len(sgp_roster)} players in dataset"
+                + (f" · 📖 Live lines active" if sgp_real_lines else " · 📐 Model lines")
+            )
+
+            # ── Add Leg panel + Slip side-by-side ────────────────────────────
+            sgp_left, sgp_right = st.columns([1, 2])
+
+            with sgp_left:
+                st.subheader("➕ Add a Leg")
+
+                sgp_player = st.selectbox(
+                    "Player",
+                    sgp_roster,
+                    key="sgp_player",
+                )
+                sgp_cat = st.selectbox(
+                    "Stat",
+                    list(CAT_MAP.keys()),
+                    format_func=str.title,
+                    key="sgp_cat",
+                )
+
+                # Line: real book line first, else weighted-avg model projection
+                @st.cache_data(show_spinner=False)
+                def _sgp_model_line(nfl, player, cat):
+                    """Return model-projected line (weighted avg rounded to nearest 0.5)."""
+                    col_k = CAT_MAP[cat.lower()][0]
+                    pdf = find_player(nfl, player)
+                    if pdf.empty:
+                        return 0.5
+                    vals = pdf[col_k].values
+                    wts  = pdf["weight"].values
+                    wavg = float(np.average(vals, weights=wts)) if len(vals) else 0.0
+                    return max(0.5, round(wavg * 2) / 2)
+
+                _real = _sgp_real_line(sgp_player, sgp_cat)
+                _model = _sgp_model_line(nfl_df, sgp_player, sgp_cat)
+                sgp_default = float(_real if _real is not None else _model)
+                line_source_label = "📖 Book line" if _real is not None else "📐 Model projection"
+
+                sgp_line = st.number_input(
+                    f"Prop Line  ({line_source_label})",
+                    min_value=0.0,
+                    value=sgp_default,
+                    step=0.5,
+                    format="%.1f",
+                    key="sgp_line",
+                )
+                sgp_direction = st.radio(
+                    "Pick",
+                    ["OVER", "UNDER"],
+                    horizontal=True,
+                    key="sgp_direction",
+                )
+                sgp_weighted = st.toggle(
+                    "Season weighting", value=True, key="sgp_weighted"
+                )
+
+                # Quick model hint
+                _sgp_hint = score_leg(nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted)
+                if _sgp_hint:
+                    hint_color = "#2DC653" if _sgp_hint["recommendation"] == "OVER" else "#D62828"
+                    st.markdown(
+                        f'<div style="background:{hint_color}22;border-left:4px solid {hint_color};'
+                        f'padding:6px 10px;border-radius:4px;font-size:12px;margin-bottom:8px;">'
+                        f'Model → <b style="color:{hint_color}">{_sgp_hint["recommendation"]}</b>'
+                        f' · Wtd avg: <b>{_sgp_hint["w_avg"]}</b>'
+                        f' · Hit rate: <b>{_sgp_hint["hit_rate_pct"]}%</b>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                sgp_add = st.button(
+                    "➕ Add to Same-Game Parlay",
+                    type="primary",
+                    use_container_width=True,
+                    key="sgp_add",
+                )
+
+                if sgp_add:
+                    if len(st.session_state["sgp_legs"]) >= 10:
+                        st.warning("Maximum 10 legs reached for a same-game parlay.")
+                    else:
+                        result_sgp = score_leg(
+                            nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted
+                        )
+                        if result_sgp is None:
+                            st.error("Player not found in dataset.")
+                        else:
+                            # Override recommendation with the chosen direction
+                            result_sgp["recommendation"] = sgp_direction
+                            # Adjust implied prob to match user's chosen direction
+                            if sgp_direction == "UNDER":
+                                result_sgp["implied_prob"] = max(
+                                    0.222,
+                                    min(0.778, 1.0 - result_sgp["hit_rate_pct"] / 100),
+                                )
+                            else:
+                                result_sgp["implied_prob"] = max(
+                                    0.222,
+                                    min(0.778, result_sgp["hit_rate_pct"] / 100),
+                                )
+                            result_sgp["american_odds"] = prob_to_american(
+                                result_sgp["implied_prob"]
+                            )
+                            result_sgp["game"] = sgp_game_labels[sgp_game_idx]
+                            result_sgp["line_source"] = (
+                                "📖 Book" if _real is not None else "📐 Model"
+                            )
+
+                            # Prevent duplicate legs
+                            dup = any(
+                                l["player"] == result_sgp["player"]
+                                and l["category"] == result_sgp["category"]
+                                and l["line"] == result_sgp["line"]
+                                and l["recommendation"] == result_sgp["recommendation"]
+                                for l in st.session_state["sgp_legs"]
+                            )
+                            if dup:
+                                st.warning("This exact leg is already in your slip.")
+                            else:
+                                st.session_state["sgp_legs"].append(result_sgp)
+                                st.rerun()
+
+                if st.session_state["sgp_legs"]:
+                    st.divider()
+                    if st.button(
+                        "🗑️ Clear SGP Slip",
+                        use_container_width=True,
+                        key="sgp_clear",
+                    ):
+                        st.session_state["sgp_legs"] = []
+                        st.rerun()
+
+                    # Also offer to send to the main Parlay Builder
+                    if st.button(
+                        "➕ Send to Parlay Builder",
+                        use_container_width=True,
+                        key="sgp_send",
+                        help="Copies all SGP legs into the main 🎰 Parlay Builder tab.",
+                    ):
+                        existing_pb = st.session_state.get("parlay_legs", [])
+                        added_pb = 0
+                        for lg in st.session_state["sgp_legs"]:
+                            dup_pb = any(
+                                e["player"] == lg["player"]
+                                and e["category"] == lg["category"]
+                                and e["line"] == lg["line"]
+                                for e in existing_pb
+                            )
+                            if not dup_pb and len(existing_pb) < 8:
+                                existing_pb.append(lg)
+                                added_pb += 1
+                        st.session_state["parlay_legs"] = existing_pb
+                        if added_pb:
+                            st.success(
+                                f"✅ {added_pb} leg(s) sent to Parlay Builder — "
+                                "switch to the 🎰 Parlay Builder tab."
+                            )
+                        else:
+                            st.info(
+                                "All legs are already in the Parlay Builder "
+                                "(or it's full at 8 legs)."
+                            )
+
+            # ── SGP Slip ─────────────────────────────────────────────────────
+            with sgp_right:
+                sgp_legs = st.session_state["sgp_legs"]
+
+                if not sgp_legs:
+                    st.info(
+                        "👈 Add legs from the left panel. "
+                        "All legs must come from the **same game**."
+                    )
+                else:
+                    st.subheader(
+                        f"🏟️ SGP Slip  —  {len(sgp_legs)} leg"
+                        f"{'s' if len(sgp_legs) > 1 else ''}"
+                    )
+
+                    # ── Per-leg rows with remove buttons ─────────────────────
+                    sgp_remove_idx = None
+                    for i, leg in enumerate(sgp_legs):
+                        rec_color = "#2DC653" if leg["recommendation"] == "OVER" else "#D62828"
+                        gc1, gc2, gc3, gc4, gc5, gc6 = st.columns([2, 1.5, 1, 1, 1, 0.5])
+                        gc1.markdown(f"**{leg['player']}**")
+                        gc2.markdown(
+                            f"{leg['category'].title()} "
+                            f"{leg['recommendation']} **{leg['line']}**"
+                            + (f"  {leg.get('line_source','')}" if leg.get('line_source') else "")
+                        )
+                        gc3.metric("Wtd Avg", leg["w_avg"])
+                        gc4.metric("Hit Rate", f"{leg['hit_rate_pct']}%")
+                        gc5.markdown(
+                            f"<span style='color:{rec_color};font-weight:700;"
+                            f"font-size:15px'>{leg['recommendation']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        if gc6.button("✕", key=f"sgp_rm_{i}"):
+                            sgp_remove_idx = i
+
+                    if sgp_remove_idx is not None:
+                        st.session_state["sgp_legs"].pop(sgp_remove_idx)
+                        st.rerun()
+
+                    st.divider()
+
+                    # ── Parlay math ───────────────────────────────────────────
+                    if len(sgp_legs) >= 2:
+                        sgp_combined_prob = 1.0
+                        for leg in sgp_legs:
+                            sgp_combined_prob *= leg["implied_prob"]
+
+                        sgp_combined_american = prob_to_american(sgp_combined_prob)
+                        sgp_conf_label, sgp_conf_color = confidence_label(sgp_combined_prob)
+
+                        # ── Max-odds limit check ──────────────────────────────
+                        odds_exceeded = sgp_combined_american > sgp_max_odds
+
+                        sgp_stake = st.number_input(
+                            "Stake ($)",
+                            min_value=1.0,
+                            value=10.0,
+                            step=5.0,
+                            format="%.2f",
+                            key="sgp_stake",
+                        )
+                        sgp_payout = parlay_payout(
+                            [l["american_odds"] for l in sgp_legs], sgp_stake
+                        )
+                        sgp_profit = round(sgp_payout - sgp_stake, 2)
+
+                        # ── Summary metrics ───────────────────────────────────
+                        sm1, sm2, sm3, sm4 = st.columns(4)
+                        sm1.metric(
+                            "Combined Win Prob",
+                            f"{sgp_combined_prob * 100:.1f}%",
+                        )
+                        sm2.metric(
+                            "SGP Odds",
+                            f"+{sgp_combined_american}"
+                            if sgp_combined_american > 0
+                            else str(sgp_combined_american),
+                            delta=(
+                                f"⚠️ exceeds +{sgp_max_odds} limit"
+                                if odds_exceeded
+                                else f"✅ within +{sgp_max_odds} limit"
+                            ),
+                            delta_color="inverse" if odds_exceeded else "normal",
+                        )
+                        sm3.metric("Potential Payout", f"${sgp_payout:,.2f}")
+                        sm4.metric("Potential Profit", f"${sgp_profit:,.2f}")
+
+                        # ── Max-odds warning banner ───────────────────────────
+                        if odds_exceeded:
+                            st.markdown(
+                                f'<div style="background:#D6282822;border-left:5px solid #D62828;'
+                                f'padding:10px 14px;border-radius:6px;margin:8px 0;font-size:14px;">'
+                                f'⚠️ <b>Odds limit exceeded:</b> Current odds '
+                                f'<b>+{sgp_combined_american}</b> are above your max of '
+                                f'<b>+{sgp_max_odds}</b>. '
+                                f'Remove a leg or raise the limit to continue.'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        # ── Confidence banner ─────────────────────────────────
+                        banner_bg = sgp_conf_color if not odds_exceeded else "#D62828"
+                        st.markdown(
+                            f'<div style="background:{banner_bg};color:#fff;'
+                            f'padding:12px 20px;border-radius:8px;'
+                            f'font-size:20px;font-weight:700;text-align:center;'
+                            f'margin:12px 0;">'
+                            f'SGP Confidence: {sgp_conf_label} &nbsp;·&nbsp; '
+                            f'{sgp_combined_prob * 100:.1f}% est. probability'
+                            + (
+                                f' &nbsp;·&nbsp; <span style="font-size:15px">⚠️ Over odds cap</span>'
+                                if odds_exceeded
+                                else ""
+                            )
+                            + f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # ── Leg breakdown chart ───────────────────────────────
+                        st.subheader("Leg Breakdown")
+                        fig_sgp, ax_sgp = plt.subplots(
+                            figsize=(9, max(3, len(sgp_legs) * 0.55))
+                        )
+                        sgp_bar_labels = [
+                            f"{l['player']}\n{l['category'].title()} "
+                            f"{l['recommendation']} {l['line']}"
+                            for l in sgp_legs
+                        ]
+                        sgp_probs = [l["implied_prob"] * 100 for l in sgp_legs]
+                        sgp_colors = [
+                            C_OVER if l["recommendation"] == "OVER" else C_LINE
+                            for l in sgp_legs
+                        ]
+                        bars_sgp = ax_sgp.barh(
+                            sgp_bar_labels[::-1],
+                            sgp_probs[::-1],
+                            color=sgp_colors[::-1],
+                            alpha=0.85,
+                            edgecolor="white",
+                            linewidth=0.5,
+                        )
+                        ax_sgp.axvline(
+                            50, color="#888", linewidth=1, linestyle="--", label="50%"
+                        )
+                        for bar, val in zip(bars_sgp, sgp_probs[::-1]):
+                            ax_sgp.text(
+                                bar.get_width() + 0.5,
+                                bar.get_y() + bar.get_height() / 2,
+                                f"{val:.1f}%",
+                                va="center",
+                                fontsize=8,
+                            )
+                        ax_sgp.set_xlabel("Estimated Win Probability (%)", fontsize=9)
+                        ax_sgp.set_xlim(0, 105)
+                        ax_sgp.spines["top"].set_visible(False)
+                        ax_sgp.spines["right"].set_visible(False)
+                        ax_sgp.grid(axis="x", linestyle="--", alpha=0.35)
+                        ax_sgp.legend(fontsize=8)
+                        plt.tight_layout()
+                        st.pyplot(fig_sgp, use_container_width=True)
+                        plt.close(fig_sgp)
+
+                        # ── Full leg detail table ─────────────────────────────
+                        st.subheader("Full Leg Details")
+                        sgp_detail = []
+                        for leg in sgp_legs:
+                            sgp_detail.append(
+                                {
+                                    "Player":      leg["player"],
+                                    "Stat":        leg["category"].title(),
+                                    "Line":        leg["line"],
+                                    "Line Source": leg.get("line_source", "📐 Model"),
+                                    "Pick":        leg["recommendation"],
+                                    "Wtd Avg":     leg["w_avg"],
+                                    "Hit Rate":    f"{leg['hit_rate_pct']}%",
+                                    "Leg Odds":    (
+                                        f"+{leg['american_odds']}"
+                                        if leg["american_odds"] > 0
+                                        else str(leg["american_odds"])
+                                    ),
+                                    "Leg Prob":    f"{leg['implied_prob'] * 100:.1f}%",
+                                }
+                            )
+                        st.dataframe(
+                            pd.DataFrame(sgp_detail),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        st.caption(
+                            "⚠️ Same-game parlays carry a sportsbook correlation discount "
+                            "not reflected in these independent probability estimates. "
+                            "Bet responsibly."
+                        )
+                    else:
+                        st.info("Add at least **2 legs** to calculate SGP odds.")
