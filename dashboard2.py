@@ -725,6 +725,32 @@ def team_bar_chart(nfl, season, stat_col, stat_label):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MODULE-LEVEL HELPERS  (used by multiple tabs)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def build_defense_table(nfl):
+    """Add opponent column derived from game_id format 'YYYY_WW_AWAY_HOME'."""
+    df = nfl.copy()
+    def get_opp(row):
+        parts = str(row["game_id"]).split("_")
+        if len(parts) < 4: return "UNK"
+        away, home = parts[2], parts[3]
+        return home if row["team"] == away else away
+    df["opponent"] = df.apply(get_opp, axis=1)
+    return df
+
+# Stat column → relevant depth-chart positions
+_COL_TO_POS = {
+    "passing_yards":   ["QB"],
+    "passing_tds":     ["QB"],
+    "rush_yards":      ["RB"],
+    "receiving_yards": ["WR", "TE", "RB"],
+    "receptions":      ["WR", "TE", "RB"],
+    "fantasy_points":  ["QB", "RB", "WR", "TE"],
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # LOAD DATA
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("🏈 NFL Prop Betting Dashboard")
@@ -1967,16 +1993,7 @@ with tab8:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
         # ── helpers ───────────────────────────────────────────────────────────
-        @st.cache_data(show_spinner=False)
-        def build_defense_table(nfl):
-            df = nfl.copy()
-            def get_opp(row):
-                parts = str(row["game_id"]).split("_")
-                if len(parts) < 4: return "UNK"
-                away, home = parts[2], parts[3]
-                return home if row["team"] == away else away
-            df["opponent"] = df.apply(get_opp, axis=1)
-            return df
+        # build_defense_table and _COL_TO_POS are now at module level (above)
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_this_weeks_games():
@@ -2161,16 +2178,6 @@ with tab8:
                     )
                 else:
                     st.warning("Odds API returned no prop lines — using model-projected lines.")
-
-            # Helper: map stat col → depth chart position(s)
-            _COL_TO_POS = {
-                "passing_yards":   ["QB"],
-                "passing_tds":     ["QB"],
-                "rush_yards":      ["RB"],
-                "receiving_yards": ["WR", "TE", "RB"],
-                "receptions":      ["WR", "TE", "RB"],
-                "fantasy_points":  ["QB", "RB", "WR", "TE"],
-            }
 
             def depth_chart_players(team, stat_col, max_rank=3):
                 """Return the top-N depth chart players for a team/stat combo."""
@@ -4049,122 +4056,349 @@ with tab_sgp:
             sgp_left, sgp_right = st.columns([1, 2])
 
             with sgp_left:
-                st.subheader("➕ Add a Leg")
-
-                sgp_player = st.selectbox(
-                    "Player",
-                    sgp_roster,
-                    key="sgp_player",
-                )
-                sgp_cat = st.selectbox(
-                    "Stat",
-                    list(CAT_MAP.keys()),
-                    format_func=str.title,
-                    key="sgp_cat",
-                )
-
-                # Line: real book line first, else weighted-avg model projection
-                @st.cache_data(show_spinner=False)
-                def _sgp_model_line(nfl, player, cat):
-                    """Return model-projected line (weighted avg rounded to nearest 0.5)."""
-                    col_k = CAT_MAP[cat.lower()][0]
-                    pdf = find_player(nfl, player)
-                    if pdf.empty:
-                        return 0.5
-                    vals = pdf[col_k].values
-                    wts  = pdf["weight"].values
-                    wavg = float(np.average(vals, weights=wts)) if len(vals) else 0.0
-                    return max(0.5, round(wavg * 2) / 2)
-
-                _real = _sgp_real_line(sgp_player, sgp_cat)
-                _model = _sgp_model_line(nfl_df, sgp_player, sgp_cat)
-                sgp_default = float(_real if _real is not None else _model)
-                line_source_label = "📖 Book line" if _real is not None else "📐 Model projection"
-
-                sgp_line = st.number_input(
-                    f"Prop Line  ({line_source_label})",
-                    min_value=0.0,
-                    value=sgp_default,
-                    step=0.5,
-                    format="%.1f",
-                    key="sgp_line",
-                )
-                sgp_direction = st.radio(
-                    "Pick",
-                    ["OVER", "UNDER"],
+                # ── Mode toggle: Auto-Build vs Manual ────────────────────────
+                sgp_mode = st.radio(
+                    "Mode",
+                    ["⚡ Auto-Build", "✏️ Manual"],
                     horizontal=True,
-                    key="sgp_direction",
-                )
-                sgp_weighted = st.toggle(
-                    "Season weighting", value=True, key="sgp_weighted"
+                    key="sgp_mode",
+                    help="Auto-Build scores every player in the game across all stats and picks the best legs. Manual lets you add individual legs.",
                 )
 
-                # Quick model hint
-                _sgp_hint = score_leg(nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted)
-                if _sgp_hint:
-                    hint_color = "#2DC653" if _sgp_hint["recommendation"] == "OVER" else "#D62828"
-                    st.markdown(
-                        f'<div style="background:{hint_color}22;border-left:4px solid {hint_color};'
-                        f'padding:6px 10px;border-radius:4px;font-size:12px;margin-bottom:8px;">'
-                        f'Model → <b style="color:{hint_color}">{_sgp_hint["recommendation"]}</b>'
-                        f' · Wtd avg: <b>{_sgp_hint["w_avg"]}</b>'
-                        f' · Hit rate: <b>{_sgp_hint["hit_rate_pct"]}%</b>'
-                        f'</div>',
-                        unsafe_allow_html=True,
+                st.divider()
+
+                # ════════════════════════════════════════════════════════════
+                # AUTO-BUILD MODE
+                # ════════════════════════════════════════════════════════════
+                if sgp_mode == "⚡ Auto-Build":
+                    st.subheader("⚡ Auto-Build Settings")
+
+                    sgp_auto_legs = st.slider(
+                        "Number of legs", 2, 8, 4, key="sgp_auto_legs"
+                    )
+                    sgp_auto_stats = st.multiselect(
+                        "Stat categories to consider",
+                        list(CAT_MAP.keys()),
+                        default=["pass yards", "rush yards", "rec yards", "receptions"],
+                        format_func=str.title,
+                        key="sgp_auto_stats",
+                    )
+                    sgp_auto_min_hr = st.slider(
+                        "Min hit rate %", 40, 80, 55, key="sgp_auto_min_hr",
+                        help="Only include legs where historical hit rate ≥ this value.",
+                    )
+                    sgp_auto_weighted = st.toggle(
+                        "Season weighting", value=True, key="sgp_auto_weighted"
+                    )
+                    sgp_auto_depth = st.toggle(
+                        "Depth-chart filter (starters only)", value=True,
+                        key="sgp_auto_depth",
+                        help="Restrict candidates to players who appear in ESPN depth charts.",
                     )
 
-                sgp_add = st.button(
-                    "➕ Add to Same-Game Parlay",
-                    type="primary",
-                    use_container_width=True,
-                    key="sgp_add",
-                )
+                    sgp_auto_btn = st.button(
+                        "⚡ Build Best SGP",
+                        type="primary",
+                        use_container_width=True,
+                        key="sgp_auto_btn",
+                    )
 
-                if sgp_add:
-                    if len(st.session_state["sgp_legs"]) >= 10:
-                        st.warning("Maximum 10 legs reached for a same-game parlay.")
-                    else:
-                        result_sgp = score_leg(
-                            nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted
-                        )
-                        if result_sgp is None:
-                            st.error("Player not found in dataset.")
+                    if sgp_auto_btn:
+                        if not sgp_auto_stats:
+                            st.warning("Select at least one stat category.")
                         else:
-                            # Override recommendation with the chosen direction
-                            result_sgp["recommendation"] = sgp_direction
-                            # Adjust implied prob to match user's chosen direction
-                            if sgp_direction == "UNDER":
-                                result_sgp["implied_prob"] = max(
-                                    0.222,
-                                    min(0.778, 1.0 - result_sgp["hit_rate_pct"] / 100),
-                                )
-                            else:
-                                result_sgp["implied_prob"] = max(
-                                    0.222,
-                                    min(0.778, result_sgp["hit_rate_pct"] / 100),
-                                )
-                            result_sgp["american_odds"] = prob_to_american(
-                                result_sgp["implied_prob"]
-                            )
-                            result_sgp["game"] = sgp_game_labels[sgp_game_idx]
-                            result_sgp["line_source"] = (
-                                "📖 Book" if _real is not None else "📐 Model"
-                            )
+                            # ── Build defense lookup for this game ────────────
+                            nfl_def_sgp = build_defense_table(nfl_df)
 
-                            # Prevent duplicate legs
-                            dup = any(
-                                l["player"] == result_sgp["player"]
-                                and l["category"] == result_sgp["category"]
-                                and l["line"] == result_sgp["line"]
-                                and l["recommendation"] == result_sgp["recommendation"]
-                                for l in st.session_state["sgp_legs"]
-                            )
-                            if dup:
-                                st.warning("This exact leg is already in your slip.")
+                            # Depth charts (already cached from Matchup Finder if loaded)
+                            with st.spinner("Loading depth charts…"):
+                                sgp_depth_charts = fetch_all_depth_charts()
+
+                            def _sgp_dc_players(team, stat_col, max_rank=3):
+                                chart = sgp_depth_charts.get(team, {})
+                                positions = _COL_TO_POS.get(stat_col, [])
+                                players = []
+                                for pos in positions:
+                                    players.extend(chart.get(pos, [])[:max_rank])
+                                return players
+
+                            # ── Score every player × stat for this game ───────
+                            candidate_legs = []
+                            seen_player_cats = set()  # avoid same player+stat twice
+
+                            for cat in sgp_auto_stats:
+                                col_key = CAT_MAP[cat.lower()][0]
+
+                                # Defense avg allowed for this stat vs each team
+                                def_agg = (
+                                    nfl_def_sgp.groupby("opponent")[col_key]
+                                    .mean()
+                                )
+                                league_avg_def = def_agg.mean() if len(def_agg) else 1.0
+
+                                for offense_team, defense_team in [
+                                    (home_norm, away_norm),
+                                    (away_norm, home_norm),
+                                ]:
+                                    def_avg = def_agg.get(defense_team, league_avg_def)
+                                    matchup_factor = def_avg / league_avg_def if league_avg_def > 0 else 1.0
+                                    if matchup_factor > 1.10:
+                                        matchup_grade = "🟢 Soft"
+                                    elif matchup_factor < 0.90:
+                                        matchup_grade = "🔴 Tough"
+                                    else:
+                                        matchup_grade = "🟡 Average"
+
+                                    # Players on this offense team
+                                    team_players_df = nfl_df[
+                                        (nfl_df["team"] == offense_team) &
+                                        (nfl_df["season"] == 2025) &
+                                        (nfl_df[col_key] > 0)
+                                    ]
+                                    if team_players_df.empty:
+                                        team_players_df = nfl_df[
+                                            (nfl_df["team"] == offense_team) &
+                                            (nfl_df["season"] == 2024) &
+                                            (nfl_df[col_key] > 0)
+                                        ]
+                                    if team_players_df.empty:
+                                        continue
+
+                                    # Depth chart filter
+                                    if sgp_auto_depth:
+                                        dc_names = _sgp_dc_players(offense_team, col_key, max_rank=3)
+                                        if dc_names:
+                                            team_players_df = team_players_df[
+                                                team_players_df["player_name"].isin(dc_names)
+                                            ]
+
+                                    player_names = team_players_df["player_name"].unique()
+
+                                    for pname in player_names:
+                                        pk = (pname, cat)
+                                        if pk in seen_player_cats:
+                                            continue
+
+                                        pdf = find_player(nfl_df, pname)
+                                        if pdf.empty:
+                                            continue
+
+                                        vals = pdf[col_key].values
+                                        wts  = pdf["weight"].values
+                                        if len(vals) == 0:
+                                            continue
+
+                                        # Weighted avg
+                                        w_avg = float(np.average(vals, weights=wts))
+                                        # Matchup-adjusted projection
+                                        proj = w_avg * matchup_factor
+
+                                        # Resolve line: real book > model projection
+                                        real_line = _sgp_real_line(pname, cat)
+                                        if real_line is not None:
+                                            line_val = real_line
+                                            lsrc = "📖 Book"
+                                        else:
+                                            # Snap to nearest realistic increment
+                                            if col_key == "passing_yards":
+                                                incs = [i + 0.5 for i in range(50, 500, 25)]
+                                            elif col_key in ("rush_yards", "receiving_yards"):
+                                                incs = [i + 0.5 for i in range(0, 250, 10)]
+                                            elif col_key == "receptions":
+                                                incs = [i + 0.5 for i in range(0, 20, 1)]
+                                            elif col_key == "passing_tds":
+                                                incs = [0.5, 1.5, 2.5, 3.5]
+                                            else:
+                                                incs = [i + 0.5 for i in range(0, 60, 5)]
+                                            line_val = min(incs, key=lambda x: abs(x - proj))
+                                            lsrc = "📐 Model"
+
+                                        # Direction: always take OVER on soft matchup, else model's call
+                                        direction = "OVER" if proj > line_val else "UNDER"
+
+                                        # Hit rate (weighted)
+                                        w_hit = float(np.average(
+                                            (vals > line_val).astype(float), weights=wts
+                                        )) * 100
+                                        hr_for_direction = w_hit if direction == "OVER" else (100 - w_hit)
+
+                                        # Apply min hit rate filter
+                                        if hr_for_direction < sgp_auto_min_hr:
+                                            continue
+
+                                        # Implied prob (capped)
+                                        implied = max(0.222, min(0.778, hr_for_direction / 100))
+
+                                        # Composite score: hit rate × matchup factor × recency boost
+                                        last3 = float(pdf[col_key].tail(3).mean()) if len(pdf) >= 3 else w_avg
+                                        recency = (last3 / w_avg) if w_avg > 0 else 1.0
+                                        recency = max(0.5, min(2.0, recency))
+                                        composite = hr_for_direction * matchup_factor * recency
+
+                                        candidate_legs.append({
+                                            "player":       pname,
+                                            "category":     cat,
+                                            "col":          col_key,
+                                            "line":         line_val,
+                                            "line_source":  lsrc,
+                                            "recommendation": direction,
+                                            "w_avg":        round(w_avg, 1),
+                                            "last3":        round(last3, 1),
+                                            "hit_rate_pct": round(w_hit, 1),
+                                            "implied_prob": round(implied, 4),
+                                            "american_odds": prob_to_american(implied),
+                                            "matchup_grade": matchup_grade,
+                                            "matchup_factor": round(matchup_factor, 2),
+                                            "defense":      defense_team,
+                                            "game":         sgp_game_labels[sgp_game_idx],
+                                            "_composite":   composite,
+                                        })
+                                        seen_player_cats.add(pk)
+
+                            # Sort by composite score, pick top N unique players
+                            candidate_legs.sort(key=lambda x: x["_composite"], reverse=True)
+
+                            # Ensure each player appears at most once in the final slip
+                            seen_players_final = set()
+                            auto_legs = []
+                            for leg in candidate_legs:
+                                if leg["player"] not in seen_players_final:
+                                    auto_legs.append(leg)
+                                    seen_players_final.add(leg["player"])
+                                if len(auto_legs) >= sgp_auto_legs:
+                                    break
+
+                            if len(auto_legs) < 2:
+                                st.warning(
+                                    "Not enough qualifying legs found. "
+                                    "Try lowering the min hit rate, adding more stat categories, "
+                                    "or turning off the depth-chart filter."
+                                )
                             else:
-                                st.session_state["sgp_legs"].append(result_sgp)
+                                # Load into session state
+                                st.session_state["sgp_legs"] = [
+                                    {k: v for k, v in lg.items() if k != "_composite"}
+                                    for lg in auto_legs
+                                ]
                                 st.rerun()
 
+                # ════════════════════════════════════════════════════════════
+                # MANUAL MODE
+                # ════════════════════════════════════════════════════════════
+                else:
+                    st.subheader("➕ Add a Leg")
+
+                    sgp_player = st.selectbox(
+                        "Player",
+                        sgp_roster,
+                        key="sgp_player",
+                    )
+                    sgp_cat = st.selectbox(
+                        "Stat",
+                        list(CAT_MAP.keys()),
+                        format_func=str.title,
+                        key="sgp_cat",
+                    )
+
+                    # Line: real book line first, else weighted-avg model projection
+                    @st.cache_data(show_spinner=False)
+                    def _sgp_model_line(nfl, player, cat):
+                        """Return model-projected line (weighted avg rounded to nearest 0.5)."""
+                        col_k = CAT_MAP[cat.lower()][0]
+                        pdf = find_player(nfl, player)
+                        if pdf.empty:
+                            return 0.5
+                        vals = pdf[col_k].values
+                        wts  = pdf["weight"].values
+                        wavg = float(np.average(vals, weights=wts)) if len(vals) else 0.0
+                        return max(0.5, round(wavg * 2) / 2)
+
+                    _real = _sgp_real_line(sgp_player, sgp_cat)
+                    _model = _sgp_model_line(nfl_df, sgp_player, sgp_cat)
+                    sgp_default = float(_real if _real is not None else _model)
+                    line_source_label = "📖 Book line" if _real is not None else "📐 Model projection"
+
+                    sgp_line = st.number_input(
+                        f"Prop Line  ({line_source_label})",
+                        min_value=0.0,
+                        value=sgp_default,
+                        step=0.5,
+                        format="%.1f",
+                        key="sgp_line",
+                    )
+                    sgp_direction = st.radio(
+                        "Pick",
+                        ["OVER", "UNDER"],
+                        horizontal=True,
+                        key="sgp_direction",
+                    )
+                    sgp_weighted = st.toggle(
+                        "Season weighting", value=True, key="sgp_weighted"
+                    )
+
+                    # Quick model hint
+                    _sgp_hint = score_leg(nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted)
+                    if _sgp_hint:
+                        hint_color = "#2DC653" if _sgp_hint["recommendation"] == "OVER" else "#D62828"
+                        st.markdown(
+                            f'<div style="background:{hint_color}22;border-left:4px solid {hint_color};'
+                            f'padding:6px 10px;border-radius:4px;font-size:12px;margin-bottom:8px;">'
+                            f'Model → <b style="color:{hint_color}">{_sgp_hint["recommendation"]}</b>'
+                            f' · Wtd avg: <b>{_sgp_hint["w_avg"]}</b>'
+                            f' · Hit rate: <b>{_sgp_hint["hit_rate_pct"]}%</b>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    sgp_add = st.button(
+                        "➕ Add to Same-Game Parlay",
+                        type="primary",
+                        use_container_width=True,
+                        key="sgp_add",
+                    )
+
+                    if sgp_add:
+                        if len(st.session_state["sgp_legs"]) >= 10:
+                            st.warning("Maximum 10 legs reached for a same-game parlay.")
+                        else:
+                            result_sgp = score_leg(
+                                nfl_df, sgp_player, sgp_cat, sgp_line, sgp_weighted
+                            )
+                            if result_sgp is None:
+                                st.error("Player not found in dataset.")
+                            else:
+                                result_sgp["recommendation"] = sgp_direction
+                                if sgp_direction == "UNDER":
+                                    result_sgp["implied_prob"] = max(
+                                        0.222,
+                                        min(0.778, 1.0 - result_sgp["hit_rate_pct"] / 100),
+                                    )
+                                else:
+                                    result_sgp["implied_prob"] = max(
+                                        0.222,
+                                        min(0.778, result_sgp["hit_rate_pct"] / 100),
+                                    )
+                                result_sgp["american_odds"] = prob_to_american(
+                                    result_sgp["implied_prob"]
+                                )
+                                result_sgp["game"] = sgp_game_labels[sgp_game_idx]
+                                result_sgp["line_source"] = (
+                                    "📖 Book" if _real is not None else "📐 Model"
+                                )
+                                dup = any(
+                                    l["player"] == result_sgp["player"]
+                                    and l["category"] == result_sgp["category"]
+                                    and l["line"] == result_sgp["line"]
+                                    and l["recommendation"] == result_sgp["recommendation"]
+                                    for l in st.session_state["sgp_legs"]
+                                )
+                                if dup:
+                                    st.warning("This exact leg is already in your slip.")
+                                else:
+                                    st.session_state["sgp_legs"].append(result_sgp)
+                                    st.rerun()
+
+                # ── Shared slip controls (both modes) ────────────────────────
                 if st.session_state["sgp_legs"]:
                     st.divider()
                     if st.button(
@@ -4175,7 +4409,6 @@ with tab_sgp:
                         st.session_state["sgp_legs"] = []
                         st.rerun()
 
-                    # Also offer to send to the main Parlay Builder
                     if st.button(
                         "➕ Send to Parlay Builder",
                         use_container_width=True,
