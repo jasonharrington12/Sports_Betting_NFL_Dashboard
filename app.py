@@ -3990,9 +3990,18 @@ with tab_sgp:
             )
 
         with sgp_top_m:
+            sgp_min_odds = st.number_input(
+                "Min parlay odds (+)",
+                min_value=100, max_value=10000, value=250, step=50,
+                key="sgp_min_odds",
+                help=(
+                    "If combined odds fall below this value the slip warns you. "
+                    "Ensures the parlay pays out enough to be worth the risk."
+                ),
+            )
             sgp_max_odds = st.number_input(
                 "Max parlay odds (+)",
-                min_value=100, max_value=100000, value=600, step=50,
+                min_value=100, max_value=100000, value=2000, step=50,
                 key="sgp_max_odds",
                 help=(
                     "If combined odds exceed this value the slip turns red. "
@@ -4532,8 +4541,9 @@ with tab_sgp:
                         sgp_combined_american = prob_to_american(sgp_combined_prob)
                         sgp_conf_label, sgp_conf_color = confidence_label(sgp_combined_prob)
 
-                        # ── Max-odds limit check ──────────────────────────────
+                        # ── Odds range checks ─────────────────────────────────
                         odds_exceeded = sgp_combined_american > sgp_max_odds
+                        odds_too_low  = 0 < sgp_combined_american < sgp_min_odds
 
                         sgp_stake = st.number_input(
                             "Stake ($)",
@@ -4554,36 +4564,54 @@ with tab_sgp:
                             "Combined Win Prob",
                             f"{sgp_combined_prob * 100:.1f}%",
                         )
-                        sm2.metric(
-                            "SGP Odds",
-                            f"+{sgp_combined_american}"
-                            if sgp_combined_american > 0
-                            else str(sgp_combined_american),
-                            delta=(
-                                f"⚠️ exceeds +{sgp_max_odds} limit"
-                                if odds_exceeded
-                                else f"✅ within +{sgp_max_odds} limit"
-                            ),
-                            delta_color="inverse" if odds_exceeded else "normal",
-                        )
+                        odds_str = f"+{sgp_combined_american}" if sgp_combined_american > 0 else str(sgp_combined_american)
+                        if odds_exceeded:
+                            odds_delta      = f"⚠️ exceeds +{sgp_max_odds} max"
+                            odds_delta_color = "inverse"
+                        elif odds_too_low:
+                            odds_delta      = f"⚠️ below +{sgp_min_odds} minimum"
+                            odds_delta_color = "inverse"
+                        else:
+                            odds_delta      = f"✅ +{sgp_min_odds}–+{sgp_max_odds} range"
+                            odds_delta_color = "normal"
+                        sm2.metric("SGP Odds", odds_str, delta=odds_delta, delta_color=odds_delta_color)
                         sm3.metric("Potential Payout", f"${sgp_payout:,.2f}")
                         sm4.metric("Potential Profit", f"${sgp_profit:,.2f}")
 
-                        # ── Max-odds warning banner ───────────────────────────
+                        # ── Odds range warning banners ────────────────────────
                         if odds_exceeded:
                             st.markdown(
                                 f'<div style="background:#D6282822;border-left:5px solid #D62828;'
                                 f'padding:10px 14px;border-radius:6px;margin:8px 0;font-size:14px;">'
-                                f'⚠️ <b>Odds limit exceeded:</b> Current odds '
+                                f'⚠️ <b>Odds cap exceeded:</b> Current odds '
                                 f'<b>+{sgp_combined_american}</b> are above your max of '
                                 f'<b>+{sgp_max_odds}</b>. '
-                                f'Remove a leg or raise the limit to continue.'
+                                f'Remove a leg or raise the max limit.'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        elif odds_too_low:
+                            st.markdown(
+                                f'<div style="background:#f59e0b22;border-left:5px solid #f59e0b;'
+                                f'padding:10px 14px;border-radius:6px;margin:8px 0;font-size:14px;">'
+                                f'⚠️ <b>Below minimum odds:</b> Current odds '
+                                f'<b>+{sgp_combined_american}</b> are below your minimum of '
+                                f'<b>+{sgp_min_odds}</b>. '
+                                f'Add more legs to increase the payout.'
                                 f'</div>',
                                 unsafe_allow_html=True,
                             )
 
                         # ── Confidence banner ─────────────────────────────────
-                        banner_bg = sgp_conf_color if not odds_exceeded else "#D62828"
+                        if odds_exceeded:
+                            banner_bg = "#D62828"
+                            banner_note = ' &nbsp;·&nbsp; <span style="font-size:15px">⚠️ Over odds cap</span>'
+                        elif odds_too_low:
+                            banner_bg = "#f59e0b"
+                            banner_note = f' &nbsp;·&nbsp; <span style="font-size:15px">⚠️ Below +{sgp_min_odds} min</span>'
+                        else:
+                            banner_bg = sgp_conf_color
+                            banner_note = ""
                         st.markdown(
                             f'<div style="background:{banner_bg};color:#fff;'
                             f'padding:12px 20px;border-radius:8px;'
@@ -4591,12 +4619,8 @@ with tab_sgp:
                             f'margin:12px 0;">'
                             f'SGP Confidence: {sgp_conf_label} &nbsp;·&nbsp; '
                             f'{sgp_combined_prob * 100:.1f}% est. probability'
-                            + (
-                                f' &nbsp;·&nbsp; <span style="font-size:15px">⚠️ Over odds cap</span>'
-                                if odds_exceeded
-                                else ""
-                            )
-                            + f'</div>',
+                            f'{banner_note}'
+                            f'</div>',
                             unsafe_allow_html=True,
                         )
 
