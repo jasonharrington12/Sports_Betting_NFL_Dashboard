@@ -1742,15 +1742,15 @@ with tab7:
 
         def prob_to_american(p: float) -> int:
             """Convert probability (0-1) back to American odds.
-            Clamps output so favourites never exceed -350 and underdogs never
-            exceed +350, keeping lines within a realistic sportsbook range.
+            Clamps output so favourites never exceed -800 and underdogs never
+            exceed +600, keeping lines within a realistic sportsbook range.
             """
             if p <= 0 or p >= 1:
                 return 0
             if p >= 0.5:
-                return max(-350, -round((p / (1 - p)) * 100))
+                return max(-800, -round((p / (1 - p)) * 100))
             else:
-                return min(350, round(((1 - p) / p) * 100))
+                return min(600, round(((1 - p) / p) * 100))
 
         def parlay_payout(leg_odds: list[int], stake: float) -> float:
             """
@@ -1797,8 +1797,8 @@ with tab7:
             rec = "OVER" if w_avg > line else "UNDER"
             # implied prob: if bet OVER, use hit rate; if UNDER use (1 - hit rate)
             implied = w_hit if rec == "OVER" else 1 - w_hit
-            # cap between 22% and 78% → American odds stay within ±350
-            implied = max(0.222, min(0.778, implied))
+            # cap between 11% and 89% → American odds stay within ±800/+600
+            implied = max(0.111, min(0.889, implied))
 
             return {
                 "player":      pdf["player_name"].iloc[0],
@@ -2398,11 +2398,11 @@ with tab8:
                         p_vals = p_df[col].values
                         hit_rate = float((p_vals > suggested_line).mean()) if len(p_vals) else 0.5
                         implied = hit_rate if rec == "OVER" else 1 - hit_rate
-                        implied = max(0.222, min(0.778, implied))
+                        implied = max(0.111, min(0.889, implied))
                         raw_odds = -round((implied / (1 - implied)) * 100) if implied >= 0.5 \
                                    else round(((1 - implied) / implied) * 100)
-                        # clamp to ±350
-                        american = max(-350, raw_odds) if raw_odds < 0 else min(350, raw_odds)
+                        # clamp to ±800/+600
+                        american = max(-800, raw_odds) if raw_odds < 0 else min(600, raw_odds)
                         odds_str = f"{american:+d}"
 
                         ou = game["odds"].get("over_under")
@@ -4247,7 +4247,7 @@ with tab_sgp:
                                             continue
 
                                         # Implied prob (capped)
-                                        implied = max(0.222, min(0.778, hr_for_direction / 100))
+                                        implied = max(0.111, min(0.889, hr_for_direction / 100))
 
                                         # Composite score: hit rate × matchup factor × recency boost
                                         last3 = float(pdf[col_key].tail(3).mean()) if len(pdf) >= 3 else w_avg
@@ -4483,13 +4483,22 @@ with tab_sgp:
                         "All legs must come from the **same game**."
                     )
                 else:
+                    # Apply direction filter to determine which legs to show/calculate
+                    if sgp_dir_filter == "OVER only":
+                        visible_legs = [l for l in sgp_legs if l["recommendation"] == "OVER"]
+                    elif sgp_dir_filter == "UNDER only":
+                        visible_legs = [l for l in sgp_legs if l["recommendation"] == "UNDER"]
+                    else:
+                        visible_legs = sgp_legs
+
+                    if not visible_legs:
+                        st.info(f"No {sgp_dir_filter.replace(' only','')} legs in the slip yet.")
+
                     # ── Per-leg rows with remove buttons ─────────────────────
                     sgp_remove_idx = None
-                    for i, leg in enumerate(sgp_legs):
-                        if sgp_dir_filter == "OVER only" and leg["recommendation"] != "OVER":
-                            continue
-                        if sgp_dir_filter == "UNDER only" and leg["recommendation"] != "UNDER":
-                            continue
+                    for leg in visible_legs:
+                        # find real index in sgp_legs for correct removal
+                        i = sgp_legs.index(leg)
                         rec_color = "#2DC653" if leg["recommendation"] == "OVER" else "#D62828"
                         gc1, gc2, gc3, gc4, gc5, gc6 = st.columns([2, 1.5, 1, 1, 1, 0.5])
                         gc1.markdown(f"**{leg['player']}**")
@@ -4514,10 +4523,10 @@ with tab_sgp:
 
                     st.divider()
 
-                    # ── Parlay math ───────────────────────────────────────────
-                    if len(sgp_legs) >= 2:
+                    # ── Parlay math (uses visible_legs so filter affects totals) ──
+                    if len(visible_legs) >= 2:
                         sgp_combined_prob = 1.0
-                        for leg in sgp_legs:
+                        for leg in visible_legs:
                             sgp_combined_prob *= leg["implied_prob"]
 
                         sgp_combined_american = prob_to_american(sgp_combined_prob)
@@ -4535,7 +4544,7 @@ with tab_sgp:
                             key="sgp_stake",
                         )
                         sgp_payout = parlay_payout(
-                            [l["american_odds"] for l in sgp_legs], sgp_stake
+                            [l["american_odds"] for l in visible_legs], sgp_stake
                         )
                         sgp_profit = round(sgp_payout - sgp_stake, 2)
 
@@ -4599,12 +4608,12 @@ with tab_sgp:
                         sgp_bar_labels = [
                             f"{l['player']}\n{l['category'].title()} "
                             f"{l['recommendation']} {l['line']}"
-                            for l in sgp_legs
+                            for l in visible_legs
                         ]
-                        sgp_probs = [l["implied_prob"] * 100 for l in sgp_legs]
+                        sgp_probs = [l["implied_prob"] * 100 for l in visible_legs]
                         sgp_colors = [
                             C_OVER if l["recommendation"] == "OVER" else C_LINE
-                            for l in sgp_legs
+                            for l in visible_legs
                         ]
                         bars_sgp = ax_sgp.barh(
                             sgp_bar_labels[::-1],
@@ -4638,7 +4647,7 @@ with tab_sgp:
                         # ── Full leg detail table ─────────────────────────────
                         st.subheader("Full Leg Details")
                         sgp_detail = []
-                        for leg in sgp_legs:
+                        for leg in visible_legs:
                             sgp_detail.append(
                                 {
                                     "Player":      leg["player"],
@@ -4667,5 +4676,5 @@ with tab_sgp:
                             "not reflected in these independent probability estimates. "
                             "Bet responsibly."
                         )
-                    else:
-                        st.info("Add at least **2 legs** to calculate SGP odds.")
+                    elif visible_legs:
+                        st.info("Add at least **2 legs** (matching the filter) to calculate SGP odds.")
