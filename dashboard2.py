@@ -328,8 +328,28 @@ def _scrape_game(game_id, season, week, home, away):
                                    receiving_tds=_safe_int(s[3]),
                                    targets=_safe_int(s[5]) if len(s) >= 6 else 0)
                     break
-            if row["attempts"]+row["rush_attempts"]+row["receptions"]+row["targets"] == 0:
-                continue
+            # Skip low-participation rows so backups/gadget players with minimal
+            # snaps don't pollute averages or prop recommendations.
+            # Rules (per game):
+            #   Passer:   must have ≥ 5 pass attempts
+            #   Rusher:   must have ≥ 3 rush attempts  (or any receiving involvement)
+            #   Receiver: must have ≥ 1 target
+            is_passer   = row["attempts"] > 0
+            is_rusher   = row["rush_attempts"] > 0
+            is_receiver = row["targets"] > 0 or row["receptions"] > 0
+
+            if not is_passer and not is_rusher and not is_receiver:
+                continue   # no meaningful involvement at all
+
+            if is_passer and not is_rusher and not is_receiver:
+                # Pure passer role — require at least 5 attempts to be meaningful
+                if row["attempts"] < 5:
+                    continue
+
+            if is_rusher and not is_passer and not is_receiver:
+                # Pure rusher role — require at least 3 rush attempts
+                if row["rush_attempts"] < 3:
+                    continue
             row["fantasy_points"] = round(_calc_fp(row), 4)
             rows.append(row)
     return rows
@@ -4454,9 +4474,22 @@ with tab_sgp:
                         f"{'s' if len(sgp_legs) > 1 else ''}"
                     )
 
+                    # ── Direction filter toggle ───────────────────────────────
+                    sgp_dir_filter = st.radio(
+                        "Show legs",
+                        ["All", "OVER only", "UNDER only"],
+                        horizontal=True,
+                        key="sgp_dir_filter",
+                        help="Filter the slip view to show only OVER or only UNDER legs.",
+                    )
+
                     # ── Per-leg rows with remove buttons ─────────────────────
                     sgp_remove_idx = None
                     for i, leg in enumerate(sgp_legs):
+                        if sgp_dir_filter == "OVER only" and leg["recommendation"] != "OVER":
+                            continue
+                        if sgp_dir_filter == "UNDER only" and leg["recommendation"] != "UNDER":
+                            continue
                         rec_color = "#2DC653" if leg["recommendation"] == "OVER" else "#D62828"
                         gc1, gc2, gc3, gc4, gc5, gc6 = st.columns([2, 1.5, 1, 1, 1, 0.5])
                         gc1.markdown(f"**{leg['player']}**")
