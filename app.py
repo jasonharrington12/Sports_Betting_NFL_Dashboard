@@ -4463,26 +4463,26 @@ with tab_sgp:
             with sgp_right:
                 sgp_legs = st.session_state["sgp_legs"]
 
+                st.subheader(
+                    f"🏟️ SGP Slip  —  {len(sgp_legs)} leg"
+                    f"{'s' if len(sgp_legs) > 1 else ''}"
+                )
+
+                # ── Direction filter toggle — always visible ──────────────────
+                sgp_dir_filter = st.radio(
+                    "Show legs",
+                    ["All", "OVER only", "UNDER only"],
+                    horizontal=True,
+                    key="sgp_dir_filter",
+                    help="Filter the slip view to show only OVER or only UNDER legs.",
+                )
+
                 if not sgp_legs:
                     st.info(
                         "👈 Add legs from the left panel. "
                         "All legs must come from the **same game**."
                     )
                 else:
-                    st.subheader(
-                        f"🏟️ SGP Slip  —  {len(sgp_legs)} leg"
-                        f"{'s' if len(sgp_legs) > 1 else ''}"
-                    )
-
-                    # ── Direction filter toggle ───────────────────────────────
-                    sgp_dir_filter = st.radio(
-                        "Show legs",
-                        ["All", "OVER only", "UNDER only"],
-                        horizontal=True,
-                        key="sgp_dir_filter",
-                        help="Filter the slip view to show only OVER or only UNDER legs.",
-                    )
-
                     # ── Per-leg rows with remove buttons ─────────────────────
                     sgp_remove_idx = None
                     for i, leg in enumerate(sgp_legs):
