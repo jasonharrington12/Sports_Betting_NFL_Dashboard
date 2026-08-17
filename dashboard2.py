@@ -2330,8 +2330,7 @@ if data_ok:
         def fetch_this_weeks_games():
             """
             Finds the next/current NFL week and returns upcoming (unplayed) games.
-            Checks the next calendar year first so the upcoming season's schedule
-            shows during the offseason (e.g. 2025 schedule visible in May 2025).
+            Tries ESPN first; falls back to Tank01 if ESPN returns nothing.
             Falls back to the most recent completed week if nothing is found.
             """
             import datetime as _dt
@@ -2339,13 +2338,8 @@ if data_ok:
             cur_year  = today.year if today.month >= 9 else today.year - 1
             next_year = cur_year + 1
 
-            def _scrape_year(year):
-                """
-                Walk weeks 1-18 for the given year.
-                Returns (upcoming_this_week, last_completed_list).
-                Stops as soon as it finds the first week that has ANY upcoming
-                (not-yet-played) game — so we never accumulate the whole season.
-                """
+            # ── ESPN path ─────────────────────────────────────────────────────
+            def _espn_year(year):
                 last_completed = []
                 for week in range(1, 19):
                     url = (
@@ -2373,27 +2367,70 @@ if data_ok:
                             "completed": done,
                             "name":      e.get("shortName", e.get("name", "")),
                             "espn_id":   e.get("id", ""),
+                            "odds":      {},
                         }
                         if not done:
                             week_upcoming.append(entry)
                         else:
                             last_completed.append(entry)
-                    # As soon as we find a week with upcoming games, return just those
                     if week_upcoming:
                         return week_upcoming, last_completed
                 return [], last_completed
 
-            # Try current season first
-            upcoming, last_completed = _scrape_year(cur_year)
+            # ── Tank01 path ───────────────────────────────────────────────────
+            def _tank01_year(year, api_key):
+                last_completed = []
+                for week in range(1, 19):
+                    data = _tank01_get("/getNFLGamesForWeek",
+                                       {"week": str(week), "seasonType": "reg",
+                                        "season": str(year)},
+                                       api_key)
+                    if not data:
+                        continue
+                    games = data.get("body", [])
+                    if not games:
+                        break
+                    week_upcoming = []
+                    for g in games:
+                        status = g.get("gameStatus", "").lower()
+                        done   = status in ("final", "completed")
+                        entry  = {
+                            "home":      g.get("home", "UNK"),
+                            "away":      g.get("away", "UNK"),
+                            "date":      g.get("gameDate", "")[:8],
+                            "week":      week,
+                            "season":    year,
+                            "completed": done,
+                            "name":      f"{g.get('away','?')} @ {g.get('home','?')}",
+                            "espn_id":   g.get("espnID", ""),
+                            "odds":      {},
+                        }
+                        if not done:
+                            week_upcoming.append(entry)
+                        else:
+                            last_completed.append(entry)
+                    if week_upcoming:
+                        return week_upcoming, last_completed
+                return [], last_completed
 
-            # If no upcoming games in current year, check next year's schedule
-            # (handles offseason when ESPN has already posted the upcoming season)
+            # ── Try ESPN first ────────────────────────────────────────────────
+            upcoming, last_completed = _espn_year(cur_year)
             if not upcoming:
-                upcoming_next, _ = _scrape_year(next_year)
+                upcoming_next, _ = _espn_year(next_year)
                 if upcoming_next:
                     upcoming = upcoming_next
 
-            return upcoming if upcoming else last_completed[-16:]  # final fallback
+            # ── Fall back to Tank01 if ESPN returned nothing ──────────────────
+            if not upcoming and not last_completed:
+                t01_key = _tank01_key()
+                if t01_key:
+                    upcoming, last_completed = _tank01_year(cur_year, t01_key)
+                    if not upcoming:
+                        upcoming_next, _ = _tank01_year(next_year, t01_key)
+                        if upcoming_next:
+                            upcoming = upcoming_next
+
+            return upcoming if upcoming else last_completed[-16:]
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_game_odds(espn_id: str) -> dict:
