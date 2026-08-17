@@ -290,79 +290,189 @@ def _full_team_name_to_abbr(full: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  —  nflverse (GitHub-hosted parquet, no API key needed)
-# Pulls player game logs for 2024 + 2025 directly from the nflverse data repo.
-# Falls back gracefully if a season file is not yet available.
+# DATA LOADING  —  sports.core.api.espn.com
+# Uses the unblocked ESPN core API (not site.api.espn.com which 403s).
+# Flow: weeks list → event refs → per-game roster → per-player stat categories
 # ──────────────────────────────────────────────────────────────────────────────
 
-# nflverse player game logs — one parquet per season
-_NFLVERSE_BASE = (
-    "https://github.com/nflverse/nflverse-data/releases/download"
-    "/player_stats/player_stats_{year}.parquet"
-)
-
-# nflverse → our internal column names
-_NV_COL_MAP = {
-    "player_id":          "player_id",
-    "player_display_name":"player_name",
-    "recent_team":        "team",
-    "season":             "season",
-    "week":               "week",
-    "completions":        "completions",
-    "attempts":           "attempts",
-    "passing_yards":      "passing_yards",
-    "passing_tds":        "passing_tds",
-    "interceptions":      "interceptions",
-    "carries":            "rush_attempts",
-    "rushing_yards":      "rush_yards",
-    "rushing_tds":        "rush_tds",
-    "receptions":         "receptions",
-    "targets":            "targets",
-    "receiving_yards":    "receiving_yards",
-    "receiving_tds":      "receiving_tds",
-    "fantasy_points_ppr": "fantasy_points",
+_CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
+_CORE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 }
 
-def _load_nflverse_season(year: int) -> pd.DataFrame:
-    """Download one season of nflverse player game logs; return empty DF on failure."""
-    url = _NFLVERSE_BASE.format(year=year)
+def _core_get(url: str):
+    """GET a sports.core.api.espn.com URL; return parsed JSON or None."""
     try:
-        import io
-        r = _requests.get(url, headers=_HEADERS, timeout=30)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        df = pd.read_parquet(io.BytesIO(r.content))
-        df.columns = df.columns.str.lower().str.strip()
-        # Keep only regular season + playoffs (season_type REG or POST)
-        if "season_type" in df.columns:
-            df = df[df["season_type"].isin(["REG", "POST"])]
-        # Rename to internal column names
-        keep = {k: v for k, v in _NV_COL_MAP.items() if k in df.columns}
-        df = df[list(keep.keys())].rename(columns=keep)
-        # Build game_id in the same format the rest of the app expects
-        if "week" in df.columns:
-            df["game_id"] = (
-                df["season"].astype(str) + "_"
-                + df["week"].astype(str).str.zfill(2) + "_"
-                + df["team"].astype(str)   # opponent not available here; use team
-            )
-            df = df.drop(columns=["week"])
-        # Fill numeric NaNs with 0
-        num_cols = df.select_dtypes(include="number").columns
-        df[num_cols] = df[num_cols].fillna(0)
-        df["player_name"] = df["player_name"].fillna("Unknown").str.strip()
-        df["team"]        = df["team"].fillna("UNK")
-        # Drop rows with zero meaningful involvement
-        meaningful = (
-            (df["attempts"]      >= 5) |
-            (df["rush_attempts"] >= 3) |
-            (df["targets"]       >= 1) |
-            (df["receptions"]    >= 1)
-        )
-        df = df[meaningful].copy()
-        return df.drop_duplicates().reset_index(drop=True)
+        # Strip http:// refs returned in $ref fields → use https
+        url = url.replace("http://", "https://")
+        r = _requests.get(url, headers=_CORE_HEADERS, timeout=15)
+        if r.status_code == 200:
+            return r.json()
     except Exception:
+        pass
+    return None
+
+
+def _parse_player_stats(entries: list, season: int, week: int,
+                         home: str, away: str) -> list:
+    """
+    Given roster entries for one team in one game, fetch each player's
+    stat categories and return a list of row dicts.
+    """
+    rows = []
+    for entry in entries:
+        name = entry.get("displayName", "Unknown")
+        pid  = str(entry.get("playerId", ""))
+        stats_ref = (entry.get("statistics") or {}).get("$ref", "")
+        if not stats_ref:
+            continue
+
+        data = _core_get(stats_ref)
+        if not data:
+            continue
+
+        categories = (data.get("splits") or {}).get("categories", [])
+        cat_map = {c["name"]: {s["name"]: s.get("value", 0)
+                               for s in c.get("stats", [])}
+                   for c in categories}
+
+        p = cat_map.get("passing",   {})
+        ru = cat_map.get("rushing",  {})
+        rc = cat_map.get("receiving",{})
+
+        completions    = int(p.get("completions",       0))
+        attempts       = int(p.get("passingAttempts",   0))
+        passing_yards  = int(p.get("passingYards",      0))
+        passing_tds    = int(p.get("passingTouchdowns", 0))
+        interceptions  = int(p.get("interceptions",     0))
+        rush_attempts  = int(ru.get("rushingAttempts",  0))
+        rush_yards     = int(ru.get("rushingYards",     0))
+        rush_tds       = int(ru.get("rushingTouchdowns",0))
+        receptions     = int(rc.get("receptions",       0))
+        targets        = int(rc.get("receivingTargets", 0))
+        receiving_yards= int(rc.get("receivingYards",   0))
+        receiving_tds  = int(rc.get("receivingTouchdowns", 0))
+
+        # Skip players with no meaningful involvement
+        if (attempts < 5 and rush_attempts < 3
+                and targets < 1 and receptions < 1):
+            continue
+
+        # Determine team from competitor context (set by caller)
+        team = entry.get("_team", "UNK")
+
+        row = dict(
+            player_id      = pid,
+            game_id        = f"{season}_{week:02d}_{away}_{home}",
+            season         = season,
+            player_name    = name,
+            team           = team,
+            completions    = completions,
+            attempts       = attempts,
+            passing_yards  = passing_yards,
+            passing_tds    = passing_tds,
+            interceptions  = interceptions,
+            rush_attempts  = rush_attempts,
+            rush_yards     = rush_yards,
+            rush_tds       = rush_tds,
+            receptions     = receptions,
+            targets        = targets,
+            receiving_yards= receiving_yards,
+            receiving_tds  = receiving_tds,
+        )
+        row["fantasy_points"] = round(_calc_fp(row), 4)
+        rows.append(row)
+    return rows
+
+
+def _scrape_week(season: int, week: int,
+                 season_type: int = 2, progress_text=None) -> list:
+    """Scrape all completed games for one week; return list of row dicts."""
+    events_url = (
+        f"{_CORE_BASE}/seasons/{season}/types/{season_type}"
+        f"/weeks/{week}/events?limit=20"
+    )
+    data = _core_get(events_url)
+    if not data:
+        return []
+
+    rows = []
+    for item in data.get("items", []):
+        event_ref = item.get("$ref", "")
+        if not event_ref:
+            continue
+
+        event = _core_get(event_ref)
+        if not event:
+            continue
+
+        comps = event.get("competitions", [])
+        if not comps:
+            continue
+        comp_ref = comps[0].get("$ref", "")
+        if not comp_ref:
+            continue
+
+        comp = _core_get(comp_ref)
+        if not comp:
+            continue
+
+        # Only process completed games
+        completed = (comp.get("status") or {}).get("type", {}).get("completed", False)
+        if not completed:
+            continue
+
+        # Identify home/away teams
+        home = away = "UNK"
+        competitors = comp.get("competitors", [])
+        for c in competitors:
+            abbr = (c.get("team") or {}).get("abbreviation", "UNK")
+            abbr = _TEAM_NORM.get(abbr, abbr)
+            if c.get("homeAway") == "home":
+                home = abbr
+            else:
+                away = abbr
+
+        if progress_text:
+            progress_text.text(f"Scraping {season} week {week}: {away} @ {home}…")
+
+        # Fetch roster for each competitor and collect player stats
+        for c in competitors:
+            abbr = (c.get("team") or {}).get("abbreviation", "UNK")
+            abbr = _TEAM_NORM.get(abbr, abbr)
+            roster_ref = (c.get("roster") or {}).get("$ref", "")
+            if not roster_ref:
+                continue
+            roster_data = _core_get(roster_ref)
+            if not roster_data:
+                continue
+            entries = roster_data.get("entries", [])
+            # Tag each entry with its team abbreviation for _parse_player_stats
+            for e in entries:
+                e["_team"] = abbr
+            rows.extend(_parse_player_stats(entries, season, week, home, away))
+            _time.sleep(0.05)   # be polite
+
+    return rows
+
+
+def _scrape_season(season: int, progress_text=None) -> pd.DataFrame:
+    """Scrape all weeks (regular season + playoffs) for one season."""
+    all_rows = []
+    # season_type 2 = regular season (weeks 1-18), 3 = playoffs (weeks 1-4)
+    for stype, max_week in [(2, 18), (3, 4)]:
+        for week in range(1, max_week + 1):
+            new = _scrape_week(season, week, stype, progress_text)
+            if not new and stype == 2 and week > 1:
+                break   # no more regular-season weeks
+            all_rows.extend(new)
+    if not all_rows:
         return pd.DataFrame()
+    return pd.DataFrame(all_rows).drop_duplicates().reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -377,20 +487,22 @@ def load_data():
         _cur_year = _today.year - 1
     _prev_year = _cur_year - 1
 
-    msg = st.empty()
+    msg  = st.empty()
+    prog = st.empty()
 
-    msg.info(f"Loading {_prev_year} season data…")
-    df_prev = _load_nflverse_season(_prev_year)
+    msg.info(f"Loading {_prev_year} season…")
+    df_prev = _scrape_season(_prev_year, prog)
 
-    msg.info(f"Loading {_cur_year} season data…")
-    df_cur  = _load_nflverse_season(_cur_year)
+    msg.info(f"Loading {_cur_year} season…")
+    df_cur  = _scrape_season(_cur_year,  prog)
 
+    prog.empty()
     msg.empty()
 
     frames = [f for f in [df_prev, df_cur] if not f.empty]
     if not frames:
         raise RuntimeError(
-            "No data available. Could not load nflverse data from GitHub. "
+            "No data available. ESPN core API returned no data. "
             "Check your internet connection and try refreshing the page."
         )
 
@@ -1416,7 +1528,7 @@ with main_settings:
 
         st.subheader("🔄 Data Refresh")
         st.markdown(
-            "Data is pulled from **nflverse** (GitHub-hosted, no API key needed) "
+            "Data is pulled from the **ESPN core API** (`sports.core.api.espn.com`) "
             "and cached for **1 hour**. After 1 hour the cache expires and the next "
             "page load automatically fetches the latest data."
         )
@@ -1426,8 +1538,8 @@ with main_settings:
             st.markdown("### ℹ️ How it works")
             st.markdown(
                 """
-- **Source** → [nflverse player stats](https://github.com/nflverse/nflverse-data) (free, public, no key)
-- **First load** → downloads 2024 + 2025 parquet files (~10 seconds)
+- **Source** → ESPN core API (no key required, not rate-limited)
+- **First load** → scrapes 2024 + 2025 season game logs (~2–3 min)
 - **Cache** → subsequent loads are instant for up to 1 hour
 - **New games** appear automatically the next time the cache refreshes
                 """
