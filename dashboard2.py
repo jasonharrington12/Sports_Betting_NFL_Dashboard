@@ -389,6 +389,16 @@ def _parse_player_stats(entries: list, season: int, week: int,
     return rows
 
 
+def _parse_short_name(short_name: str):
+    """Parse 'BAL @ KC' → (away='BAL', home='KC')."""
+    parts = short_name.split(" @ ")
+    if len(parts) == 2:
+        away = _TEAM_NORM.get(parts[0].strip(), parts[0].strip())
+        home = _TEAM_NORM.get(parts[1].strip(), parts[1].strip())
+        return away, home
+    return "UNK", "UNK"
+
+
 def _scrape_week(season: int, week: int,
                  season_type: int = 2, progress_text=None) -> list:
     """Scrape all completed games for one week; return list of row dicts."""
@@ -410,6 +420,9 @@ def _scrape_week(season: int, week: int,
         if not event:
             continue
 
+        # home/away from event shortName e.g. "BAL @ KC" — no extra fetch needed
+        away, home = _parse_short_name(event.get("shortName", ""))
+
         comps = event.get("competitions", [])
         if not comps:
             continue
@@ -421,29 +434,25 @@ def _scrape_week(season: int, week: int,
         if not comp:
             continue
 
-        # Only process completed games
-        completed = (comp.get("status") or {}).get("type", {}).get("completed", False)
+        # status is a $ref — fetch it to check completed
+        status_ref = (comp.get("status") or {}).get("$ref", "")
+        if status_ref:
+            status_data = _core_get(status_ref)
+            completed = (status_data or {}).get("type", {}).get("completed", False)
+        else:
+            completed = False
         if not completed:
             continue
-
-        # Identify home/away teams
-        home = away = "UNK"
-        competitors = comp.get("competitors", [])
-        for c in competitors:
-            abbr = (c.get("team") or {}).get("abbreviation", "UNK")
-            abbr = _TEAM_NORM.get(abbr, abbr)
-            if c.get("homeAway") == "home":
-                home = abbr
-            else:
-                away = abbr
 
         if progress_text:
             progress_text.text(f"Scraping {season} week {week}: {away} @ {home}…")
 
         # Fetch roster for each competitor and collect player stats
+        competitors = comp.get("competitors", [])
         for c in competitors:
-            abbr = (c.get("team") or {}).get("abbreviation", "UNK")
-            abbr = _TEAM_NORM.get(abbr, abbr)
+            # homeAway is inline; team abbr via separate ref — use home/away from shortName
+            is_home = c.get("homeAway") == "home"
+            team_abbr = home if is_home else away
             roster_ref = (c.get("roster") or {}).get("$ref", "")
             if not roster_ref:
                 continue
@@ -451,11 +460,10 @@ def _scrape_week(season: int, week: int,
             if not roster_data:
                 continue
             entries = roster_data.get("entries", [])
-            # Tag each entry with its team abbreviation for _parse_player_stats
             for e in entries:
-                e["_team"] = abbr
+                e["_team"] = team_abbr
             rows.extend(_parse_player_stats(entries, season, week, home, away))
-            _time.sleep(0.05)   # be polite
+            _time.sleep(0.05)
 
     return rows
 
