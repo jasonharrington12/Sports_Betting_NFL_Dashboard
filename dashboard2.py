@@ -432,6 +432,12 @@ def _load_nflverse(year: int) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # The parquet has both player_name (short) and player_display_name (full).
+    # Drop the short name first so renaming display_name → player_name doesn't
+    # create a duplicate column.
+    if "player_name" in df.columns:
+        df = df.drop(columns=["player_name"])
+
     # Rename to match internal schema
     df = df.rename(columns={
         "player_display_name": "player_name",
@@ -448,7 +454,7 @@ def _load_nflverse(year: int) -> pd.DataFrame:
     )
     df["season"] = year
 
-    # Use PPR fantasy points (matches our _FP weight scheme)
+    # Use PPR fantasy points (better matches our PPR scoring weights)
     if "fantasy_points_ppr" in df.columns:
         df["fantasy_points"] = df["fantasy_points_ppr"]
 
@@ -460,22 +466,30 @@ def _load_nflverse(year: int) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = 0
 
-    # Apply the same low-participation filter as the ESPN scraper
+    # Apply the same low-participation filter as the ESPN scraper.
+    # Reset index between each filter step so boolean masks stay aligned.
+    df = df.reset_index(drop=True)
     is_passer   = df["attempts"]      > 0
     is_rusher   = df["rush_attempts"] > 0
     is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
+    df = df[is_passer | is_rusher | is_receiver].reset_index(drop=True)
 
-    df = df[is_passer | is_rusher | is_receiver].copy()
-    df = df[~((is_passer & ~is_rusher & ~is_receiver) & (df["attempts"] < 5))]
-    df = df[~((is_rusher & ~is_passer & ~is_receiver) & (df["rush_attempts"] < 3))]
+    is_passer   = df["attempts"]      > 0
+    is_rusher   = df["rush_attempts"] > 0
+    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
+    df = df[~((is_passer & ~is_rusher & ~is_receiver) & (df["attempts"] < 5))].reset_index(drop=True)
 
-    keep = ["player_name", "team", "season", "game_id",
+    is_passer   = df["attempts"]      > 0
+    is_rusher   = df["rush_attempts"] > 0
+    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
+    df = df[~((is_rusher & ~is_passer & ~is_receiver) & (df["rush_attempts"] < 3))].reset_index(drop=True)
+
+    keep = ["player_id", "player_name", "team", "season", "game_id",
             "completions", "attempts", "passing_yards", "passing_tds",
             "interceptions", "rush_attempts", "rush_yards", "rush_tds",
             "receptions", "targets", "receiving_yards", "receiving_tds",
             "fantasy_points"]
     df = df[[c for c in keep if c in df.columns]].copy()
-    df["player_id"] = df["player_name"]
 
     df = df.drop_duplicates()
     return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
