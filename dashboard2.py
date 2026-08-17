@@ -397,12 +397,19 @@ _TANK01_BASE = f"https://{_TANK01_HOST}"
 
 def _tank01_key():
     """Return the RapidAPI key from Streamlit secrets or env, or None."""
-    try:
-        return st.secrets["RAPIDAPI_KEY"]
-    except Exception:
-        pass
     import os
-    return os.environ.get("RAPIDAPI_KEY")
+    # Try every common capitalisation people might use in secrets.toml
+    for name in ("RAPIDAPI_KEY", "rapidapi_key", "RapidAPI_Key", "RAPID_API_KEY"):
+        try:
+            val = st.secrets[name]
+            if val:
+                return str(val).strip()
+        except Exception:
+            pass
+        env_val = os.environ.get(name)
+        if env_val:
+            return env_val.strip()
+    return None
 
 def _tank01_get(path: str, params: dict, api_key: str):
     """GET a Tank01 endpoint; return parsed JSON or None on failure."""
@@ -565,12 +572,19 @@ def load_data():
             msg.empty()
 
     if df_prev.empty and df_cur.empty:
-        raise RuntimeError(
-            "ESPN API returned no data. It may be temporarily unavailable — "
-            "try refreshing the page in a minute. "
-            "If you have a RapidAPI key, add it to Streamlit secrets as RAPIDAPI_KEY "
-            "to enable the Tank01 NFL fallback."
-        )
+        t01_key_check = _tank01_key()
+        if t01_key_check:
+            raise RuntimeError(
+                "ESPN API returned no data and Tank01 (RapidAPI) also returned no data. "
+                "Try refreshing the page in a minute."
+            )
+        else:
+            raise RuntimeError(
+                "ESPN API returned no data. It may be temporarily unavailable — "
+                "try refreshing the page in a minute. "
+                "Tank01 fallback is not active: add your RapidAPI key to Streamlit "
+                "secrets as  RAPIDAPI_KEY = \"your_key\"  to enable it."
+            )
 
     # Use whichever frames have data
     df_2024 = df_prev if not df_prev.empty else pd.DataFrame(columns=df_cur.columns)
