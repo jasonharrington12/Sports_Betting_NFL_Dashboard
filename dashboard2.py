@@ -388,115 +388,7 @@ def _scrape_season_live(year, progress_text=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# nflverse FALLBACK  (used when ESPN API is unavailable)
-# Reads the same parquet files that nfl_data_py wraps, but directly via
-# pandas — no extra package required, works with pandas 2.x.
-# Source: https://github.com/nflverse/nflverse-data/releases
-# ──────────────────────────────────────────────────────────────────────────────
-_NFLVERSE_WEEKLY_URL = (
-    "https://github.com/nflverse/nflverse-data/releases/download/"
-    "player_stats/player_stats.parquet"
-)
-
-def _load_nflverse(year: int) -> pd.DataFrame:
-    """
-    Pull weekly player stats for `year` directly from the nflverse parquet
-    file and return a DataFrame whose columns match the ESPN-scraped schema.
-
-    Column mapping:
-        player_display_name → player_name
-        recent_team         → team
-        carries             → rush_attempts
-        rushing_yards       → rush_yards
-        rushing_tds         → rush_tds
-        game_id             → synthesised as "{year}_{week:02d}_nflverse"
-    """
-    try:
-        df = pd.read_parquet(_NFLVERSE_WEEKLY_URL, engine="pyarrow")
-    except Exception:
-        try:
-            # fallback engine
-            df = pd.read_parquet(_NFLVERSE_WEEKLY_URL, engine="fastparquet")
-        except Exception:
-            return pd.DataFrame()
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # Filter to the requested year + regular season only
-    if "season" in df.columns:
-        df = df[df["season"] == year]
-    if "season_type" in df.columns:
-        df = df[df["season_type"] == "REG"]
-
-    if df.empty:
-        return pd.DataFrame()
-
-    # The parquet has both player_name (short) and player_display_name (full).
-    # Drop the short name first so renaming display_name → player_name doesn't
-    # create a duplicate column.
-    if "player_name" in df.columns:
-        df = df.drop(columns=["player_name"])
-
-    # Rename to match internal schema
-    df = df.rename(columns={
-        "player_display_name": "player_name",
-        "recent_team":         "team",
-        "carries":             "rush_attempts",
-        "rushing_yards":       "rush_yards",
-        "rushing_tds":         "rush_tds",
-    })
-
-    # Synthesise game_id: "{year}_{week:02d}_nflverse"
-    df["game_id"] = (
-        df["season"].astype(str) + "_"
-        + df["week"].astype(str).str.zfill(2) + "_nflverse"
-    )
-    df["season"] = year
-
-    # Use PPR fantasy points (better matches our PPR scoring weights)
-    if "fantasy_points_ppr" in df.columns:
-        df["fantasy_points"] = df["fantasy_points_ppr"]
-
-    # Ensure all required columns exist
-    for col in ["completions", "attempts", "passing_yards", "passing_tds",
-                "interceptions", "rush_attempts", "rush_yards", "rush_tds",
-                "receptions", "targets", "receiving_yards", "receiving_tds",
-                "fantasy_points"]:
-        if col not in df.columns:
-            df[col] = 0
-
-    # Apply the same low-participation filter as the ESPN scraper.
-    # Reset index between each filter step so boolean masks stay aligned.
-    df = df.reset_index(drop=True)
-    is_passer   = df["attempts"]      > 0
-    is_rusher   = df["rush_attempts"] > 0
-    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
-    df = df[is_passer | is_rusher | is_receiver].reset_index(drop=True)
-
-    is_passer   = df["attempts"]      > 0
-    is_rusher   = df["rush_attempts"] > 0
-    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
-    df = df[~((is_passer & ~is_rusher & ~is_receiver) & (df["attempts"] < 5))].reset_index(drop=True)
-
-    is_passer   = df["attempts"]      > 0
-    is_rusher   = df["rush_attempts"] > 0
-    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
-    df = df[~((is_rusher & ~is_passer & ~is_receiver) & (df["rush_attempts"] < 3))].reset_index(drop=True)
-
-    keep = ["player_id", "player_name", "team", "season", "game_id",
-            "completions", "attempts", "passing_yards", "passing_tds",
-            "interceptions", "rush_attempts", "rush_yards", "rush_tds",
-            "receptions", "targets", "receiving_yards", "receiving_tds",
-            "fantasy_points"]
-    df = df[[c for c in keep if c in df.columns]].copy()
-
-    df = df.drop_duplicates()
-    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (ESPN primary, nfl_data_py fallback)
+# DATA LOADING  (ESPN API — cached 1 hour)
 # ttl=3600 means: first visitor triggers a scrape, everyone else for the next
 # hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
 # any new games that were played.
@@ -513,8 +405,6 @@ def load_data():
 
     msg  = st.empty()
     prog = st.empty()
-
-    # ── 1. Try ESPN first ─────────────────────────────────────────────────────
     msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API… "
              "this takes ~5 min on first load, then caches for 1 hour.")
     df_prev = _scrape_season_live(_prev_year, prog)
@@ -522,23 +412,10 @@ def load_data():
     prog.empty()
     msg.empty()
 
-    espn_ok = not df_prev.empty or not df_cur.empty
-
-    # ── 2. Fall back to nfl_data_py if ESPN returned nothing ─────────────────
-    if not espn_ok:
-        msg.warning(
-            "ESPN API returned no data — falling back to **nfl_data_py** "
-            "(nflverse). Data may lag by ~1 day after games."
-        )
-        df_prev = _load_nflverse(_prev_year)
-        df_cur  = _load_nflverse(_cur_year)
-        msg.empty()
-
     if df_prev.empty and df_cur.empty:
         raise RuntimeError(
-            "Both ESPN and nfl_data_py returned no data. "
-            "ESPN may be temporarily unavailable — try refreshing in a minute. "
-            "If the problem persists, check your internet connection."
+            "ESPN API returned no data. It may be temporarily unavailable — "
+            "try refreshing the page in a minute."
         )
 
     # Use whichever frames have data
