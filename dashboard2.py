@@ -1835,6 +1835,17 @@ if data_ok:
             pb_auto_min_hr = st.slider(
                 "Min hit rate %", 40, 80, 55, key="pb_auto_min_hr"
             )
+            _oc1, _oc2 = st.columns(2)
+            pb_auto_min_odds = _oc1.number_input(
+                "Min parlay odds (+)", min_value=100, max_value=50000,
+                value=300, step=50, key="pb_auto_min_odds",
+                help="Suggested parlay must pay at least this much. Increase to force more legs or longer shots.",
+            )
+            pb_auto_max_odds = _oc2.number_input(
+                "Max parlay odds (+)", min_value=100, max_value=100000,
+                value=3000, step=100, key="pb_auto_max_odds",
+                help="Suggested parlay won't exceed this payout. Keeps you from building lottery-ticket slips.",
+            )
             pb_auto_btn = st.button(
                 "⚡ Suggest Best Legs", use_container_width=True, key="pb_auto_btn"
             )
@@ -1918,7 +1929,26 @@ if data_ok:
                     if len(best_legs) < 2:
                         st.warning("Not enough qualifying legs. Lower the min hit rate or add more stat categories.")
                     else:
-                        # Merge into existing legs (avoid duplicates)
+                        # Check combined parlay odds against min/max
+                        combined_prob = 1.0
+                        for leg in best_legs:
+                            combined_prob *= leg["implied_prob"]
+                        combined_american = prob_to_american(combined_prob)
+
+                        if combined_american < pb_auto_min_odds:
+                            st.warning(
+                                f"Suggested parlay pays **+{combined_american}**, "
+                                f"which is below your min of **+{pb_auto_min_odds}**. "
+                                "Try increasing legs, lowering min hit rate, or raising min odds."
+                            )
+                        elif combined_american > pb_auto_max_odds:
+                            st.warning(
+                                f"Suggested parlay pays **+{combined_american}**, "
+                                f"which exceeds your max of **+{pb_auto_max_odds}**. "
+                                "Try fewer legs or raising the min hit rate."
+                            )
+
+                        # Load legs regardless — user can see the odds and decide
                         added = 0
                         for leg in best_legs:
                             if len(st.session_state["parlay_legs"]) >= 8:
