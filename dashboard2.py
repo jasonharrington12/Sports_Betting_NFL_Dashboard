@@ -78,7 +78,7 @@ _ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
 
 _ESPN_SCOREBOARD = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-    "?seasontype=2&week={week}&dates={year}"
+    "?seasontype=2&week={week}&season={year}"
 )
 _ESPN_SUMMARY = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
@@ -105,8 +105,17 @@ def _get_json(url):
         r = _requests.get(url, headers=_HEADERS, timeout=15)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+        # Surface non-200 status codes for debugging
+        if hasattr(st, 'session_state'):
+            if 'api_errors' not in st.session_state:
+                st.session_state.api_errors = []
+            st.session_state.api_errors.append(f"ESPN API {r.status_code}: {url[:80]}...")
+    except Exception as e:
+        # Surface exceptions for debugging
+        if hasattr(st, 'session_state'):
+            if 'api_errors' not in st.session_state:
+                st.session_state.api_errors = []
+            st.session_state.api_errors.append(f"ESPN request failed: {e}")
     return None
 
 # Normalise ESPN schedule abbreviations → what's stored in the CSV game logs
@@ -387,165 +396,6 @@ def _scrape_season_live(year, progress_text=None):
     return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# TANK01 NFL API FALLBACK  (RapidAPI — free tier 100 req/day)
-# Used automatically when ESPN returns no data.
-# Key stored in st.secrets["RAPIDAPI_KEY"] or env var RAPIDAPI_KEY.
-# ──────────────────────────────────────────────────────────────────────────────
-_TANK01_HOST = "tank01-nfl-live-in-game-real-time-statistics-nfl.p.rapidapi.com"
-_TANK01_BASE = f"https://{_TANK01_HOST}"
-
-def _tank01_key():
-    """Return the RapidAPI key from Streamlit secrets or env, or None."""
-    import os
-    # Try every common capitalisation people might use in secrets.toml
-    for name in ("RAPIDAPI_KEY", "rapidapi_key", "RapidAPI_Key", "RAPID_API_KEY"):
-        try:
-            val = st.secrets[name]
-            if val:
-                return str(val).strip()
-        except Exception:
-            pass
-        env_val = os.environ.get(name)
-        if env_val:
-            return env_val.strip()
-    return None
-
-def _tank01_get(path: str, params: dict, api_key: str):
-    """GET a Tank01 endpoint; return parsed JSON or None on failure."""
-    headers = {
-        "x-rapidapi-host": _TANK01_HOST,
-        "x-rapidapi-key":  api_key,
-        "User-Agent":      "Mozilla/5.0",
-    }
-    try:
-        r = _requests.get(_TANK01_BASE + path, headers=headers,
-                          params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
-
-def _tank01_game(game_id_raw: str, season: int, week: int,
-                 home: str, away: str, api_key: str) -> list:
-    """
-    Pull one game's box score from Tank01 and return rows in the same
-    schema as _scrape_game().
-    game_id_raw format from Tank01: "20240907_BAL@KC"
-    """
-    data = _tank01_get("/getNFLBoxScore",
-                       {"gameID": game_id_raw, "playByPlay": "false",
-                        "fantasyPoints": "false"},
-                       api_key)
-    if not data:
-        return []
-
-    body = data.get("body", {})
-    rows = []
-
-    # Tank01 groups stats under playerStats → { playerID: { stats… } }
-    # or under home/away team sub-dicts depending on version.
-    # Support both layouts.
-    player_stats = body.get("playerStats", {})
-    if not player_stats:
-        # alternate layout: body["homePts"] etc. with sub-dicts per team
-        for side in ("home", "away"):
-            team_abbr = home if side == "home" else away
-            for pid, pdata in body.get(side, {}).items():
-                if not isinstance(pdata, dict):
-                    continue
-                player_stats[pid] = {**pdata, "_team": team_abbr}
-
-    for pid, pdata in player_stats.items():
-        if not isinstance(pdata, dict):
-            continue
-        name = pdata.get("longName", pdata.get("name", "Unknown"))
-        team = pdata.get("teamAbv", pdata.get("team", pdata.get("_team", "UNK")))
-
-        # Stats are nested under "Passing", "Rushing", "Receiving" sub-dicts
-        passing   = pdata.get("Passing",   {}) or {}
-        rushing   = pdata.get("Rushing",   {}) or {}
-        receiving = pdata.get("Receiving", {}) or {}
-
-        row = dict(
-            player_id     = str(pid),
-            game_id       = f"{season}_{week:02d}_{away}_{home}",
-            season        = season,
-            player_name   = name,
-            team          = team,
-            completions   = _safe_int(passing.get("passCompletions", 0)),
-            attempts      = _safe_int(passing.get("passAttempts",    0)),
-            passing_yards = _safe_int(passing.get("passYds",         0)),
-            passing_tds   = _safe_int(passing.get("passTD",          0)),
-            interceptions = _safe_int(passing.get("int",             0)),
-            rush_attempts = _safe_int(rushing.get("carries",         0)),
-            rush_yards    = _safe_int(rushing.get("rushYds",         0)),
-            rush_tds      = _safe_int(rushing.get("rushTD",          0)),
-            receptions    = _safe_int(receiving.get("receptions",    0)),
-            targets       = _safe_int(receiving.get("targets",       0)),
-            receiving_yards = _safe_int(receiving.get("recYds",      0)),
-            receiving_tds   = _safe_int(receiving.get("recTD",       0)),
-        )
-
-        # Same low-participation filter as ESPN scraper
-        is_passer   = row["attempts"]      > 0
-        is_rusher   = row["rush_attempts"] > 0
-        is_receiver = row["targets"] > 0 or row["receptions"] > 0
-
-        if not is_passer and not is_rusher and not is_receiver:
-            continue
-        if is_passer and not is_rusher and not is_receiver and row["attempts"] < 5:
-            continue
-        if is_rusher and not is_passer and not is_receiver and row["rush_attempts"] < 3:
-            continue
-
-        row["fantasy_points"] = round(_calc_fp(row), 4)
-        rows.append(row)
-    return rows
-
-
-def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataFrame:
-    """
-    Scrape a full NFL season via Tank01.
-    Stops early as soon as a week has zero completed games (future weeks).
-    No sleep between requests — Tank01 handles concurrent calls fine and
-    the 1000 req/day limit is per-day not per-minute.
-    """
-    all_rows = []
-    for week in range(1, 19):
-        if progress_text:
-            progress_text.text(f"Tank01: {year} — week {week}/18…")
-        data = _tank01_get("/getNFLGamesForWeek",
-                           {"week": str(week), "seasonType": "reg",
-                            "season": str(year)},
-                           api_key)
-        if not data:
-            continue
-        games = data.get("body", [])
-        if not games:
-            break   # season hasn't started yet or no data for this week
-
-        completed = [
-            g for g in games
-            if g.get("gameStatus", "").lower() in ("final", "completed")
-        ]
-
-        # If a week has games listed but none completed, we've hit future weeks
-        if games and not completed:
-            break
-
-        for game in completed:
-            gid  = game.get("gameID", "")
-            away = game.get("away", "UNK")
-            home = game.get("home", "UNK")
-            all_rows.extend(_tank01_game(gid, year, week, home, away, api_key))
-
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows).drop_duplicates()
-    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
-
 
 # CSV bundled in the repo — instant load, no API calls needed
 _CSV_PATH = "final_nfl_2024_2025_player_game_logs.csv"
@@ -629,51 +479,22 @@ def _topup_from_espn(base_df: pd.DataFrame, year: int,
     return pd.DataFrame(all_rows).drop_duplicates()
 
 
-def _topup_from_tank01(base_df: pd.DataFrame, year: int,
-                       start_week: int, api_key: str,
-                       progress_text=None) -> pd.DataFrame:
-    """Scrape weeks start_week..18 for year from Tank01 and return new rows only."""
-    all_rows = []
-    known_ids = set(base_df["game_id"].unique()) if not base_df.empty else set()
-    for week in range(start_week, 19):
-        if progress_text:
-            progress_text.text(f"Tank01 update {year} — week {week}/18…")
-        data = _tank01_get("/getNFLGamesForWeek",
-                           {"week": str(week), "seasonType": "reg",
-                            "season": str(year)},
-                           api_key)
-        if not data:
-            continue
-        games = data.get("body", [])
-        if not games:
-            break
-        completed = [g for g in games
-                     if g.get("gameStatus", "").lower() in ("final", "completed")]
-        if games and not completed:
-            break
-        for game in completed:
-            gid  = game.get("gameID", "")
-            away = game.get("away", "UNK")
-            home = game.get("home", "UNK")
-            game_id_key = f"{year}_{week:02d}_{away}_{home}"
-            if game_id_key in known_ids:
-                continue
-            new_rows = _tank01_game(gid, year, week, home, away, api_key)
-            all_rows.extend(new_rows)
-    if not all_rows:
-        return pd.DataFrame()
-    return pd.DataFrame(all_rows).drop_duplicates()
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (CSV base → top-up from ESPN or Tank01 for new weeks)
+# DATA LOADING  (CSV base → top-up from ESPN for new weeks)
 # Instant on first load; only fetches weeks newer than what's in the CSV.
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
     import datetime as _dt
     _today = _dt.date.today()
-    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
+    # NFL season starts in September, but 2025 season data should be tracked starting Jan 2025
+    # If we're past week 1 of the current calendar year, we're in the *next* NFL season
+    if _today.month >= 9:
+        _cur_year = _today.year
+    elif _today.month >= 2:
+        _cur_year = _today.year  # Feb-Aug → current calendar year is current NFL season
+    else:
+        _cur_year = _today.year - 1  # Jan only → still in previous NFL season
     _prev_year = _cur_year - 1
 
     msg  = st.empty()
@@ -697,31 +518,23 @@ def load_data():
 
     needs_update = prev_start <= 18 or cur_start <= 18
     if needs_update:
-        # ── 3a. Try ESPN for new weeks ────────────────────────────────────────
+        # ── 3. Try ESPN for new weeks ─────────────────────────────────────────
         msg.info(f"Checking for new games (week {cur_start}+)…")
         new_prev = _topup_from_espn(base, _prev_year, prev_start, prog)
         new_cur  = _topup_from_espn(base,  _cur_year,  cur_start, prog)
         prog.empty()
         msg.empty()
 
-        # ── 3b. If ESPN failed, try Tank01 ────────────────────────────────────
-        if new_prev.empty and new_cur.empty and cur_start <= 18:
-            t01_key = _tank01_key()
-            if t01_key:
-                msg.info(f"ESPN unavailable — checking Tank01 for new games…")
-                new_prev = _topup_from_tank01(base, _prev_year, prev_start, t01_key, prog)
-                new_cur  = _topup_from_tank01(base,  _cur_year,  cur_start, t01_key, prog)
-                prog.empty()
-                msg.empty()
-    else:
-        msg.empty()
-
     # ── 4. Combine CSV base + any new rows ────────────────────────────────────
     frames = [f for f in [base, new_prev, new_cur] if not f.empty]
     if not frames:
+        # Show detailed error info if ESPN calls failed
+        error_detail = ""
+        if hasattr(st.session_state, 'api_errors') and st.session_state.api_errors:
+            error_detail = "\n\n**ESPN API errors:**\n" + "\n".join(st.session_state.api_errors[-5:])
         raise RuntimeError(
-            "No data available. The bundled CSV is missing and ESPN/Tank01 "
-            "are both unavailable. Try refreshing the page in a minute."
+            "No data available. The bundled CSV is missing and ESPN is "
+            "unavailable. Try refreshing the page in a minute." + error_detail
         )
 
     combined = pd.concat(frames, ignore_index=True)
@@ -2326,111 +2139,7 @@ if data_ok:
         # ── helpers ───────────────────────────────────────────────────────────
         # build_defense_table and _COL_TO_POS are now at module level (above)
 
-        @st.cache_data(ttl=3600, show_spinner=False)
-        def fetch_this_weeks_games():
-            """
-            Finds the next/current NFL week and returns upcoming (unplayed) games.
-            Tries ESPN first; falls back to Tank01 if ESPN returns nothing.
-            Falls back to the most recent completed week if nothing is found.
-            """
-            import datetime as _dt
-            today     = _dt.date.today()
-            cur_year  = today.year if today.month >= 9 else today.year - 1
-            next_year = cur_year + 1
-
-            # ── ESPN path ─────────────────────────────────────────────────────
-            def _espn_year(year):
-                last_completed = []
-                for week in range(1, 19):
-                    url = (
-                        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                        f"?seasontype=2&week={week}&dates={year}"
-                    )
-                    data = _get_json(url)
-                    if not data:
-                        continue
-                    events = data.get("events", [])
-                    if not events:
-                        break
-                    week_upcoming = []
-                    for e in events:
-                        comp  = e["competitions"][0]
-                        done  = comp["status"]["type"]["completed"]
-                        teams = {c["homeAway"]: c["team"]["abbreviation"]
-                                 for c in comp["competitors"]}
-                        entry = {
-                            "home":      teams.get("home", "UNK"),
-                            "away":      teams.get("away", "UNK"),
-                            "date":      e["date"][:10],
-                            "week":      week,
-                            "season":    year,
-                            "completed": done,
-                            "name":      e.get("shortName", e.get("name", "")),
-                            "espn_id":   e.get("id", ""),
-                            "odds":      {},
-                        }
-                        if not done:
-                            week_upcoming.append(entry)
-                        else:
-                            last_completed.append(entry)
-                    if week_upcoming:
-                        return week_upcoming, last_completed
-                return [], last_completed
-
-            # ── Tank01 path ───────────────────────────────────────────────────
-            def _tank01_year(year, api_key):
-                last_completed = []
-                for week in range(1, 19):
-                    data = _tank01_get("/getNFLGamesForWeek",
-                                       {"week": str(week), "seasonType": "reg",
-                                        "season": str(year)},
-                                       api_key)
-                    if not data:
-                        continue
-                    games = data.get("body", [])
-                    if not games:
-                        break
-                    week_upcoming = []
-                    for g in games:
-                        status = g.get("gameStatus", "").lower()
-                        done   = status in ("final", "completed")
-                        entry  = {
-                            "home":      g.get("home", "UNK"),
-                            "away":      g.get("away", "UNK"),
-                            "date":      g.get("gameDate", "")[:8],
-                            "week":      week,
-                            "season":    year,
-                            "completed": done,
-                            "name":      f"{g.get('away','?')} @ {g.get('home','?')}",
-                            "espn_id":   g.get("espnID", ""),
-                            "odds":      {},
-                        }
-                        if not done:
-                            week_upcoming.append(entry)
-                        else:
-                            last_completed.append(entry)
-                    if week_upcoming:
-                        return week_upcoming, last_completed
-                return [], last_completed
-
-            # ── Try ESPN first ────────────────────────────────────────────────
-            upcoming, last_completed = _espn_year(cur_year)
-            if not upcoming:
-                upcoming_next, _ = _espn_year(next_year)
-                if upcoming_next:
-                    upcoming = upcoming_next
-
-            # ── Fall back to Tank01 if ESPN returned nothing ──────────────────
-            if not upcoming and not last_completed:
-                t01_key = _tank01_key()
-                if t01_key:
-                    upcoming, last_completed = _tank01_year(cur_year, t01_key)
-                    if not upcoming:
-                        upcoming_next, _ = _tank01_year(next_year, t01_key)
-                        if upcoming_next:
-                            upcoming = upcoming_next
-
-            return upcoming if upcoming else last_completed[-16:]
+        # fetch_this_weeks_games defined at module level below tab declarations
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_game_odds(espn_id: str) -> dict:
