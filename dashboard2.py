@@ -388,7 +388,144 @@ def _scrape_season_live(year, progress_text=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (ESPN API — cached 1 hour)
+# TANK01 NFL API FALLBACK  (RapidAPI — free tier 100 req/day)
+# Used automatically when ESPN returns no data.
+# Key stored in st.secrets["RAPIDAPI_KEY"] or env var RAPIDAPI_KEY.
+# ──────────────────────────────────────────────────────────────────────────────
+_TANK01_HOST = "tank01-nfl-live-in-game-real-time-statistics-nfl.p.rapidapi.com"
+_TANK01_BASE = f"https://{_TANK01_HOST}"
+
+def _tank01_key():
+    """Return the RapidAPI key from Streamlit secrets or env, or None."""
+    try:
+        return st.secrets["RAPIDAPI_KEY"]
+    except Exception:
+        pass
+    import os
+    return os.environ.get("RAPIDAPI_KEY")
+
+def _tank01_get(path: str, params: dict, api_key: str):
+    """GET a Tank01 endpoint; return parsed JSON or None on failure."""
+    headers = {
+        "x-rapidapi-host": _TANK01_HOST,
+        "x-rapidapi-key":  api_key,
+        "User-Agent":      "Mozilla/5.0",
+    }
+    try:
+        r = _requests.get(_TANK01_BASE + path, headers=headers,
+                          params=params, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def _tank01_game(game_id_raw: str, season: int, week: int,
+                 home: str, away: str, api_key: str) -> list:
+    """
+    Pull one game's box score from Tank01 and return rows in the same
+    schema as _scrape_game().
+    game_id_raw format from Tank01: "20240907_BAL@KC"
+    """
+    data = _tank01_get("/getNFLBoxScore",
+                       {"gameID": game_id_raw, "playByPlay": "false",
+                        "fantasyPoints": "false"},
+                       api_key)
+    if not data:
+        return []
+
+    body = data.get("body", {})
+    rows = []
+
+    # Tank01 groups stats under playerStats → { playerID: { stats… } }
+    # or under home/away team sub-dicts depending on version.
+    # Support both layouts.
+    player_stats = body.get("playerStats", {})
+    if not player_stats:
+        # alternate layout: body["homePts"] etc. with sub-dicts per team
+        for side in ("home", "away"):
+            team_abbr = home if side == "home" else away
+            for pid, pdata in body.get(side, {}).items():
+                if not isinstance(pdata, dict):
+                    continue
+                player_stats[pid] = {**pdata, "_team": team_abbr}
+
+    for pid, pdata in player_stats.items():
+        if not isinstance(pdata, dict):
+            continue
+        name = pdata.get("longName", pdata.get("name", "Unknown"))
+        team = pdata.get("team", pdata.get("_team", "UNK"))
+
+        row = dict(
+            player_id    = str(pid),
+            game_id      = f"{season}_{week:02d}_{away}_{home}",
+            season       = season,
+            player_name  = name,
+            team         = team,
+            completions  = _safe_int(pdata.get("Completions",  pdata.get("completions",  0))),
+            attempts     = _safe_int(pdata.get("PassingAttempts", pdata.get("passAttempts", 0))),
+            passing_yards= _safe_int(pdata.get("PassingYards", pdata.get("passYds",      0))),
+            passing_tds  = _safe_int(pdata.get("PassingTDs",   pdata.get("passTD",       0))),
+            interceptions= _safe_int(pdata.get("Interceptions",pdata.get("int",          0))),
+            rush_attempts= _safe_int(pdata.get("RushingAttempts", pdata.get("carries",   0))),
+            rush_yards   = _safe_int(pdata.get("RushingYards", pdata.get("rushYds",      0))),
+            rush_tds     = _safe_int(pdata.get("RushingTDs",   pdata.get("rushTD",       0))),
+            receptions   = _safe_int(pdata.get("Receptions",   pdata.get("receptions",   0))),
+            targets      = _safe_int(pdata.get("Targets",      pdata.get("targets",      0))),
+            receiving_yards = _safe_int(pdata.get("ReceivingYards", pdata.get("recYds",  0))),
+            receiving_tds   = _safe_int(pdata.get("ReceivingTDs",   pdata.get("recTD",   0))),
+        )
+
+        # Same low-participation filter as ESPN scraper
+        is_passer   = row["attempts"]      > 0
+        is_rusher   = row["rush_attempts"] > 0
+        is_receiver = row["targets"] > 0 or row["receptions"] > 0
+
+        if not is_passer and not is_rusher and not is_receiver:
+            continue
+        if is_passer and not is_rusher and not is_receiver and row["attempts"] < 5:
+            continue
+        if is_rusher and not is_passer and not is_receiver and row["rush_attempts"] < 3:
+            continue
+
+        row["fantasy_points"] = round(_calc_fp(row), 4)
+        rows.append(row)
+    return rows
+
+
+def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataFrame:
+    """Scrape a full NFL season via Tank01 — mirrors _scrape_season_live()."""
+    all_rows = []
+    for week in range(1, 19):
+        if progress_text:
+            progress_text.text(f"Tank01: {year} — week {week}/18…")
+        data = _tank01_get("/getNFLGamesForWeek",
+                           {"week": str(week), "seasonType": "reg",
+                            "season": str(year)},
+                           api_key)
+        if not data:
+            continue
+        games = data.get("body", [])
+        if not games:
+            break
+        for game in games:
+            # Only process completed games
+            if game.get("gameStatus", "") != "Completed":
+                continue
+            gid  = game.get("gameID", "")          # e.g. "20240907_BAL@KC"
+            away = game.get("away", "UNK")
+            home = game.get("home", "UNK")
+            all_rows.extend(_tank01_game(gid, year, week, home, away, api_key))
+            _time.sleep(0.4)   # stay within free-tier rate limit
+
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows).drop_duplicates()
+    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA LOADING  (ESPN primary → Tank01 fallback)
 # ttl=3600 means: first visitor triggers a scrape, everyone else for the next
 # hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
 # any new games that were played.
@@ -405,6 +542,8 @@ def load_data():
 
     msg  = st.empty()
     prog = st.empty()
+
+    # ── 1. Try ESPN ───────────────────────────────────────────────────────────
     msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API… "
              "this takes ~5 min on first load, then caches for 1 hour.")
     df_prev = _scrape_season_live(_prev_year, prog)
@@ -412,10 +551,25 @@ def load_data():
     prog.empty()
     msg.empty()
 
+    # ── 2. Fall back to Tank01 if ESPN returned nothing ───────────────────────
+    if df_prev.empty and df_cur.empty:
+        t01_key = _tank01_key()
+        if t01_key:
+            msg.warning(
+                "ESPN API returned no data — falling back to **Tank01 NFL API** "
+                "(RapidAPI). Data may be slightly delayed."
+            )
+            df_prev = _tank01_season(_prev_year, prog, t01_key)
+            df_cur  = _tank01_season(_cur_year,  prog, t01_key)
+            prog.empty()
+            msg.empty()
+
     if df_prev.empty and df_cur.empty:
         raise RuntimeError(
             "ESPN API returned no data. It may be temporarily unavailable — "
-            "try refreshing the page in a minute."
+            "try refreshing the page in a minute. "
+            "If you have a RapidAPI key, add it to Streamlit secrets as RAPIDAPI_KEY "
+            "to enable the Tank01 NFL fallback."
         )
 
     # Use whichever frames have data
