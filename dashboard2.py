@@ -1700,6 +1700,12 @@ if data_ok:
             """
             Returns a dict with hit_rate (%), weighted_avg, recommendation,
             implied_prob for this leg based on historical data.
+
+            Accuracy improvements:
+            - Sample size confidence: shrinks implied prob toward 50% for small samples
+            - Variance penalty: high-σ players get probability pulled toward 50%
+            - UNDER threshold: requires 60%+ raw hit rate before recommending UNDER
+              (books shade lines above median, so UNDER is harder to hit)
             """
             col = CAT_MAP[category.lower()][0]
             pdf = find_player(nfl, player_name)
@@ -1708,30 +1714,55 @@ if data_ok:
 
             vals = pdf[col].values
             wts  = pdf["weight"].values
+            n    = len(vals)
 
-            if use_weighted:
-                w_avg = np.average(vals, weights=wts)
-                w_hit = np.average((vals > line).astype(float), weights=wts)
+            if use_weighted and n > 0:
+                w_avg = float(np.average(vals, weights=wts))
+                w_hit = float(np.average((vals > line).astype(float), weights=wts))
             else:
-                w_avg = vals.mean()
-                w_hit = (vals > line).mean()
+                w_avg = float(vals.mean()) if n > 0 else 0.0
+                w_hit = float((vals > line).mean()) if n > 0 else 0.5
 
-            rec = "OVER" if w_avg > line else "UNDER"
-            # implied prob: if bet OVER, use hit rate; if UNDER use (1 - hit rate)
-            implied = w_hit if rec == "OVER" else 1 - w_hit
-            # cap between 11% and 89% → American odds stay within ±800/+600
+            # ── Sample size confidence: blend toward 50% for small samples ──────
+            # At n=1 → 50% weight on prior; at n=10+ → full weight on data
+            prior_weight = max(0.0, 1.0 - n / 10.0)
+            w_hit_adj = w_hit * (1 - prior_weight) + 0.5 * prior_weight
+
+            # ── Variance penalty: high σ relative to line shrinks edge ───────────
+            if n >= 3:
+                std = float(np.std(vals))
+                cv  = std / (line + 1e-6)   # coefficient of variation vs line
+                var_penalty = min(0.15, cv * 0.05)   # max 15% pull toward 50%
+                w_hit_adj = w_hit_adj * (1 - var_penalty) + 0.5 * var_penalty
+
+            # ── Direction: require 60%+ hit rate to call UNDER ───────────────────
+            # Books shade lines above median so UNDER needs more edge to be +EV
+            if w_hit_adj >= 0.55:
+                rec = "OVER"
+            elif (1 - w_hit_adj) >= 0.60:
+                rec = "UNDER"
+            else:
+                # Weak signal — still pick the better side but flag low confidence
+                rec = "OVER" if w_hit_adj >= 0.5 else "UNDER"
+
+            implied = w_hit_adj if rec == "OVER" else 1 - w_hit_adj
             implied = max(0.111, min(0.889, implied))
 
+            # ── Last 3 games trend ───────────────────────────────────────────────
+            last3_avg = float(pdf[col].tail(3).mean()) if n >= 3 else w_avg
+
             return {
-                "player":      pdf["player_name"].iloc[0],
-                "category":    category,
-                "line":        line,
-                "col":         col,
-                "w_avg":       round(float(w_avg), 1),
-                "hit_rate_pct": round(float(w_hit) * 100, 1),
+                "player":         pdf["player_name"].iloc[0],
+                "category":       category,
+                "line":           line,
+                "col":            col,
+                "w_avg":          round(w_avg, 1),
+                "last3_avg":      round(last3_avg, 1),
+                "hit_rate_pct":   round(w_hit * 100, 1),       # raw hit rate for display
+                "sample_size":    n,
                 "recommendation": rec,
-                "implied_prob": round(implied, 4),
-                "american_odds": prob_to_american(implied),
+                "implied_prob":   round(implied, 4),
+                "american_odds":  prob_to_american(implied),
             }
 
         # ─────────────────────────────────────────────────────────────────────
@@ -1779,7 +1810,6 @@ if data_ok:
                     if result is None:
                         st.error("Player not found.")
                     else:
-                        # prevent duplicate legs
                         exists = any(
                             l["player"] == result["player"]
                             and l["category"] == result["category"]
@@ -1790,6 +1820,105 @@ if data_ok:
                             st.warning("This exact leg is already in your parlay.")
                         else:
                             st.session_state["parlay_legs"].append(result)
+                            st.rerun()
+
+            st.divider()
+            st.markdown("##### ⚡ Auto-Suggest")
+            pb_auto_n    = st.slider("Legs to suggest", 2, 8, 4, key="pb_auto_n")
+            pb_auto_cats = st.multiselect(
+                "Stats to consider",
+                list(CAT_MAP.keys()),
+                default=["pass yards", "rush yards", "rec yards", "receptions"],
+                format_func=str.title,
+                key="pb_auto_cats",
+            )
+            pb_auto_min_hr = st.slider(
+                "Min hit rate %", 40, 80, 55, key="pb_auto_min_hr"
+            )
+            pb_auto_btn = st.button(
+                "⚡ Suggest Best Legs", use_container_width=True, key="pb_auto_btn"
+            )
+
+            if pb_auto_btn:
+                if not pb_auto_cats:
+                    st.warning("Select at least one stat category.")
+                else:
+                    # Score every player × stat in the dataset
+                    candidates = []
+                    seen_pk = set()
+                    for cat in pb_auto_cats:
+                        col_key = CAT_MAP[cat.lower()][0]
+                        # Only consider players with enough data
+                        for pname in nfl_df["player_name"].unique():
+                            pk = (pname, cat)
+                            if pk in seen_pk:
+                                continue
+                            pdf = find_player(nfl_df, pname)
+                            if len(pdf) < 5:
+                                continue   # need min 5 games
+                            vals = pdf[col_key].values
+                            wts  = pdf["weight"].values
+                            w_avg = float(np.average(vals, weights=wts))
+                            # Project line near weighted avg
+                            proj = w_avg
+                            if col_key == "passing_yards":
+                                incs = [i + 0.5 for i in range(50, 500, 25)]
+                            elif col_key in ("rush_yards", "receiving_yards"):
+                                incs = [i + 0.5 for i in range(0, 250, 10)]
+                            elif col_key == "receptions":
+                                incs = [i + 0.5 for i in range(0, 20, 1)]
+                            elif col_key == "passing_tds":
+                                incs = [0.5, 1.5, 2.5, 3.5]
+                            else:
+                                incs = [i + 0.5 for i in range(0, 60, 5)]
+                            line_val = min(incs, key=lambda x: abs(x - proj))
+                            # Score the leg
+                            scored = score_leg(nfl_df, pname, cat, line_val, pb_weighted)
+                            if scored is None:
+                                continue
+                            hr = scored["hit_rate_pct"]
+                            if hr < pb_auto_min_hr:
+                                continue
+                            # Composite: hit rate × consistency (1/cv) × recency
+                            std = float(np.std(vals))
+                            cv  = std / (w_avg + 1e-6)
+                            consistency = 1 / (1 + cv)
+                            last3 = float(pdf[col_key].tail(3).mean())
+                            recency = max(0.5, min(2.0, last3 / (w_avg + 1e-6)))
+                            composite = (scored["implied_prob"] * 100) * consistency * recency
+                            candidates.append({**scored, "_composite": composite,
+                                               "last3_avg": round(last3, 1),
+                                               "sample_size": len(vals)})
+                            seen_pk.add(pk)
+
+                    # Sort, deduplicate by player, pick top N
+                    candidates.sort(key=lambda x: x["_composite"], reverse=True)
+                    seen_players = set()
+                    best_legs = []
+                    for c in candidates:
+                        if c["player"] not in seen_players:
+                            best_legs.append({k: v for k, v in c.items() if k != "_composite"})
+                            seen_players.add(c["player"])
+                        if len(best_legs) >= pb_auto_n:
+                            break
+
+                    if len(best_legs) < 2:
+                        st.warning("Not enough qualifying legs. Lower the min hit rate or add more stat categories.")
+                    else:
+                        # Merge into existing legs (avoid duplicates)
+                        added = 0
+                        for leg in best_legs:
+                            if len(st.session_state["parlay_legs"]) >= 8:
+                                break
+                            exists = any(
+                                l["player"] == leg["player"]
+                                and l["category"] == leg["category"]
+                                for l in st.session_state["parlay_legs"]
+                            )
+                            if not exists:
+                                st.session_state["parlay_legs"].append(leg)
+                                added += 1
+                        if added:
                             st.rerun()
 
             # clear button
@@ -1815,8 +1944,12 @@ if data_ok:
                     c1, c2, c3, c4, c5, c6 = st.columns([2, 1.2, 1, 1, 1, 0.5])
                     c1.markdown(f"**{leg['player']}**")
                     c2.markdown(f"{leg['category'].title()} {leg['recommendation']} **{leg['line']}**")
-                    c3.metric("Wtd Avg", leg["w_avg"])
-                    c4.metric("Hit Rate", f"{leg['hit_rate_pct']}%")
+                    c3.metric("Wtd Avg", leg["w_avg"],
+                              delta=f"L3: {leg.get('last3_avg', leg['w_avg'])}",
+                              delta_color="normal")
+                    c4.metric("Hit Rate", f"{leg['hit_rate_pct']}%",
+                              delta=f"n={leg.get('sample_size','?')}",
+                              delta_color="off")
                     c5.markdown(
                         f"<span style='color:{rec_color};font-weight:700;font-size:15px'>"
                         f"{leg['recommendation']}</span>",
@@ -4178,45 +4311,63 @@ if data_ok:
                                             line_val = min(incs, key=lambda x: abs(x - proj))
                                             lsrc = "📐 Model"
 
-                                        # Direction: always take OVER on soft matchup, else model's call
-                                        direction = "OVER" if proj > line_val else "UNDER"
+                                        n_games = len(vals)
+                                        if n_games < 3:
+                                            continue
 
-                                        # Hit rate (weighted)
-                                        w_hit = float(np.average(
+                                        # Weighted hit rate
+                                        w_hit_raw = float(np.average(
                                             (vals > line_val).astype(float), weights=wts
-                                        )) * 100
-                                        hr_for_direction = w_hit if direction == "OVER" else (100 - w_hit)
+                                        ))
 
-                                        # Apply min hit rate filter
+                                        # Sample size confidence
+                                        prior_w = max(0.0, 1.0 - n_games / 10.0)
+                                        w_hit_adj = w_hit_raw * (1 - prior_w) + 0.5 * prior_w
+
+                                        # Variance penalty
+                                        std_v = float(np.std(vals))
+                                        cv_v  = std_v / (line_val + 1e-6)
+                                        var_pen = min(0.15, cv_v * 0.05)
+                                        w_hit_adj = w_hit_adj * (1 - var_pen) + 0.5 * var_pen
+
+                                        # Direction with UNDER threshold
+                                        if w_hit_adj >= 0.55:
+                                            direction = "OVER"
+                                        elif (1 - w_hit_adj) >= 0.60:
+                                            direction = "UNDER"
+                                        else:
+                                            direction = "OVER" if w_hit_adj >= 0.5 else "UNDER"
+
+                                        hr_for_direction = (w_hit_adj if direction == "OVER"
+                                                            else 1 - w_hit_adj) * 100
+
                                         if hr_for_direction < sgp_auto_min_hr:
                                             continue
 
-                                        # Implied prob (capped)
                                         implied = max(0.111, min(0.889, hr_for_direction / 100))
 
-                                        # Composite score: hit rate × matchup factor × recency boost
-                                        last3 = float(pdf[col_key].tail(3).mean()) if len(pdf) >= 3 else w_avg
-                                        recency = (last3 / w_avg) if w_avg > 0 else 1.0
-                                        recency = max(0.5, min(2.0, recency))
-                                        composite = hr_for_direction * matchup_factor * recency
+                                        last3 = float(pdf[col_key].tail(3).mean()) if n_games >= 3 else w_avg
+                                        recency = max(0.5, min(2.0, (last3 / w_avg) if w_avg > 0 else 1.0))
+                                        consistency = 1 / (1 + cv_v)
+                                        composite = hr_for_direction * matchup_factor * recency * consistency
 
                                         candidate_legs.append({
-                                            "player":       pname,
-                                            "category":     cat,
-                                            "col":          col_key,
-                                            "line":         line_val,
-                                            "line_source":  lsrc,
+                                            "player":         pname,
+                                            "category":       cat,
+                                            "col":            col_key,
+                                            "line":           line_val,
+                                            "line_source":    lsrc,
                                             "recommendation": direction,
-                                            "w_avg":        round(w_avg, 1),
-                                            "last3":        round(last3, 1),
-                                            "hit_rate_pct": round(w_hit, 1),
-                                            "implied_prob": round(implied, 4),
-                                            "american_odds": prob_to_american(implied),
-                                            "matchup_grade": matchup_grade,
+                                            "w_avg":          round(w_avg, 1),
+                                            "last3":          round(last3, 1),
+                                            "hit_rate_pct":   round(w_hit_raw * 100, 1),
+                                            "implied_prob":   round(implied, 4),
+                                            "american_odds":  prob_to_american(implied),
+                                            "matchup_grade":  matchup_grade,
                                             "matchup_factor": round(matchup_factor, 2),
-                                            "defense":      defense_team,
-                                            "game":         sgp_game_labels[sgp_game_idx],
-                                            "_composite":   composite,
+                                            "defense":        defense_team,
+                                            "game":           sgp_game_labels[sgp_game_idx],
+                                            "_composite":     composite,
                                         })
                                         seen_player_cats.add(pk)
 
