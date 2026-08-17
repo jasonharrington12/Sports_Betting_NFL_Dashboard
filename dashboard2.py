@@ -587,24 +587,19 @@ def load_data():
 
     nfl["weight"] = nfl.apply(_weight, axis=1)
 
-    # ── normalise dtypes ───────────────────────────────────────────────────
-    # nflverse parquet uses int32/float32. pandas' numexpr engine evaluates
-    # the full array before np.where applies its mask, so integer or float32
-    # zero-denominators raise ZeroDivisionError. Cast every numeric column
-    # to float64 once here so all subsequent arithmetic is safe.
-    num_cols_pre = nfl.select_dtypes(include="number").columns
-    nfl[num_cols_pre] = nfl[num_cols_pre].astype("float64")
-
     # ── efficiency metrics ─────────────────────────────────────────────────
-    nfl["completion_percentage"] = np.where(
-        nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0
-    )
-    nfl["yards_per_attempt"] = np.where(
-        nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0
-    )
-    nfl["yards_per_reception"] = np.where(
-        nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0
-    )
+    # Use pandas divide() with fill_value=0 — this avoids np.where entirely
+    # and never triggers numexpr, so int32/float32 zero-denominators are
+    # handled safely regardless of the data source.
+    att  = pd.to_numeric(nfl["attempts"],      errors="coerce").fillna(0)
+    rec  = pd.to_numeric(nfl["receptions"],    errors="coerce").fillna(0)
+    comp = pd.to_numeric(nfl["completions"],   errors="coerce").fillna(0)
+    pyd  = pd.to_numeric(nfl["passing_yards"], errors="coerce").fillna(0)
+    reyd = pd.to_numeric(nfl["receiving_yards"], errors="coerce").fillna(0)
+
+    nfl["completion_percentage"] = comp.where(att == 0, comp / att.replace(0, np.nan)).fillna(0)
+    nfl["yards_per_attempt"]     = pyd.where( att == 0, pyd  / att.replace(0, np.nan)).fillna(0)
+    nfl["yards_per_reception"]   = reyd.where(rec == 0, reyd / rec.replace(0, np.nan)).fillna(0)
 
     # ── rolling averages ───────────────────────────────────────────────────
     nfl = nfl.sort_values(["player_name", "season", "game_id"])
