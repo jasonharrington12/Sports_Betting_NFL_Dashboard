@@ -587,12 +587,15 @@ def load_data():
 
     nfl["weight"] = nfl.apply(_weight, axis=1)
 
+    # ── normalise dtypes ───────────────────────────────────────────────────
+    # nflverse parquet uses int32/float32. pandas' numexpr engine evaluates
+    # the full array before np.where applies its mask, so integer or float32
+    # zero-denominators raise ZeroDivisionError. Cast every numeric column
+    # to float64 once here so all subsequent arithmetic is safe.
+    num_cols_pre = nfl.select_dtypes(include="number").columns
+    nfl[num_cols_pre] = nfl[num_cols_pre].astype("float64")
+
     # ── efficiency metrics ─────────────────────────────────────────────────
-    # Cast to float64 first — nflverse parquet uses int32 which causes a
-    # hard ZeroDivisionError inside np.where (unlike int64/float64 which
-    # silently produce NaN).
-    nfl["attempts"]   = nfl["attempts"].astype("float64")
-    nfl["receptions"] = nfl["receptions"].astype("float64")
     nfl["completion_percentage"] = np.where(
         nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0
     )
