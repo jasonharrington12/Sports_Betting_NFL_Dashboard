@@ -388,7 +388,97 @@ def _scrape_season_live(year, progress_text=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (ESPN API only — cached for 1 hour so data stays fresh)
+# nfl_data_py FALLBACK  (used when ESPN API is unavailable)
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_nfl_data_py(year: int) -> pd.DataFrame:
+    """
+    Pull weekly player stats for `year` via nfl_data_py and return a DataFrame
+    whose columns match the ESPN-scraped schema so the rest of the app is unaware
+    of the source switch.
+
+    Column mapping:
+        player_display_name → player_name
+        recent_team         → team
+        carries             → rush_attempts
+        rushing_yards       → rush_yards
+        rushing_tds         → rush_tds
+        game_id             → synthesised as "{year}_{week:02d}_nflverse"
+    """
+    try:
+        import nfl_data_py as _nfl
+    except ImportError:
+        return pd.DataFrame()
+
+    try:
+        df = _nfl.import_weekly_data([year])
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Keep regular season only
+    if "season_type" in df.columns:
+        df = df[df["season_type"] == "REG"]
+
+    # Rename to match internal schema
+    df = df.rename(columns={
+        "player_display_name": "player_name",
+        "recent_team":         "team",
+        "carries":             "rush_attempts",
+        "rushing_yards":       "rush_yards",
+        "rushing_tds":         "rush_tds",
+    })
+
+    # Synthesise a game_id consistent with ESPN format "{year}_{week:02d}_nflverse"
+    df["game_id"] = (
+        df["season"].astype(str) + "_"
+        + df["week"].astype(str).str.zfill(2) + "_nflverse"
+    )
+    df["season"] = year
+
+    # Map fantasy_points_ppr → fantasy_points (PPR scoring matches our _FP weights)
+    if "fantasy_points_ppr" in df.columns and "fantasy_points" not in df.columns:
+        df["fantasy_points"] = df["fantasy_points_ppr"]
+    elif "fantasy_points_ppr" in df.columns:
+        df["fantasy_points"] = df["fantasy_points_ppr"]
+
+    # Ensure all expected columns exist with 0 as default
+    for col in ["completions", "attempts", "passing_yards", "passing_tds",
+                "interceptions", "rush_attempts", "rush_yards", "rush_tds",
+                "receptions", "targets", "receiving_yards", "receiving_tds",
+                "fantasy_points"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    # Apply the same low-participation filter as the ESPN scraper
+    is_passer   = df["attempts"]      > 0
+    is_rusher   = df["rush_attempts"] > 0
+    is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
+
+    mask = is_passer | is_rusher | is_receiver
+    df = df[mask].copy()
+    # Pure passer < 5 attempts → drop
+    df = df[~((is_passer & ~is_rusher & ~is_receiver) & (df["attempts"] < 5))]
+    # Pure rusher < 3 carries → drop
+    df = df[~((is_rusher & ~is_passer & ~is_receiver) & (df["rush_attempts"] < 3))]
+
+    keep = ["player_name", "team", "season", "game_id",
+            "completions", "attempts", "passing_yards", "passing_tds",
+            "interceptions", "rush_attempts", "rush_yards", "rush_tds",
+            "receptions", "targets", "receiving_yards", "receiving_tds",
+            "fantasy_points"]
+    df = df[[c for c in keep if c in df.columns]].copy()
+
+    # player_id not available from nfl_data_py per-weekly summary — use name as key
+    df["player_id"] = df["player_name"]
+
+    df = df.drop_duplicates()
+    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA LOADING  (ESPN primary, nfl_data_py fallback)
 # ttl=3600 means: first visitor triggers a scrape, everyone else for the next
 # hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
 # any new games that were played.
@@ -405,18 +495,32 @@ def load_data():
 
     msg  = st.empty()
     prog = st.empty()
-    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API... "
+
+    # ── 1. Try ESPN first ─────────────────────────────────────────────────────
+    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API… "
              "this takes ~5 min on first load, then caches for 1 hour.")
     df_prev = _scrape_season_live(_prev_year, prog)
     df_cur  = _scrape_season_live(_cur_year,  prog)
     prog.empty()
     msg.empty()
 
-    # Current season may be empty before it starts (offseason) — that's fine
+    espn_ok = not df_prev.empty or not df_cur.empty
+
+    # ── 2. Fall back to nfl_data_py if ESPN returned nothing ─────────────────
+    if not espn_ok:
+        msg.warning(
+            "ESPN API returned no data — falling back to **nfl_data_py** "
+            "(nflverse). Data may lag by ~1 day after games."
+        )
+        df_prev = _load_nfl_data_py(_prev_year)
+        df_cur  = _load_nfl_data_py(_cur_year)
+        msg.empty()
+
     if df_prev.empty and df_cur.empty:
         raise RuntimeError(
-            "ESPN API returned no data. It may be temporarily unavailable — "
-            "try refreshing the page in a minute."
+            "Both ESPN and nfl_data_py returned no data. "
+            "ESPN may be temporarily unavailable — try refreshing in a minute. "
+            "If the problem persists, check your internet connection."
         )
 
     # Use whichever frames have data
