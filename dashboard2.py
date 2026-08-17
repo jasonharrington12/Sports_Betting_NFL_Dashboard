@@ -1928,14 +1928,107 @@ if data_ok:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SCHEDULE HELPER  —  fetch_this_weeks_games
+# Uses sports.core.api.espn.com (not blocked).
+# Returns the current/upcoming week's games as a list of dicts:
+#   { espn_id, home, away, week, date, completed }
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=1800, show_spinner=False)   # cache 30 min
+def fetch_this_weeks_games() -> list:
+    import datetime as _dt
+    _CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
+    _H    = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    def _cget(url):
+        try:
+            r = _requests.get(url.replace("http://", "https://"), headers=_H, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
+    today = _dt.date.today()
+    # Determine current NFL season year
+    cur_year = today.year if today.month >= 9 else today.year if today.month >= 2 else today.year - 1
+
+    # Find the current/most-recent week by checking the season calendar
+    weeks_data = _cget(f"{_CORE}/seasons/{cur_year}/types/2/weeks")
+    if not weeks_data:
+        return []
+
+    # Pick the week closest to today — prefer upcoming, fall back to most recent past
+    best_week = 1
+    best_diff = None
+    for w in weeks_data.get("items", []):
+        w_detail = _cget(w.get("$ref", "").replace("http://", "https://"))
+        if not w_detail:
+            continue
+        try:
+            start = _dt.date.fromisoformat(w_detail.get("startDate", "")[:10])
+            end   = _dt.date.fromisoformat(w_detail.get("endDate",   "")[:10])
+            week_num = w_detail.get("number", 0)
+        except Exception:
+            continue
+        # Use this week if today falls within it, or pick closest
+        if start <= today <= end:
+            best_week = week_num
+            break
+        diff = abs((start - today).days)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_week = week_num
+
+    events_data = _cget(
+        f"{_CORE}/seasons/{cur_year}/types/2/weeks/{best_week}/events?limit=20"
+    )
+    if not events_data:
+        return []
+
+    games = []
+    for item in events_data.get("items", []):
+        event = _cget(item.get("$ref", ""))
+        if not event:
+            continue
+        short = event.get("shortName", "")
+        parts = short.split(" @ ")
+        if len(parts) != 2:
+            continue
+        away = _TEAM_NORM.get(parts[0].strip(), parts[0].strip())
+        home = _TEAM_NORM.get(parts[1].strip(), parts[1].strip())
+
+        # Completed status via status $ref
+        comp_ref = (event.get("competitions") or [{}])[0].get("$ref", "")
+        completed = False
+        espn_id   = event.get("id", "")
+        date_str  = event.get("date", "")[:10]
+        if comp_ref:
+            comp = _cget(comp_ref)
+            if comp:
+                status_ref = (comp.get("status") or {}).get("$ref", "")
+                if status_ref:
+                    status = _cget(status_ref)
+                    completed = bool((status or {}).get("type", {}).get("completed", False))
+
+        games.append({
+            "espn_id":   espn_id,
+            "home":      home,
+            "away":      away,
+            "week":      best_week,
+            "date":      date_str,
+            "completed": completed,
+        })
+    return games
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
 if data_ok:
     with tab8:
         # ── helpers ───────────────────────────────────────────────────────────
         # build_defense_table and _COL_TO_POS are now at module level (above)
-
-        # fetch_this_weeks_games defined at module level below tab declarations
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_game_odds(espn_id: str) -> dict:
