@@ -468,19 +468,46 @@ def _scrape_week(season: int, week: int,
     return rows
 
 
-def _scrape_season(season: int, progress_text=None) -> pd.DataFrame:
-    """Scrape all weeks (regular season + playoffs) for one season."""
-    all_rows = []
-    # season_type 2 = regular season (weeks 1-18), 3 = playoffs (weeks 1-4)
-    for stype, max_week in [(2, 18), (3, 4)]:
-        for week in range(1, max_week + 1):
-            new = _scrape_week(season, week, stype, progress_text)
-            if not new and stype == 2 and week > 1:
-                break   # no more regular-season weeks
-            all_rows.extend(new)
-    if not all_rows:
+# Persistent cache file — survives across Streamlit reruns within the same
+# server instance. /tmp is writable on Streamlit Cloud and locally.
+_CACHE_PATH = "/tmp/nfl_game_logs.csv"
+
+def _cache_load() -> pd.DataFrame:
+    """Read the on-disk cache; return empty DataFrame if missing/corrupt."""
+    import os
+    if not os.path.exists(_CACHE_PATH):
         return pd.DataFrame()
-    return pd.DataFrame(all_rows).drop_duplicates().reset_index(drop=True)
+    try:
+        df = pd.read_csv(_CACHE_PATH, low_memory=False)
+        df.columns = df.columns.str.lower().str.strip()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _cache_save(df: pd.DataFrame):
+    """Write the full dataset to the on-disk cache."""
+    try:
+        df.to_csv(_CACHE_PATH, index=False)
+    except Exception:
+        pass
+
+
+def _latest_week_in_df(df: pd.DataFrame, year: int) -> int:
+    """Return the highest week number already cached for a season, or 0."""
+    if df.empty or "game_id" not in df.columns or "season" not in df.columns:
+        return 0
+    sub = df[df["season"] == year]
+    if sub.empty:
+        return 0
+    try:
+        weeks = (
+            sub["game_id"].str.split("_", expand=True)[1]
+            .dropna().astype(int)
+        )
+        return int(weeks.max()) if not weeks.empty else 0
+    except Exception:
+        return 0
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -498,23 +525,65 @@ def load_data():
     msg  = st.empty()
     prog = st.empty()
 
-    msg.info(f"Loading {_prev_year} season…")
-    df_prev = _scrape_season(_prev_year, prog)
+    # ── 1. Read whatever is already cached on disk ────────────────────────────
+    base = _cache_load()
 
-    msg.info(f"Loading {_cur_year} season…")
-    df_cur  = _scrape_season(_cur_year,  prog)
+    # ── 2. Work out which weeks are missing for each season ───────────────────
+    prev_done = _latest_week_in_df(base, _prev_year)
+    cur_done  = _latest_week_in_df(base, _cur_year)
+
+    new_rows = []
+
+    # Regular season weeks not yet cached
+    for season, done in [(_prev_year, prev_done), (_cur_year, cur_done)]:
+        for week in range(done + 1, 19):
+            msg.info(f"Fetching {season} week {week}/18…")
+            rows = _scrape_week(season, week, season_type=2, progress_text=prog)
+            if not rows and week > 1:
+                break   # ESPN returned nothing → season not that far yet
+            new_rows.extend(rows)
+
+    # Playoffs: only scrape if we haven't cached them yet (week 19+ encoded as
+    # game_id YYYY_19_… through YYYY_22_…)
+    for season in [_prev_year, _cur_year]:
+        playoff_done = 0
+        if not base.empty and "game_id" in base.columns and "season" in base.columns:
+            sub = base[base["season"] == season]
+            try:
+                wks = sub["game_id"].str.split("_", expand=True)[1].dropna().astype(int)
+                playoff_done = int(wks[wks >= 19].max()) if not wks[wks >= 19].empty else 0
+            except Exception:
+                playoff_done = 0
+        for week in range(max(1, playoff_done + 1), 5):
+            msg.info(f"Fetching {season} playoffs week {week}/4…")
+            rows = _scrape_week(season, week, season_type=3, progress_text=prog)
+            if not rows and week > 1:
+                break
+            # Re-encode playoff week numbers as 19-22 so they sort after regular season
+            for r in rows:
+                parts = r["game_id"].split("_")
+                if len(parts) >= 2:
+                    r["game_id"] = f"{parts[0]}_{int(parts[1]) + 18:02d}_{'_'.join(parts[2:])}"
+            new_rows.extend(rows)
 
     prog.empty()
     msg.empty()
 
-    frames = [f for f in [df_prev, df_cur] if not f.empty]
+    # ── 3. Merge new rows into cache and persist ──────────────────────────────
+    if new_rows:
+        new_df = pd.DataFrame(new_rows).drop_duplicates()
+        combined_cache = pd.concat([base, new_df], ignore_index=True).drop_duplicates()
+        _cache_save(combined_cache)
+        base = combined_cache
+
+    frames = [f for f in [base] if not f.empty]
     if not frames:
         raise RuntimeError(
             "No data available. ESPN core API returned no data. "
             "Check your internet connection and try refreshing the page."
         )
 
-    combined = pd.concat(frames, ignore_index=True)
+    combined = base.copy()
 
     # Split into per-season frames for the rest of load_data()
     df_2024 = combined[combined["season"] == _prev_year].copy()
