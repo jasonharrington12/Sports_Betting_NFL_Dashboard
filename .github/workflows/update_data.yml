@@ -1,0 +1,44 @@
+name: Update NFL Data
+
+on:
+  schedule:
+    # Every Tuesday at 6 AM UTC (Monday night game finishes ~1 AM UTC Tuesday)
+    - cron: "0 6 * * 2"
+    # Also run every Wednesday during the season as a safety net
+    - cron: "0 6 * * 3"
+  workflow_dispatch:   # allow manual trigger from GitHub Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Run scraper
+        run: python scrape_data.py
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f final_nfl_2024_2025_player_game_logs.csv
+          # Only commit if something actually changed
+          if git diff --cached --quiet; then
+            echo "No new data — nothing to commit."
+          else
+            ROWS=$(python -c "import pandas as pd; df=pd.read_csv('final_nfl_2024_2025_player_game_logs.csv'); print(len(df))")
+            git commit -m "data: auto-update game logs [${ROWS} rows] $(date -u '+%Y-%m-%d')"
+            git push
+          fi

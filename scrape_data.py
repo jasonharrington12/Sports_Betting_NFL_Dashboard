@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OUTPUT_CSV  = "final_nfl_2024_2025_player_game_logs.csv"
+OUTPUT_CSV  = "final_nfl_2024_2025_player_game_logs.csv"   # shared with dashboard2.py
 CORE_BASE   = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
 HEADERS     = {
     "User-Agent": (
@@ -248,7 +248,12 @@ def main():
 
     import datetime
     today    = datetime.date.today()
-    cur_year = today.year if today.month >= 9 else today.year if today.month >= 2 else today.year - 1
+    if today.month >= 9:
+        cur_year = today.year       # Sep-Dec → current calendar year is the active season
+    elif today.month >= 2:
+        cur_year = today.year       # Feb-Aug → season just ended / offseason
+    else:
+        cur_year = today.year - 1   # Jan → still wrapping up previous season
     prev_year = cur_year - 1
     years    = [args.year] if args.year else [prev_year, cur_year]
 
