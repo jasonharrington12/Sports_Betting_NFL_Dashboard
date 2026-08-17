@@ -461,26 +461,31 @@ def _tank01_game(game_id_raw: str, season: int, week: int,
         if not isinstance(pdata, dict):
             continue
         name = pdata.get("longName", pdata.get("name", "Unknown"))
-        team = pdata.get("team", pdata.get("_team", "UNK"))
+        team = pdata.get("teamAbv", pdata.get("team", pdata.get("_team", "UNK")))
+
+        # Stats are nested under "Passing", "Rushing", "Receiving" sub-dicts
+        passing   = pdata.get("Passing",   {}) or {}
+        rushing   = pdata.get("Rushing",   {}) or {}
+        receiving = pdata.get("Receiving", {}) or {}
 
         row = dict(
-            player_id    = str(pid),
-            game_id      = f"{season}_{week:02d}_{away}_{home}",
-            season       = season,
-            player_name  = name,
-            team         = team,
-            completions  = _safe_int(pdata.get("Completions",  pdata.get("completions",  0))),
-            attempts     = _safe_int(pdata.get("PassingAttempts", pdata.get("passAttempts", 0))),
-            passing_yards= _safe_int(pdata.get("PassingYards", pdata.get("passYds",      0))),
-            passing_tds  = _safe_int(pdata.get("PassingTDs",   pdata.get("passTD",       0))),
-            interceptions= _safe_int(pdata.get("Interceptions",pdata.get("int",          0))),
-            rush_attempts= _safe_int(pdata.get("RushingAttempts", pdata.get("carries",   0))),
-            rush_yards   = _safe_int(pdata.get("RushingYards", pdata.get("rushYds",      0))),
-            rush_tds     = _safe_int(pdata.get("RushingTDs",   pdata.get("rushTD",       0))),
-            receptions   = _safe_int(pdata.get("Receptions",   pdata.get("receptions",   0))),
-            targets      = _safe_int(pdata.get("Targets",      pdata.get("targets",      0))),
-            receiving_yards = _safe_int(pdata.get("ReceivingYards", pdata.get("recYds",  0))),
-            receiving_tds   = _safe_int(pdata.get("ReceivingTDs",   pdata.get("recTD",   0))),
+            player_id     = str(pid),
+            game_id       = f"{season}_{week:02d}_{away}_{home}",
+            season        = season,
+            player_name   = name,
+            team          = team,
+            completions   = _safe_int(passing.get("passCompletions", 0)),
+            attempts      = _safe_int(passing.get("passAttempts",    0)),
+            passing_yards = _safe_int(passing.get("passYds",         0)),
+            passing_tds   = _safe_int(passing.get("passTD",          0)),
+            interceptions = _safe_int(passing.get("int",             0)),
+            rush_attempts = _safe_int(rushing.get("carries",         0)),
+            rush_yards    = _safe_int(rushing.get("rushYds",         0)),
+            rush_tds      = _safe_int(rushing.get("rushTD",          0)),
+            receptions    = _safe_int(receiving.get("receptions",    0)),
+            targets       = _safe_int(receiving.get("targets",       0)),
+            receiving_yards = _safe_int(receiving.get("recYds",      0)),
+            receiving_tds   = _safe_int(receiving.get("recTD",       0)),
         )
 
         # Same low-participation filter as ESPN scraper
@@ -516,8 +521,9 @@ def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataF
         if not games:
             break
         for game in games:
-            # Only process completed games
-            if game.get("gameStatus", "") != "Completed":
+            # Tank01 uses "Final" for completed games
+            status = game.get("gameStatus", "")
+            if status not in ("Final", "Completed", "final", "completed"):
                 continue
             gid  = game.get("gameID", "")          # e.g. "20240907_BAL@KC"
             away = game.get("away", "UNK")
