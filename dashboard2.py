@@ -1839,26 +1839,39 @@ if data_ok:
                 "⚡ Suggest Best Legs", use_container_width=True, key="pb_auto_btn"
             )
 
+            # Minimum average thresholds per stat — filters out backups
+            _PB_MIN_AVG = {
+                "passing_yards":   150.0,   # QB1s average 220+; 150 filters out backups
+                "passing_tds":       0.8,   # must average nearly 1 TD/game
+                "rush_yards":       35.0,   # RB1s average 60+; 35 filters out change-of-pace backs
+                "rush_tds":          0.2,
+                "receiving_yards":  25.0,   # WR/TE starters average 50+; 25 filters out gadget players
+                "receptions":        2.5,   # must average 2.5+ catches/game
+                "fantasy_points":   10.0,
+            }
+
             if pb_auto_btn:
                 if not pb_auto_cats:
                     st.warning("Select at least one stat category.")
                 else:
-                    # Score every player × stat in the dataset
                     candidates = []
                     seen_pk = set()
                     for cat in pb_auto_cats:
                         col_key = CAT_MAP[cat.lower()][0]
-                        # Only consider players with enough data
+                        min_avg = _PB_MIN_AVG.get(col_key, 0.0)
                         for pname in nfl_df["player_name"].unique():
                             pk = (pname, cat)
                             if pk in seen_pk:
                                 continue
                             pdf = find_player(nfl_df, pname)
-                            if len(pdf) < 5:
-                                continue   # need min 5 games
+                            if len(pdf) < 8:
+                                continue   # need min 8 games for reliable stats
                             vals = pdf[col_key].values
                             wts  = pdf["weight"].values
                             w_avg = float(np.average(vals, weights=wts))
+                            # Skip backups / gadget players below the meaningful avg threshold
+                            if w_avg < min_avg:
+                                continue
                             # Project line near weighted avg
                             proj = w_avg
                             if col_key == "passing_yards":
@@ -4288,6 +4301,17 @@ if data_ok:
 
                                         # Weighted avg
                                         w_avg = float(np.average(vals, weights=wts))
+
+                                        # Skip backups — must meet minimum average for this stat
+                                        _sgp_min_avg = {
+                                            "passing_yards": 150.0, "passing_tds": 0.8,
+                                            "rush_yards": 35.0,     "rush_tds": 0.2,
+                                            "receiving_yards": 25.0,"receptions": 2.5,
+                                            "fantasy_points": 10.0,
+                                        }
+                                        if w_avg < _sgp_min_avg.get(col_key, 0.0):
+                                            continue
+
                                         # Matchup-adjusted projection
                                         proj = w_avg * matchup_factor
 
