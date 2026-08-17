@@ -9,7 +9,7 @@ Tabs
 2. Player Profile  – full game-log table + rolling-average trend line
 3. Team Overview   – fantasy-point bar chart per team + top players per team
 4. League Leaders  – sortable per-stat leaderboard
-5. Data Refresh    – scrape fresh data from the ESPN API without leaving the browser
+5. Data Refresh    – reload fresh data from nflverse without leaving the browser
 """
 
 import time
@@ -289,252 +289,109 @@ def _full_team_name_to_abbr(full: str) -> str:
     return _MAP.get(full, full[:3].upper())
 
 
-def _scrape_game(game_id, season, week, home, away):
-    data = _get_json(_ESPN_SUMMARY.format(game_id=game_id))
-    if not data:
-        return []
-    rows = []
-    for grp in data.get("boxscore", {}).get("players", []):
-        team = grp.get("team", {}).get("abbreviation", "UNK")
-        sbn  = {s["name"]: s for s in grp.get("statistics", [])}
-        aids = {}
-        for cat in sbn.values():
-            for e in cat.get("athletes", []):
-                a = e.get("athlete", {})
-                if a.get("id") and a["id"] not in aids:
-                    aids[a["id"]] = a.get("displayName", "Unknown")
-        for aid, name in aids.items():
-            row = dict(player_id=aid,
-                       game_id=f"{season}_{week:02d}_{away}_{home}",
-                       completions=0, attempts=0, passing_yards=0, passing_tds=0,
-                       interceptions=0, rush_attempts=0, rush_yards=0, rush_tds=0,
-                       receptions=0, targets=0, receiving_yards=0, receiving_tds=0,
-                       season=season, player_name=name, team=team)
-            for e in sbn.get("passing",   {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 5:
-                        c, a2 = _parse_ca(s[0])
-                        row.update(completions=c, attempts=a2,
-                                   passing_yards=_safe_int(s[1]),
-                                   passing_tds=_safe_int(s[3]),
-                                   interceptions=_safe_int(s[4]))
-                    break
-            for e in sbn.get("rushing",   {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 4:
-                        row.update(rush_attempts=_safe_int(s[0]),
-                                   rush_yards=_safe_int(s[1]),
-                                   rush_tds=_safe_int(s[3]))
-                    break
-            for e in sbn.get("receiving", {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 4:
-                        row.update(receptions=_safe_int(s[0]),
-                                   receiving_yards=_safe_int(s[1]),
-                                   receiving_tds=_safe_int(s[3]),
-                                   targets=_safe_int(s[5]) if len(s) >= 6 else 0)
-                    break
-            # Skip low-participation rows so backups/gadget players with minimal
-            # snaps don't pollute averages or prop recommendations.
-            # Rules (per game):
-            #   Passer:   must have ≥ 5 pass attempts
-            #   Rusher:   must have ≥ 3 rush attempts  (or any receiving involvement)
-            #   Receiver: must have ≥ 1 target
-            is_passer   = row["attempts"] > 0
-            is_rusher   = row["rush_attempts"] > 0
-            is_receiver = row["targets"] > 0 or row["receptions"] > 0
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA LOADING  —  nflverse (GitHub-hosted parquet, no API key needed)
+# Pulls player game logs for 2024 + 2025 directly from the nflverse data repo.
+# Falls back gracefully if a season file is not yet available.
+# ──────────────────────────────────────────────────────────────────────────────
 
-            if not is_passer and not is_rusher and not is_receiver:
-                continue   # no meaningful involvement at all
+# nflverse player game logs — one parquet per season
+_NFLVERSE_BASE = (
+    "https://github.com/nflverse/nflverse-data/releases/download"
+    "/player_stats/player_stats_{year}.parquet"
+)
 
-            if is_passer and not is_rusher and not is_receiver:
-                # Pure passer role — require at least 5 attempts to be meaningful
-                if row["attempts"] < 5:
-                    continue
+# nflverse → our internal column names
+_NV_COL_MAP = {
+    "player_id":          "player_id",
+    "player_display_name":"player_name",
+    "recent_team":        "team",
+    "season":             "season",
+    "week":               "week",
+    "completions":        "completions",
+    "attempts":           "attempts",
+    "passing_yards":      "passing_yards",
+    "passing_tds":        "passing_tds",
+    "interceptions":      "interceptions",
+    "carries":            "rush_attempts",
+    "rushing_yards":      "rush_yards",
+    "rushing_tds":        "rush_tds",
+    "receptions":         "receptions",
+    "targets":            "targets",
+    "receiving_yards":    "receiving_yards",
+    "receiving_tds":      "receiving_tds",
+    "fantasy_points_ppr": "fantasy_points",
+}
 
-            if is_rusher and not is_passer and not is_receiver:
-                # Pure rusher role — require at least 3 rush attempts
-                if row["rush_attempts"] < 3:
-                    continue
-            row["fantasy_points"] = round(_calc_fp(row), 4)
-            rows.append(row)
-    return rows
-
-def _scrape_season_live(year, progress_text=None):
-    """Scrape a full season into a DataFrame with no disk I/O."""
-    all_rows = []
-    for week in range(1, 19):
-        if progress_text:
-            progress_text.text(f"Scraping {year} — week {week}/18…")
-        data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
-        if not data:
-            continue
-        events = data.get("events", [])
-        if not events:
-            break
-        for event in events:
-            completed = (event.get("competitions", [{}])[0]
-                         .get("status", {}).get("type", {})
-                         .get("completed", False))
-            if not completed:
-                continue
-            gid   = event["id"]
-            comps = event.get("competitions", [{}])[0].get("competitors", [])
-            home = away = "UNK"
-            for c in comps:
-                ab = c.get("team", {}).get("abbreviation", "UNK")
-                if c.get("homeAway") == "home": home = ab
-                else: away = ab
-            all_rows.extend(_scrape_game(gid, year, week, home, away))
-            _time.sleep(0.35)
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows).drop_duplicates()
-    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
-
-
-
-# CSV bundled in the repo — instant load, no API calls needed
-_CSV_PATH = "final_nfl_2024_2025_player_game_logs.csv"
-
-# Columns the CSV pre-computes that we recalculate anyway — drop to avoid conflicts
-_CSV_DROP_COLS = [
-    "changed_team", "weight", "completion_percentage",
-    "yards_per_attempt", "yards_per_reception",
-    "pass_yards_over", "rush_yards_over", "rec_yards_over",
-    "last_3_pass_yards_avg", "last_3_rec_yards_avg", "last_3_rush_yards_avg",
-    "passing_yards_std_weighted",
-]
-
-def _load_csv_base() -> pd.DataFrame:
-    """Load the bundled CSV and return a clean base DataFrame."""
-    import os
-    if not os.path.exists(_CSV_PATH):
-        return pd.DataFrame()
-    df = pd.read_csv(_CSV_PATH, low_memory=False)
-    df.columns = df.columns.str.lower().str.strip()
-    drop = [c for c in _CSV_DROP_COLS if c in df.columns]
-    if drop:
-        df = df.drop(columns=drop)
-    return df.drop_duplicates().reset_index(drop=True)
-
-
-def _latest_week_in_df(df: pd.DataFrame, year: int) -> int:
-    """Return the highest week number already in df for the given year, or 0."""
-    if df.empty or "game_id" not in df.columns or "season" not in df.columns:
-        return 0
-    season_df = df[df["season"] == year]
-    if season_df.empty:
-        return 0
+def _load_nflverse_season(year: int) -> pd.DataFrame:
+    """Download one season of nflverse player game logs; return empty DF on failure."""
+    url = _NFLVERSE_BASE.format(year=year)
     try:
-        weeks = (
-            season_df["game_id"]
-            .str.split("_", expand=True)[1]
-            .dropna()
-            .astype(int)
+        import io
+        r = _requests.get(url, headers=_HEADERS, timeout=30)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        df = pd.read_parquet(io.BytesIO(r.content))
+        df.columns = df.columns.str.lower().str.strip()
+        # Keep only regular season + playoffs (season_type REG or POST)
+        if "season_type" in df.columns:
+            df = df[df["season_type"].isin(["REG", "POST"])]
+        # Rename to internal column names
+        keep = {k: v for k, v in _NV_COL_MAP.items() if k in df.columns}
+        df = df[list(keep.keys())].rename(columns=keep)
+        # Build game_id in the same format the rest of the app expects
+        if "week" in df.columns:
+            df["game_id"] = (
+                df["season"].astype(str) + "_"
+                + df["week"].astype(str).str.zfill(2) + "_"
+                + df["team"].astype(str)   # opponent not available here; use team
+            )
+            df = df.drop(columns=["week"])
+        # Fill numeric NaNs with 0
+        num_cols = df.select_dtypes(include="number").columns
+        df[num_cols] = df[num_cols].fillna(0)
+        df["player_name"] = df["player_name"].fillna("Unknown").str.strip()
+        df["team"]        = df["team"].fillna("UNK")
+        # Drop rows with zero meaningful involvement
+        meaningful = (
+            (df["attempts"]      >= 5) |
+            (df["rush_attempts"] >= 3) |
+            (df["targets"]       >= 1) |
+            (df["receptions"]    >= 1)
         )
-        return int(weeks.max()) if not weeks.empty else 0
+        df = df[meaningful].copy()
+        return df.drop_duplicates().reset_index(drop=True)
     except Exception:
-        return 0
-
-
-def _topup_from_espn(base_df: pd.DataFrame, year: int,
-                     start_week: int, progress_text=None) -> pd.DataFrame:
-    """Scrape weeks start_week..18 for year from ESPN and return new rows only."""
-    all_rows = []
-    known_ids = set(base_df["game_id"].unique()) if not base_df.empty else set()
-    for week in range(start_week, 19):
-        if progress_text:
-            progress_text.text(f"Updating {year} — week {week}/18…")
-        data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
-        if not data:
-            continue
-        events = data.get("events", [])
-        if not events:
-            break
-        for event in events:
-            completed = (event.get("competitions", [{}])[0]
-                         .get("status", {}).get("type", {})
-                         .get("completed", False))
-            if not completed:
-                continue
-            gid   = event["id"]
-            comps = event.get("competitions", [{}])[0].get("competitors", [])
-            home = away = "UNK"
-            for c in comps:
-                ab = c.get("team", {}).get("abbreviation", "UNK")
-                if c.get("homeAway") == "home": home = ab
-                else: away = ab
-            game_id_key = f"{year}_{week:02d}_{away}_{home}"
-            if game_id_key in known_ids:
-                continue   # already in CSV
-            new_rows = _scrape_game(gid, year, week, home, away)
-            all_rows.extend(new_rows)
-            _time.sleep(0.35)
-    if not all_rows:
         return pd.DataFrame()
-    return pd.DataFrame(all_rows).drop_duplicates()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (CSV base → top-up from ESPN for new weeks)
-# Instant on first load; only fetches weeks newer than what's in the CSV.
-# ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
     import datetime as _dt
     _today = _dt.date.today()
-    # NFL season starts in September, but 2025 season data should be tracked starting Jan 2025
-    # If we're past week 1 of the current calendar year, we're in the *next* NFL season
     if _today.month >= 9:
         _cur_year = _today.year
     elif _today.month >= 2:
-        _cur_year = _today.year  # Feb-Aug → current calendar year is current NFL season
+        _cur_year = _today.year
     else:
-        _cur_year = _today.year - 1  # Jan only → still in previous NFL season
+        _cur_year = _today.year - 1
     _prev_year = _cur_year - 1
 
-    msg  = st.empty()
-    prog = st.empty()
+    msg = st.empty()
 
-    # ── 1. Load CSV base (instant) ────────────────────────────────────────────
-    msg.info("Loading base data from CSV…")
-    base = _load_csv_base()
+    msg.info(f"Loading {_prev_year} season data…")
+    df_prev = _load_nflverse_season(_prev_year)
+
+    msg.info(f"Loading {_cur_year} season data…")
+    df_cur  = _load_nflverse_season(_cur_year)
+
     msg.empty()
 
-    # ── 2. Find the last week already in the CSV for each season ─────────────
-    prev_latest = _latest_week_in_df(base, _prev_year)
-    cur_latest  = _latest_week_in_df(base, _cur_year)
-
-    # Only fetch weeks we don't already have
-    prev_start = prev_latest + 1
-    cur_start  = cur_latest  + 1
-
-    new_prev = pd.DataFrame()
-    new_cur  = pd.DataFrame()
-
-    needs_update = prev_start <= 18 or cur_start <= 18
-    if needs_update:
-        # ── 3. Try ESPN for new weeks ─────────────────────────────────────────
-        msg.info(f"Checking for new games (week {cur_start}+)…")
-        new_prev = _topup_from_espn(base, _prev_year, prev_start, prog)
-        new_cur  = _topup_from_espn(base,  _cur_year,  cur_start, prog)
-        prog.empty()
-        msg.empty()
-
-    # ── 4. Combine CSV base + any new rows ────────────────────────────────────
-    frames = [f for f in [base, new_prev, new_cur] if not f.empty]
+    frames = [f for f in [df_prev, df_cur] if not f.empty]
     if not frames:
-        # Show detailed error info if ESPN calls failed
-        error_detail = ""
-        if hasattr(st.session_state, 'api_errors') and st.session_state.api_errors:
-            error_detail = "\n\n**ESPN API errors:**\n" + "\n".join(st.session_state.api_errors[-5:])
         raise RuntimeError(
-            "No data available. The bundled CSV is missing and ESPN is "
-            "unavailable. Try refreshing the page in a minute." + error_detail
+            "No data available. Could not load nflverse data from GitHub. "
+            "Check your internet connection and try refreshing the page."
         )
 
     combined = pd.concat(frames, ignore_index=True)
@@ -913,8 +770,8 @@ with st.spinner("Loading data…"):
     except Exception as e:
         st.error(
             f"**Data load failed:** {e}\n\n"
-            "If running locally, use the **Data Refresh** tab to scrape data first. "
-            "If this is a fresh cloud deploy, the ESPN API may be temporarily unavailable — "
+            "If running locally, use the **Data Refresh** tab to reload data first. "
+            "If this is a fresh cloud deploy, nflverse data may be temporarily unavailable — "
             "try refreshing the page in a minute."
         )
         data_ok = False
@@ -1559,9 +1416,9 @@ with main_settings:
 
         st.subheader("🔄 Data Refresh")
         st.markdown(
-            "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
-            "After 1 hour the cache expires and the next page load automatically "
-            "fetches the latest games — no action needed week-to-week."
+            "Data is pulled from **nflverse** (GitHub-hosted, no API key needed) "
+            "and cached for **1 hour**. After 1 hour the cache expires and the next "
+            "page load automatically fetches the latest data."
         )
         st.divider()
         c1, c2 = st.columns(2)
@@ -1569,9 +1426,9 @@ with main_settings:
             st.markdown("### ℹ️ How it works")
             st.markdown(
                 """
-- **First load of the day** → scrapes 2024 + 2025 from ESPN (~5 min)
-- **Everyone else within that hour** → instant load from cache
-- **After 1 hour** → cache expires, next visitor triggers a fresh scrape
+- **Source** → [nflverse player stats](https://github.com/nflverse/nflverse-data) (free, public, no key)
+- **First load** → downloads 2024 + 2025 parquet files (~10 seconds)
+- **Cache** → subsequent loads are instant for up to 1 hour
 - **New games** appear automatically the next time the cache refreshes
                 """
             )
