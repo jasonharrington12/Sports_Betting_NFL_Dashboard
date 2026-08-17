@@ -1765,6 +1765,45 @@ if data_ok:
                 "american_odds":  prob_to_american(implied),
             }
 
+        # ── Odds API key (module-level so both manual + auto-suggest use it) ──
+        _pb_secret_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+        pb_api_key = st.text_input(
+            "The Odds API key — optional (pre-fills real DraftKings lines)",
+            value=_pb_secret_key,
+            type="password",
+            key="pb_api_key",
+            placeholder="Leave blank to use model-projected lines",
+        )
+
+        # Fetch real lines once and share across manual + auto-suggest
+        pb_real_lines: dict = {}   # {player_name_lower: {cat: line}}
+        if pb_api_key.strip():
+            with st.spinner("Fetching live prop lines…"):
+                _pb_raw_props = fetch_odds_api_props(pb_api_key.strip())
+            for _rr in _pb_raw_props:
+                _k = _rr["player_raw"].lower().strip()
+                if _k not in pb_real_lines:
+                    pb_real_lines[_k] = {}
+                pb_real_lines[_k][_rr["cat"]] = _rr["line"]
+            if pb_real_lines:
+                st.success(
+                    f"✅ Live lines loaded for **{len(pb_real_lines)}** players "
+                    f"from {_pb_raw_props[0]['bookmaker'] if _pb_raw_props else 'book'} · cached 15 min"
+                )
+            else:
+                st.warning("Odds API returned no lines — using model-projected lines.")
+
+        def _pb_real_line(player_name: str, cat: str):
+            """Return real book line for a player+cat, or None."""
+            key = player_name.lower().strip()
+            line = pb_real_lines.get(key, {}).get(cat)
+            if line is None:
+                last = key.split()[-1]
+                for k, v in pb_real_lines.items():
+                    if k.endswith(last) and cat in v:
+                        return v[cat]
+            return line
+
         # ─────────────────────────────────────────────────────────────────────
         # LAYOUT: add-leg panel (left) | parlay slip (right)
         # ─────────────────────────────────────────────────────────────────────
@@ -1787,9 +1826,13 @@ if data_ok:
                 format_func=str.title,
                 key="pb_cat",
             )
+            # Pre-fill line from real book if API key is set
+            _pb_default_line = _pb_real_line(pb_player, pb_cat) or 200.5
             pb_line = st.number_input(
-                "Prop Line", min_value=0.0, value=200.5, step=0.5,
+                "Prop Line" + (" 📖" if _pb_real_line(pb_player, pb_cat) else " 📐"),
+                min_value=0.0, value=float(_pb_default_line), step=0.5,
                 format="%.1f", key="pb_line",
+                help="📖 = real book line  ·  📐 = model projection",
             )
             pb_weighted = st.toggle(
                 "Season weighting", value=True, key="pb_weighted"
@@ -1883,19 +1926,23 @@ if data_ok:
                             # Skip backups / gadget players below the meaningful avg threshold
                             if w_avg < min_avg:
                                 continue
-                            # Project line near weighted avg
-                            proj = w_avg
-                            if col_key == "passing_yards":
-                                incs = [i + 0.5 for i in range(50, 500, 25)]
-                            elif col_key in ("rush_yards", "receiving_yards"):
-                                incs = [i + 0.5 for i in range(0, 250, 10)]
-                            elif col_key == "receptions":
-                                incs = [i + 0.5 for i in range(0, 20, 1)]
-                            elif col_key == "passing_tds":
-                                incs = [0.5, 1.5, 2.5, 3.5]
+                            # Use real book line if available, else model projection
+                            real_line = _pb_real_line(pname, cat)
+                            if real_line is not None:
+                                line_val = real_line
                             else:
-                                incs = [i + 0.5 for i in range(0, 60, 5)]
-                            line_val = min(incs, key=lambda x: abs(x - proj))
+                                proj = w_avg
+                                if col_key == "passing_yards":
+                                    incs = [i + 0.5 for i in range(50, 500, 25)]
+                                elif col_key in ("rush_yards", "receiving_yards"):
+                                    incs = [i + 0.5 for i in range(0, 250, 10)]
+                                elif col_key == "receptions":
+                                    incs = [i + 0.5 for i in range(0, 20, 1)]
+                                elif col_key == "passing_tds":
+                                    incs = [0.5, 1.5, 2.5, 3.5]
+                                else:
+                                    incs = [i + 0.5 for i in range(0, 60, 5)]
+                                line_val = min(incs, key=lambda x: abs(x - proj))
                             # Score the leg
                             scored = score_leg(nfl_df, pname, cat, line_val, pb_weighted)
                             if scored is None:
