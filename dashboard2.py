@@ -506,7 +506,12 @@ def _tank01_game(game_id_raw: str, season: int, week: int,
 
 
 def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataFrame:
-    """Scrape a full NFL season via Tank01 — mirrors _scrape_season_live()."""
+    """
+    Scrape a full NFL season via Tank01.
+    Stops early as soon as a week has zero completed games (future weeks).
+    No sleep between requests — Tank01 handles concurrent calls fine and
+    the 1000 req/day limit is per-day not per-minute.
+    """
     all_rows = []
     for week in range(1, 19):
         if progress_text:
@@ -519,17 +524,22 @@ def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataF
             continue
         games = data.get("body", [])
         if not games:
+            break   # season hasn't started yet or no data for this week
+
+        completed = [
+            g for g in games
+            if g.get("gameStatus", "").lower() in ("final", "completed")
+        ]
+
+        # If a week has games listed but none completed, we've hit future weeks
+        if games and not completed:
             break
-        for game in games:
-            # Tank01 uses "Final" for completed games
-            status = game.get("gameStatus", "")
-            if status not in ("Final", "Completed", "final", "completed"):
-                continue
-            gid  = game.get("gameID", "")          # e.g. "20240907_BAL@KC"
+
+        for game in completed:
+            gid  = game.get("gameID", "")
             away = game.get("away", "UNK")
             home = game.get("home", "UNK")
             all_rows.extend(_tank01_game(gid, year, week, home, away, api_key))
-            _time.sleep(0.4)   # stay within free-tier rate limit
 
     if not all_rows:
         return pd.DataFrame()
@@ -537,18 +547,131 @@ def _tank01_season(year: int, progress_text=None, api_key: str = "") -> pd.DataF
     return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
 
 
+# CSV bundled in the repo — instant load, no API calls needed
+_CSV_PATH = "final_nfl_2024_2025_player_game_logs.csv"
+
+# Columns the CSV pre-computes that we recalculate anyway — drop to avoid conflicts
+_CSV_DROP_COLS = [
+    "changed_team", "weight", "completion_percentage",
+    "yards_per_attempt", "yards_per_reception",
+    "pass_yards_over", "rush_yards_over", "rec_yards_over",
+    "last_3_pass_yards_avg", "last_3_rec_yards_avg", "last_3_rush_yards_avg",
+    "passing_yards_std_weighted",
+]
+
+def _load_csv_base() -> pd.DataFrame:
+    """Load the bundled CSV and return a clean base DataFrame."""
+    import os
+    if not os.path.exists(_CSV_PATH):
+        return pd.DataFrame()
+    df = pd.read_csv(_CSV_PATH, low_memory=False)
+    df.columns = df.columns.str.lower().str.strip()
+    drop = [c for c in _CSV_DROP_COLS if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop)
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def _latest_week_in_df(df: pd.DataFrame, year: int) -> int:
+    """Return the highest week number already in df for the given year, or 0."""
+    if df.empty or "game_id" not in df.columns or "season" not in df.columns:
+        return 0
+    season_df = df[df["season"] == year]
+    if season_df.empty:
+        return 0
+    try:
+        weeks = (
+            season_df["game_id"]
+            .str.split("_", expand=True)[1]
+            .dropna()
+            .astype(int)
+        )
+        return int(weeks.max()) if not weeks.empty else 0
+    except Exception:
+        return 0
+
+
+def _topup_from_espn(base_df: pd.DataFrame, year: int,
+                     start_week: int, progress_text=None) -> pd.DataFrame:
+    """Scrape weeks start_week..18 for year from ESPN and return new rows only."""
+    all_rows = []
+    known_ids = set(base_df["game_id"].unique()) if not base_df.empty else set()
+    for week in range(start_week, 19):
+        if progress_text:
+            progress_text.text(f"Updating {year} — week {week}/18…")
+        data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
+        if not data:
+            continue
+        events = data.get("events", [])
+        if not events:
+            break
+        for event in events:
+            completed = (event.get("competitions", [{}])[0]
+                         .get("status", {}).get("type", {})
+                         .get("completed", False))
+            if not completed:
+                continue
+            gid   = event["id"]
+            comps = event.get("competitions", [{}])[0].get("competitors", [])
+            home = away = "UNK"
+            for c in comps:
+                ab = c.get("team", {}).get("abbreviation", "UNK")
+                if c.get("homeAway") == "home": home = ab
+                else: away = ab
+            game_id_key = f"{year}_{week:02d}_{away}_{home}"
+            if game_id_key in known_ids:
+                continue   # already in CSV
+            new_rows = _scrape_game(gid, year, week, home, away)
+            all_rows.extend(new_rows)
+            _time.sleep(0.35)
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows).drop_duplicates()
+
+
+def _topup_from_tank01(base_df: pd.DataFrame, year: int,
+                       start_week: int, api_key: str,
+                       progress_text=None) -> pd.DataFrame:
+    """Scrape weeks start_week..18 for year from Tank01 and return new rows only."""
+    all_rows = []
+    known_ids = set(base_df["game_id"].unique()) if not base_df.empty else set()
+    for week in range(start_week, 19):
+        if progress_text:
+            progress_text.text(f"Tank01 update {year} — week {week}/18…")
+        data = _tank01_get("/getNFLGamesForWeek",
+                           {"week": str(week), "seasonType": "reg",
+                            "season": str(year)},
+                           api_key)
+        if not data:
+            continue
+        games = data.get("body", [])
+        if not games:
+            break
+        completed = [g for g in games
+                     if g.get("gameStatus", "").lower() in ("final", "completed")]
+        if games and not completed:
+            break
+        for game in completed:
+            gid  = game.get("gameID", "")
+            away = game.get("away", "UNK")
+            home = game.get("home", "UNK")
+            game_id_key = f"{year}_{week:02d}_{away}_{home}"
+            if game_id_key in known_ids:
+                continue
+            new_rows = _tank01_game(gid, year, week, home, away, api_key)
+            all_rows.extend(new_rows)
+    if not all_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(all_rows).drop_duplicates()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (ESPN primary → Tank01 fallback)
-# ttl=3600 means: first visitor triggers a scrape, everyone else for the next
-# hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
-# any new games that were played.
+# DATA LOADING  (CSV base → top-up from ESPN or Tank01 for new weeks)
+# Instant on first load; only fetches weeks newer than what's in the CSV.
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
     import datetime as _dt
-    # Auto-detect current and previous NFL season years.
-    # NFL seasons straddle two calendar years: the 2025 season runs Sep 2025–Jan 2026.
-    # Jan–Aug = still the previous season year; Sep–Dec = new season year.
     _today = _dt.date.today()
     _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
     _prev_year = _cur_year - 1
@@ -556,45 +679,63 @@ def load_data():
     msg  = st.empty()
     prog = st.empty()
 
-    # ── 1. Try ESPN ───────────────────────────────────────────────────────────
-    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API… "
-             "this takes ~5 min on first load, then caches for 1 hour.")
-    df_prev = _scrape_season_live(_prev_year, prog)
-    df_cur  = _scrape_season_live(_cur_year,  prog)
-    prog.empty()
+    # ── 1. Load CSV base (instant) ────────────────────────────────────────────
+    msg.info("Loading base data from CSV…")
+    base = _load_csv_base()
     msg.empty()
 
-    # ── 2. Fall back to Tank01 if ESPN returned nothing ───────────────────────
-    if df_prev.empty and df_cur.empty:
-        t01_key = _tank01_key()
-        if t01_key:
-            msg.warning(
-                "ESPN API returned no data — falling back to **Tank01 NFL API** "
-                "(RapidAPI). Data may be slightly delayed."
-            )
-            df_prev = _tank01_season(_prev_year, prog, t01_key)
-            df_cur  = _tank01_season(_cur_year,  prog, t01_key)
-            prog.empty()
-            msg.empty()
+    # ── 2. Find the last week already in the CSV for each season ─────────────
+    prev_latest = _latest_week_in_df(base, _prev_year)
+    cur_latest  = _latest_week_in_df(base, _cur_year)
 
-    if df_prev.empty and df_cur.empty:
-        t01_key_check = _tank01_key()
-        if t01_key_check:
-            raise RuntimeError(
-                "ESPN API returned no data and Tank01 (RapidAPI) also returned no data. "
-                "Try refreshing the page in a minute."
-            )
-        else:
-            raise RuntimeError(
-                "ESPN API returned no data. It may be temporarily unavailable — "
-                "try refreshing the page in a minute. "
-                "Tank01 fallback is not active: add your RapidAPI key to Streamlit "
-                "secrets as  RAPIDAPI_KEY = \"your_key\"  to enable it."
-            )
+    # Only fetch weeks we don't already have
+    prev_start = prev_latest + 1
+    cur_start  = cur_latest  + 1
 
-    # Use whichever frames have data
-    df_2024 = df_prev if not df_prev.empty else pd.DataFrame(columns=df_cur.columns)
-    df_2025 = df_cur  if not df_cur.empty  else pd.DataFrame(columns=df_prev.columns)
+    new_prev = pd.DataFrame()
+    new_cur  = pd.DataFrame()
+
+    needs_update = prev_start <= 18 or cur_start <= 18
+    if needs_update:
+        # ── 3a. Try ESPN for new weeks ────────────────────────────────────────
+        msg.info(f"Checking for new games (week {cur_start}+)…")
+        new_prev = _topup_from_espn(base, _prev_year, prev_start, prog)
+        new_cur  = _topup_from_espn(base,  _cur_year,  cur_start, prog)
+        prog.empty()
+        msg.empty()
+
+        # ── 3b. If ESPN failed, try Tank01 ────────────────────────────────────
+        if new_prev.empty and new_cur.empty and cur_start <= 18:
+            t01_key = _tank01_key()
+            if t01_key:
+                msg.info(f"ESPN unavailable — checking Tank01 for new games…")
+                new_prev = _topup_from_tank01(base, _prev_year, prev_start, t01_key, prog)
+                new_cur  = _topup_from_tank01(base,  _cur_year,  cur_start, t01_key, prog)
+                prog.empty()
+                msg.empty()
+    else:
+        msg.empty()
+
+    # ── 4. Combine CSV base + any new rows ────────────────────────────────────
+    frames = [f for f in [base, new_prev, new_cur] if not f.empty]
+    if not frames:
+        raise RuntimeError(
+            "No data available. The bundled CSV is missing and ESPN/Tank01 "
+            "are both unavailable. Try refreshing the page in a minute."
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Split into per-season frames for the rest of load_data()
+    df_2024 = combined[combined["season"] == _prev_year].copy()
+    df_2025 = combined[combined["season"] == _cur_year].copy()
+
+    # Ensure columns are present even if one season is empty
+    ref_cols = combined.columns
+    if df_2024.empty:
+        df_2024 = pd.DataFrame(columns=ref_cols)
+    if df_2025.empty:
+        df_2025 = pd.DataFrame(columns=ref_cols)
 
     for df in [df_2024, df_2025]:
         df.columns = df.columns.str.lower().str.strip()
