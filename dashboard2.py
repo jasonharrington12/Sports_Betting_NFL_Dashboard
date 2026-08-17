@@ -1472,10 +1472,8 @@ with main_settings:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── MATCHUP EDGE (tab6 inside main_bet) ──────────────────────────────────────
-with tab6:
-    if not data_ok:
-        st.info("Load data first using the **Data Refresh** tab.")
-    else:
+if data_ok:
+    with tab6:
         # ── How it works ──────────────────────────────────────────────────────
         # "Defensive average" = how many yards / TDs that stat category's
         # position group has put up AGAINST each team on average.
@@ -1722,10 +1720,8 @@ with tab6:
 # ══════════════════════════════════════════════════════════════════════════════
 # PARLAY BUILDER (tab7 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab7:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab7:
         # ── session-state parlay list ─────────────────────────────────────────
         if "parlay_legs" not in st.session_state:
             st.session_state["parlay_legs"] = []   # list of dicts
@@ -2008,10 +2004,8 @@ with tab7:
 # ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab8:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab8:
         # ── helpers ───────────────────────────────────────────────────────────
         # build_defense_table and _COL_TO_POS are now at module level (above)
 
@@ -2720,10 +2714,8 @@ with tab8:
 # ══════════════════════════════════════════════════════════════════════════════
 # INJURY REPORT (tab9 inside main_teams)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab9:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab9:
         @st.cache_data(ttl=1800, show_spinner=False)  # refresh every 30 min
         def fetch_injuries():
             """Fetch current NFL injury report from ESPN API."""
@@ -2823,10 +2815,8 @@ with tab9:
 # ══════════════════════════════════════════════════════════════════════════════
 # HOME / AWAY SPLITS (tab10 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab10:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab10:
         @st.cache_data(show_spinner=False)
         def build_home_away(nfl):
             """Add is_home column: True if player's team is the home team in game_id."""
@@ -2946,10 +2936,8 @@ with tab10:
 # ══════════════════════════════════════════════════════════════════════════════
 # START / SIT ADVISOR (tab11 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab11:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab11:
         @st.cache_data(show_spinner=False)
         def build_opp_defense(nfl):
             df = nfl.copy()
@@ -3120,10 +3108,8 @@ with tab11:
 # Falls back to manual paste if no API key is set.
 # ══════════════════════════════════════════════════════════════════════════════
 
-with tab_vegas:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab_vegas:
         st.subheader("📈 Vegas Lines — Live Prop Odds")
         st.caption(
             "Pulls live NFL player prop lines from The Odds API (DraftKings / consensus) "
@@ -3951,10 +3937,8 @@ with main_tracker:
 # ══════════════════════════════════════════════════════════════════════════════
 # SAME-GAME PARLAY BUILDER  (tab_sgp inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_sgp:
-    if not data_ok:
-        st.info("Load data first using the **⚙️ Settings & Data** tab.")
-    else:
+if data_ok:
+    with tab_sgp:
         st.subheader("🏟️ Same-Game Parlay Builder")
         st.caption(
             "Pick a live or upcoming game, add prop legs for players in that game, "
