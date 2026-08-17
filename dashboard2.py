@@ -588,6 +588,11 @@ def load_data():
     nfl["weight"] = nfl.apply(_weight, axis=1)
 
     # ── efficiency metrics ─────────────────────────────────────────────────
+    # Cast to float64 first — nflverse parquet uses int32 which causes a
+    # hard ZeroDivisionError inside np.where (unlike int64/float64 which
+    # silently produce NaN).
+    nfl["attempts"]   = nfl["attempts"].astype("float64")
+    nfl["receptions"] = nfl["receptions"].astype("float64")
     nfl["completion_percentage"] = np.where(
         nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0
     )
