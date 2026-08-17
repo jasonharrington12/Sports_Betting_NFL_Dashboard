@@ -388,13 +388,20 @@ def _scrape_season_live(year, progress_text=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# nfl_data_py FALLBACK  (used when ESPN API is unavailable)
+# nflverse FALLBACK  (used when ESPN API is unavailable)
+# Reads the same parquet files that nfl_data_py wraps, but directly via
+# pandas — no extra package required, works with pandas 2.x.
+# Source: https://github.com/nflverse/nflverse-data/releases
 # ──────────────────────────────────────────────────────────────────────────────
-def _load_nfl_data_py(year: int) -> pd.DataFrame:
+_NFLVERSE_WEEKLY_URL = (
+    "https://github.com/nflverse/nflverse-data/releases/download/"
+    "player_stats/player_stats.parquet"
+)
+
+def _load_nflverse(year: int) -> pd.DataFrame:
     """
-    Pull weekly player stats for `year` via nfl_data_py and return a DataFrame
-    whose columns match the ESPN-scraped schema so the rest of the app is unaware
-    of the source switch.
+    Pull weekly player stats for `year` directly from the nflverse parquet
+    file and return a DataFrame whose columns match the ESPN-scraped schema.
 
     Column mapping:
         player_display_name → player_name
@@ -405,21 +412,25 @@ def _load_nfl_data_py(year: int) -> pd.DataFrame:
         game_id             → synthesised as "{year}_{week:02d}_nflverse"
     """
     try:
-        import nfl_data_py as _nfl
-    except ImportError:
-        return pd.DataFrame()
-
-    try:
-        df = _nfl.import_weekly_data([year])
+        df = pd.read_parquet(_NFLVERSE_WEEKLY_URL, engine="pyarrow")
     except Exception:
-        return pd.DataFrame()
+        try:
+            # fallback engine
+            df = pd.read_parquet(_NFLVERSE_WEEKLY_URL, engine="fastparquet")
+        except Exception:
+            return pd.DataFrame()
 
     if df.empty:
         return pd.DataFrame()
 
-    # Keep regular season only
+    # Filter to the requested year + regular season only
+    if "season" in df.columns:
+        df = df[df["season"] == year]
     if "season_type" in df.columns:
         df = df[df["season_type"] == "REG"]
+
+    if df.empty:
+        return pd.DataFrame()
 
     # Rename to match internal schema
     df = df.rename(columns={
@@ -430,20 +441,18 @@ def _load_nfl_data_py(year: int) -> pd.DataFrame:
         "rushing_tds":         "rush_tds",
     })
 
-    # Synthesise a game_id consistent with ESPN format "{year}_{week:02d}_nflverse"
+    # Synthesise game_id: "{year}_{week:02d}_nflverse"
     df["game_id"] = (
         df["season"].astype(str) + "_"
         + df["week"].astype(str).str.zfill(2) + "_nflverse"
     )
     df["season"] = year
 
-    # Map fantasy_points_ppr → fantasy_points (PPR scoring matches our _FP weights)
-    if "fantasy_points_ppr" in df.columns and "fantasy_points" not in df.columns:
-        df["fantasy_points"] = df["fantasy_points_ppr"]
-    elif "fantasy_points_ppr" in df.columns:
+    # Use PPR fantasy points (matches our _FP weight scheme)
+    if "fantasy_points_ppr" in df.columns:
         df["fantasy_points"] = df["fantasy_points_ppr"]
 
-    # Ensure all expected columns exist with 0 as default
+    # Ensure all required columns exist
     for col in ["completions", "attempts", "passing_yards", "passing_tds",
                 "interceptions", "rush_attempts", "rush_yards", "rush_tds",
                 "receptions", "targets", "receiving_yards", "receiving_tds",
@@ -456,11 +465,8 @@ def _load_nfl_data_py(year: int) -> pd.DataFrame:
     is_rusher   = df["rush_attempts"] > 0
     is_receiver = (df["targets"] > 0) | (df["receptions"] > 0)
 
-    mask = is_passer | is_rusher | is_receiver
-    df = df[mask].copy()
-    # Pure passer < 5 attempts → drop
+    df = df[is_passer | is_rusher | is_receiver].copy()
     df = df[~((is_passer & ~is_rusher & ~is_receiver) & (df["attempts"] < 5))]
-    # Pure rusher < 3 carries → drop
     df = df[~((is_rusher & ~is_passer & ~is_receiver) & (df["rush_attempts"] < 3))]
 
     keep = ["player_name", "team", "season", "game_id",
@@ -469,8 +475,6 @@ def _load_nfl_data_py(year: int) -> pd.DataFrame:
             "receptions", "targets", "receiving_yards", "receiving_tds",
             "fantasy_points"]
     df = df[[c for c in keep if c in df.columns]].copy()
-
-    # player_id not available from nfl_data_py per-weekly summary — use name as key
     df["player_id"] = df["player_name"]
 
     df = df.drop_duplicates()
@@ -512,8 +516,8 @@ def load_data():
             "ESPN API returned no data — falling back to **nfl_data_py** "
             "(nflverse). Data may lag by ~1 day after games."
         )
-        df_prev = _load_nfl_data_py(_prev_year)
-        df_cur  = _load_nfl_data_py(_cur_year)
+        df_prev = _load_nflverse(_prev_year)
+        df_cur  = _load_nflverse(_cur_year)
         msg.empty()
 
     if df_prev.empty and df_cur.empty:
