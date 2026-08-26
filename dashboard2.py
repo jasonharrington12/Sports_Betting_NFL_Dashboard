@@ -345,11 +345,11 @@ def get_depth_charts(highlightly_key: str = "", nfl: "pd.DataFrame | None" = Non
     """
     if highlightly_key.strip():
         data = fetch_highlightly_depth_charts(highlightly_key.strip())
-        if data:
+        if data and any(v for v in data.values()):
             return data
-    # Try ESPN free endpoint
+    # Try ESPN free endpoint — only use it if at least one team has actual players
     espn_data = fetch_all_depth_charts()
-    if espn_data:
+    if espn_data and any(v for v in espn_data.values()):
         return espn_data
     # Final fallback — build from game log (always available)
     if nfl is not None and not nfl.empty:
