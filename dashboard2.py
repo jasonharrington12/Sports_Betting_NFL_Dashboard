@@ -570,10 +570,14 @@ def _scrape_game(game_id, season, week, home, away):
             rows.append(row)
     return rows
 
-def _scrape_season_live(year, progress_text=None):
-    """Scrape a full season into a DataFrame with no disk I/O."""
+def _scrape_season_live(year, progress_text=None, from_week=1):
+    """
+    Scrape completed NFL games for `year` starting at `from_week`.
+    Stops as soon as a week has no completed games (avoids hammering
+    ESPN for future weeks).  Returns a DataFrame of player game rows.
+    """
     all_rows = []
-    for week in range(1, 19):
+    for week in range(from_week, 19):
         if progress_text:
             progress_text.text(f"Scraping {year} — week {week}/18…")
         data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
@@ -581,15 +585,17 @@ def _scrape_season_live(year, progress_text=None):
             continue
         events = data.get("events", [])
         if not events:
-            break
+            break   # season hasn't reached this week yet
+
+        completed_any = False
         for event in events:
-            completed = (event.get("competitions", [{}])[0]
-                         .get("status", {}).get("type", {})
-                         .get("completed", False))
+            comp = event.get("competitions", [{}])[0]
+            completed = comp.get("status", {}).get("type", {}).get("completed", False)
             if not completed:
                 continue
-            gid   = event["id"]
-            comps = event.get("competitions", [{}])[0].get("competitors", [])
+            completed_any = True
+            gid  = event["id"]
+            comps = comp.get("competitors", [])
             home = away = "UNK"
             for c in comps:
                 ab = c.get("team", {}).get("abbreviation", "UNK")
@@ -597,6 +603,11 @@ def _scrape_season_live(year, progress_text=None):
                 else: away = ab
             all_rows.extend(_scrape_game(gid, year, week, home, away))
             _time.sleep(0.35)
+
+        # Stop scraping forward weeks once we hit a week with zero completed games
+        if not completed_any:
+            break
+
     if not all_rows:
         return pd.DataFrame()
     df = pd.DataFrame(all_rows).drop_duplicates()
@@ -611,105 +622,151 @@ def _scrape_season_live(year, progress_text=None):
 # ──────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
+    """
+    Load 2024 + current-season NFL game logs from the ESPN API.
+
+    Cache TTL = 1 hour — new weeks appear automatically after the cache
+    expires.  The scraper stops at the first week with no completed games
+    so it never wastes requests on future weeks.
+
+    Returns (nfl_df, team_changes_df).
+    """
     import datetime as _dt
-    # Auto-detect current and previous NFL season years.
-    # NFL seasons straddle two calendar years: the 2025 season runs Sep 2025–Jan 2026.
-    # Jan–Aug = still the previous season year; Sep–Dec = new season year.
-    _today = _dt.date.today()
+
+    # NFL season year: Sep–Dec uses the current calendar year,
+    # Jan–Aug uses the previous calendar year (e.g. Jan 2026 → 2025 season).
+    _today     = _dt.date.today()
     _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
     _prev_year = _cur_year - 1
 
     msg  = st.empty()
     prog = st.empty()
-    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API... "
-             "this takes ~5 min on first load, then caches for 1 hour.")
+    msg.info(
+        f"Loading {_prev_year} + {_cur_year} NFL data from ESPN… "
+        "first load takes ~3–5 min, then caches for 1 hour."
+    )
+
     df_prev = _scrape_season_live(_prev_year, prog)
     df_cur  = _scrape_season_live(_cur_year,  prog)
+
     prog.empty()
     msg.empty()
 
-    # Current season may be empty before it starts (offseason) — that's fine
     if df_prev.empty and df_cur.empty:
         raise RuntimeError(
             "ESPN API returned no data. It may be temporarily unavailable — "
-            "try refreshing the page in a minute."
+            "try refreshing in a minute."
         )
 
-    # Use whichever frames have data
-    df_2024 = df_prev if not df_prev.empty else pd.DataFrame(columns=df_cur.columns)
-    df_2025 = df_cur  if not df_cur.empty  else pd.DataFrame(columns=df_prev.columns)
-
-    for df in [df_2024, df_2025]:
+    # Normalise columns
+    _COLS = [
+        "player_id", "game_id", "season", "player_name", "team",
+        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
+        "rush_attempts", "rush_yards", "rush_tds",
+        "receptions", "targets", "receiving_yards", "receiving_tds",
+        "fantasy_points",
+    ]
+    def _norm(df):
+        df = df.copy()
         df.columns = df.columns.str.lower().str.strip()
+        return df.drop_duplicates()
 
-    df_2024 = df_2024.drop_duplicates()
-    df_2025 = df_2025.drop_duplicates()
+    df_2024 = _norm(df_prev) if not df_prev.empty else pd.DataFrame(columns=_COLS)
+    df_2025 = _norm(df_cur)  if not df_cur.empty  else pd.DataFrame(columns=_COLS)
 
     # ── team-change detection ──────────────────────────────────────────────
-    teams_2024 = (
-        df_2024.sort_values("game_id").groupby("player_name")["team"]
-        .last().reset_index().rename(columns={"team": "team_2024"})
-    )
-    teams_2025 = (
-        df_2025.sort_values("game_id").groupby("player_name")["team"]
-        .last().reset_index().rename(columns={"team": "team_2025"})
-    )
-    team_changes = teams_2024.merge(teams_2025, on="player_name", how="inner")
-    team_changes["changed_team"] = team_changes["team_2024"] != team_changes["team_2025"]
+    # last team each player appeared for in each season
+    def _last_team(df, label):
+        return (
+            df.sort_values("game_id")
+            .groupby("player_name")["team"]
+            .last()
+            .rename(label)
+        )
 
-    # Only flag changed_team=True for players who actually changed.
-    # Use outer merge so players only in 2025 (rookies) also get the column.
+    t24 = _last_team(df_2024, "team_2024") if not df_2024.empty else pd.Series(name="team_2024", dtype=str)
+    t25 = _last_team(df_2025, "team_2025") if not df_2025.empty else pd.Series(name="team_2025", dtype=str)
+
+    # Use the CSV roster as ground truth for current team where available
+    _roster_current: dict[str, str] = {}   # player_name → current team
+    try:
+        import csv as _csv
+        with open(_ROSTER_CSV, newline="", encoding="utf-8") as _f:
+            for _r in _csv.DictReader(_f):
+                _n = _r.get("Player", "").strip()
+                _t = _CSV_TEAM_NORM.get(_r.get("Team","").strip(), _r.get("Team","").strip())
+                if _n and _t:
+                    _roster_current[_n] = _t
+    except FileNotFoundError:
+        pass
+
+    team_changes = pd.concat([t24, t25], axis=1).reset_index()
+    team_changes.columns = ["player_name", "team_2024", "team_2025"]
+    team_changes = team_changes.dropna(subset=["team_2024"])
+
+    # Override team_2025 from CSV when available (handles pre-season / no 2025 games yet)
+    team_changes["team_2025_csv"] = team_changes["player_name"].map(_roster_current)
+    team_changes["team_2025"] = team_changes["team_2025_csv"].combine_first(team_changes["team_2025"])
+    team_changes = team_changes.drop(columns=["team_2025_csv"])
+
+    team_changes["changed_team"] = (
+        team_changes["team_2024"].notna() &
+        team_changes["team_2025"].notna() &
+        (team_changes["team_2024"] != team_changes["team_2025"])
+    )
+
+    # Tag 2024 rows for players who changed teams (weight them lower)
     df_2024 = df_2024.merge(
         team_changes[["player_name", "changed_team"]], on="player_name", how="left"
     )
     df_2024["changed_team"] = df_2024["changed_team"].fillna(False)
-
-    # Give 2025 rows the column too (always False — they're playing for their current team)
-    df_2025["changed_team"] = False
+    df_2025["changed_team"] = False   # 2025 rows are always current team
 
     nfl = pd.concat([df_2024, df_2025], ignore_index=True)
     nfl["changed_team"] = nfl["changed_team"].fillna(False)
     nfl = nfl.sort_values(["player_name", "season", "game_id"]).reset_index(drop=True)
 
-    # ── season weights ─────────────────────────────────────────────────────
-    def _weight(row):
-        if row["season"] == 2025:
-            return 1.0
-        if row["season"] == 2024 and row.get("changed_team", False):
-            return 0.3
-        return 0.6
-
-    nfl["weight"] = nfl.apply(_weight, axis=1)
+    # ── season weights (vectorised — no row-by-row apply) ──────────────────
+    nfl["weight"] = np.select(
+        [
+            nfl["season"] == 2025,
+            (nfl["season"] == 2024) & nfl["changed_team"],
+        ],
+        [1.0, 0.3],
+        default=0.6,
+    )
 
     # ── efficiency metrics ─────────────────────────────────────────────────
     nfl["completion_percentage"] = np.where(
-        nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0
+        nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0.0
     )
     nfl["yards_per_attempt"] = np.where(
-        nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0
+        nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0.0
     )
     nfl["yards_per_reception"] = np.where(
-        nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0
+        nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0.0
     )
 
-    # ── rolling averages ───────────────────────────────────────────────────
+    # ── rolling 3-game averages (per player, chronological) ───────────────
     nfl = nfl.sort_values(["player_name", "season", "game_id"])
-    for col, new_col in [
+    for _col, _new in [
         ("passing_yards",   "last_3_pass_avg"),
         ("rush_yards",      "last_3_rush_avg"),
         ("receiving_yards", "last_3_rec_avg"),
         ("fantasy_points",  "last_3_fp_avg"),
     ]:
-        nfl[new_col] = (
-            nfl.groupby("player_name")[col]
+        nfl[_new] = (
+            nfl.groupby("player_name")[_col]
             .transform(lambda x: x.rolling(3, min_periods=1).mean())
         )
 
     # ── fill missing ───────────────────────────────────────────────────────
-    num_cols = nfl.select_dtypes(include="number").columns
-    cat_cols = nfl.select_dtypes(include="object").columns
-    nfl[num_cols] = nfl[num_cols].fillna(0)
-    nfl[cat_cols] = nfl[cat_cols].fillna("Unknown")
+    nfl[nfl.select_dtypes("number").columns] = (
+        nfl.select_dtypes("number").fillna(0)
+    )
+    nfl[nfl.select_dtypes("object").columns] = (
+        nfl.select_dtypes("object").fillna("Unknown")
+    )
     nfl["player_name"] = nfl["player_name"].str.strip()
 
     return nfl, team_changes
@@ -999,14 +1056,17 @@ def team_bar_chart(nfl, season, stat_col, stat_label):
 
 @st.cache_data(show_spinner=False)
 def build_defense_table(nfl):
-    """Add opponent column derived from game_id format 'YYYY_WW_AWAY_HOME'."""
-    df = nfl.copy()
-    def get_opp(row):
-        parts = str(row["game_id"]).split("_")
-        if len(parts) < 4: return "UNK"
-        away, home = parts[2], parts[3]
-        return home if row["team"] == away else away
-    df["opponent"] = df.apply(get_opp, axis=1)
+    """
+    Add an 'opponent' column derived from game_id 'YYYY_WW_AWAY_HOME'.
+    Vectorised — no row-by-row apply().
+    This single cached result is reused by all tabs (Matchup Edge,
+    Matchup Finder, Home/Away Splits, Start/Sit, Vegas Lines).
+    """
+    df    = nfl.copy()
+    parts = df["game_id"].str.split("_", expand=True)
+    away_col  = parts[2].fillna("UNK")
+    home_col  = parts[3].fillna("UNK")
+    df["opponent"] = np.where(df["team"] == away_col, home_col, away_col)
     return df
 
 # Stat column → relevant depth-chart positions
@@ -1074,19 +1134,7 @@ with main_bet:
             all_players  = sorted(nfl_df["player_name"].unique())
             all_teams_pa = ["None (skip matchup)"] + sorted(nfl_df["team"].dropna().unique().tolist())
             _pa_fmt = lambda n: _player_label(n, player_team_map)
-
-            # Build opponent defense lookup once (reuse Matchup Edge logic)
-            @st.cache_data(show_spinner=False)
-            def build_opp_pa(nfl):
-                df = nfl.copy()
-                def _opp(row):
-                    parts = str(row["game_id"]).split("_")
-                    if len(parts) < 4: return "UNK"
-                    away, home = parts[2], parts[3]
-                    return home if row["team"] == away else away
-                df["opponent"] = df.apply(_opp, axis=1)
-                return df
-            nfl_opp_pa = build_opp_pa(nfl_df)
+            nfl_opp_pa = build_defense_table(nfl_df)
 
             c_left, c_right = st.columns([1, 3])
             with c_left:
@@ -1820,21 +1868,7 @@ with tab6:
         # "{season}_{week}_{away}_{home}" to get opponent per row, then group
         # by opponent to get "avg yards allowed".
 
-        # ── build opponent column ─────────────────────────────────────────────
-        @st.cache_data(show_spinner=False)
-        def build_opponent_col(nfl):
-            df = nfl.copy()
-            # game_id format: "2024_01_NYJ_SF"  → away=NYJ, home=SF
-            def parse_opponent(row):
-                parts = str(row["game_id"]).split("_")
-                if len(parts) < 4:
-                    return "UNK"
-                away, home = parts[2], parts[3]
-                return home if row["team"] == away else away
-            df["opponent"] = df.apply(parse_opponent, axis=1)
-            return df
-
-        nfl_opp = build_opponent_col(nfl_df)
+        nfl_opp = build_defense_table(nfl_df)
 
         # ── controls ─────────────────────────────────────────────────────────
         me_col1, me_col2 = st.columns([1, 3])
@@ -2702,8 +2736,7 @@ with tab8:
                         proj = player_avg_display * matchup_factor
                         player_key = best["player_name"].lower().strip()
                         real_line = mf_real_lines.get(player_key, {}).get(
-                            CAT_MAP[mf_stat.lower()][1].lower()  # try label first
-                            if False else mf_stat.lower(),        # use cat key
+                            mf_stat.lower()
                         )
                         # Also try partial name match (handles "Patrick Mahomes" vs "P. Mahomes")
                         if real_line is None:
@@ -3166,20 +3199,12 @@ with tab10:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        @st.cache_data(show_spinner=False)
-        def build_home_away(nfl):
-            """Add is_home column: True if player's team is the home team in game_id."""
-            df = nfl.copy()
-            def _is_home(row):
-                parts = str(row["game_id"]).split("_")
-                if len(parts) < 4:
-                    return None
-                home_team = parts[3]
-                return row["team"] == home_team
-            df["is_home"] = df.apply(_is_home, axis=1)
-            return df
-
-        nfl_ha = build_home_away(nfl_df)
+        # Reuse the shared opponent table; derive is_home from the opponent column
+        _nfl_ha_base = build_defense_table(nfl_df)
+        _ha_parts = _nfl_ha_base["game_id"].str.split("_", expand=True)
+        _nfl_ha_base = _nfl_ha_base.copy()
+        _nfl_ha_base["is_home"] = _nfl_ha_base["team"] == _ha_parts[3].fillna("")
+        nfl_ha = _nfl_ha_base
         all_players_ha = sorted(nfl_df["player_name"].unique())
 
         st.subheader("🏠 Home / Away Splits")
@@ -3290,18 +3315,7 @@ with tab11:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        @st.cache_data(show_spinner=False)
-        def build_opp_defense(nfl):
-            df = nfl.copy()
-            def get_opp(row):
-                parts = str(row["game_id"]).split("_")
-                if len(parts) < 4: return "UNK"
-                away, home = parts[2], parts[3]
-                return home if row["team"] == away else away
-            df["opponent"] = df.apply(get_opp, axis=1)
-            return df
-
-        nfl_ss = build_opp_defense(nfl_df)
+        nfl_ss = build_defense_table(nfl_df)
         all_players_ss = sorted(nfl_df["player_name"].unique())
         all_teams_ss   = sorted(nfl_df["team"].unique())
         _ss_fmt = lambda n: _player_label(n, player_team_map)
@@ -3474,18 +3488,7 @@ with tab_vegas:
             "Free tier: 500 requests/month · lines refresh every 15 min."
         )
 
-        # ── Build opponent lookup once (shared) ───────────────────────────────
-        @st.cache_data(show_spinner=False)
-        def _build_opp_vl(nfl):
-            df = nfl.copy()
-            def _opp(row):
-                parts = str(row["game_id"]).split("_")
-                if len(parts) < 4: return "UNK"
-                away, home = parts[2], parts[3]
-                return home if row["team"] == away else away
-            df["opponent"] = df.apply(_opp, axis=1)
-            return df
-        nfl_vl_opp = _build_opp_vl(nfl_df)
+        nfl_vl_opp = build_defense_table(nfl_df)
 
         # ── Shared scoring helper ─────────────────────────────────────────────
         def _score_parsed_rows(parsed_rows, vl_weighted, vl_window, vl_opp_mode, vl_min_edge):
