@@ -133,45 +133,95 @@ _TEAM_IDS = {
 # Positions relevant for prop betting
 _PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
 
-# CSV abbr → internal app abbr
+# CSV abbr → internal app abbr (kept for load_data team-change detection)
 _CSV_TEAM_NORM = {"JAC": "JAX", "LAR": "LA", "LVR": "LV"}
 
-# Statuses that mean a player is unavailable (IR, PUP, etc.)
+# Statuses that mean a player is unavailable
 _INACTIVE_STATUSES = {"IR", "PUP", "R, IR"}
 
 _ROSTER_CSV = _os.path.join(_os.path.dirname(__file__), "nfl_rosters_with_positions.csv")
 
+# ESPN team abbreviation → numeric ID (all 32 teams)
+_TEAM_IDS = {
+    "ARI": 22, "ATL": 1,  "BAL": 33, "BUF": 2,  "CAR": 29, "CHI": 3,
+    "CIN": 4,  "CLE": 5,  "DAL": 6,  "DEN": 7,  "DET": 8,  "GB":  9,
+    "HOU": 34, "IND": 11, "JAX": 30, "KC":  12, "LV":  13, "LAC": 24,
+    "LA":  14, "MIA": 15, "MIN": 16, "NE":  17, "NO":  18, "NYG": 19,
+    "NYJ": 20, "PHI": 21, "PIT": 23, "SF":  25, "SEA": 26, "TB":  27,
+    "TEN": 10, "WAS": 28,
+}
+
+@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours
 def fetch_all_depth_charts():
     """
-    Build depth charts from the local nfl_rosters_with_positions.csv file.
-    Row order within each team+position group is the depth chart order.
-    Players with Status IR / PUP are flagged with 🔴.
+    Pull live NFL depth charts from ESPN's official depthcharts endpoint.
+      GET /nfl/teams/{id}/depthcharts  →  3WR 1TE scheme, players in rank order
+
+    displayName is directly on each athlete object (not nested under 'athlete').
+    Falls back to the local CSV if ESPN returns no data for a team.
 
     Returns:
         { "NE": { "QB": ["Drake Maye", ...], "RB": [...], "WR": [...], "TE": [...] },
           "KC": { ... }, ... }
     """
-    import csv as _csv
-    result = {}
+    # Build CSV lookup as fallback
+    csv_fallback: dict = {}
     try:
+        import csv as _csv
         with open(_ROSTER_CSV, newline="", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            for row in reader:
+            for row in _csv.DictReader(f):
                 pos    = row.get("Position", "").strip()
                 if pos not in _PROP_POSITIONS:
                     continue
-                abbr   = row.get("Team", "").strip()
-                abbr   = _CSV_TEAM_NORM.get(abbr, abbr)
+                abbr   = _CSV_TEAM_NORM.get(row.get("Team","").strip(), row.get("Team","").strip())
                 name   = row.get("Player", "").strip()
                 status = row.get("Status", "").strip()
                 if not name or not abbr:
                     continue
-                team_chart = result.setdefault(abbr, {})
-                bucket     = team_chart.setdefault(pos, [])
-                display    = f"{name} 🔴" if status in _INACTIVE_STATUSES else name
-                bucket.append(display)
+                tc = csv_fallback.setdefault(abbr, {})
+                display = f"{name} 🔴" if status in _INACTIVE_STATUSES else name
+                tc.setdefault(pos, []).append(display)
     except FileNotFoundError:
-        return {}
+        pass
+
+    result = {}
+    for abbr, team_id in _TEAM_IDS.items():
+        url  = (
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+            f"/teams/{team_id}/depthcharts"
+        )
+        data = _get_json(url)
+        schemes = (data or {}).get("depthchart", [])
+
+        # Prefer the 3WR 1TE pass-heavy scheme; fall back to first scheme
+        scheme = next(
+            (s for s in schemes if "3WR" in s.get("name", "").upper()),
+            schemes[0] if schemes else None,
+        )
+
+        if scheme is None:
+            result[abbr] = csv_fallback.get(abbr, {})
+            continue
+
+        team_chart: dict = {}
+        for pos_data in scheme["positions"].values():
+            pos_abbr = pos_data.get("position", {}).get("abbreviation", "")
+            if pos_abbr not in _PROP_POSITIONS:
+                continue
+            # Athletes are in rank order; displayName is directly on the athlete object
+            athletes = sorted(pos_data.get("athletes", []), key=lambda a: a.get("rank", 99))
+            existing = team_chart.get(pos_abbr, [])
+            for a in athletes:
+                name = a.get("displayName", "").strip()
+                if name and name not in existing:
+                    existing.append(name)
+            if existing:
+                team_chart[pos_abbr] = existing
+
+        # Use ESPN data if it has players, otherwise fall back to CSV
+        result[abbr] = team_chart if any(team_chart.values()) else csv_fallback.get(abbr, {})
+        _time.sleep(0.05)
+
     return result
 
 
