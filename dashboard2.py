@@ -64,7 +64,7 @@ C_TREND = "#7c5cd8"
 # ──────────────────────────────────────────────────────────────────────────────
 # ESPN API HELPERS  +  ODDS API HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-import re as _re, time as _time, requests as _requests
+import re as _re, time as _time, requests as _requests, os as _os
 
 # ── Odds API market map (must be defined before fetch_odds_api_props) ─────────
 _ODDS_MARKET_MAP = {
@@ -133,69 +133,47 @@ _TEAM_IDS = {
 # Positions relevant for prop betting
 _PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
 
-@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours
+# CSV abbr → internal app abbr
+_CSV_TEAM_NORM = {"JAC": "JAX", "LAR": "LA", "LVR": "LV"}
+
+# Statuses that mean a player is unavailable (IR, PUP, etc.)
+_INACTIVE_STATUSES = {"IR", "PUP", "R, IR"}
+
+_ROSTER_CSV = _os.path.join(_os.path.dirname(__file__), "nfl_rosters_with_positions.csv")
+
+@st.cache_data(show_spinner=False)   # no TTL — reload only when CSV changes
 def fetch_all_depth_charts():
     """
-    Pull the current NFL rosters from ESPN's reliable public endpoints:
-      GET /nfl/teams               → all 32 teams with id + abbreviation
-      GET /nfl/teams/{id}/roster   → full roster grouped by position
+    Build depth charts from the local nfl_rosters_with_positions.csv file.
+    Row order within each team+position group is the depth chart order.
+    Players with Status IR / PUP are included but flagged — callers can filter.
 
     Returns:
         { "NE": { "QB": ["Drake Maye", ...], "RB": [...], "WR": [...], "TE": [...] },
           "KC": { ... }, ... }
-    Players are in roster order (jersey number order within each position group).
     """
-    # Step 1 — fetch all team IDs and abbreviations
-    teams_data = _get_json(
-        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
-    )
-    if not teams_data:
-        return {}
-
-    teams_list = (
-        teams_data.get("sports", [{}])[0]
-        .get("leagues", [{}])[0]
-        .get("teams", [])
-    )
-    if not teams_list:
-        return {}
-
+    import csv as _csv
     result = {}
-    for entry in teams_list:
-        team = entry.get("team", {})
-        abbr    = team.get("abbreviation", "")
-        team_id = team.get("id", "")
-        if not abbr or not team_id:
-            continue
-
-        # Normalise ESPN abbrs to our internal codes
-        abbr = _TEAM_NORM.get(abbr, abbr)
-
-        # Step 2 — fetch roster for this team
-        roster_data = _get_json(
-            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-            f"/teams/{team_id}/roster"
-        )
-        if not roster_data:
-            result[abbr] = {}
-            continue
-
-        team_chart: dict = {}
-        for grp in roster_data.get("athletes", []):
-            for player in grp.get("items", []):
-                pos = player.get("position", {}).get("abbreviation", "")
+    try:
+        with open(_ROSTER_CSV, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                pos    = row.get("Position", "").strip()
                 if pos not in _PROP_POSITIONS:
                     continue
-                name = player.get("fullName", "").strip()
-                if not name:
+                abbr   = row.get("Team", "").strip()
+                abbr   = _CSV_TEAM_NORM.get(abbr, abbr)   # normalise to app codes
+                name   = row.get("Player", "").strip()
+                status = row.get("Status", "").strip()
+                if not name or not abbr:
                     continue
-                bucket = team_chart.setdefault(pos, [])
-                if name not in bucket:
-                    bucket.append(name)
-
-        result[abbr] = team_chart
-        _time.sleep(0.05)   # be polite
-
+                team_chart = result.setdefault(abbr, {})
+                bucket     = team_chart.setdefault(pos, [])
+                # append with optional injury flag so UI can show it
+                display    = f"{name} 🔴" if status in _INACTIVE_STATUSES else name
+                bucket.append(display)
+    except FileNotFoundError:
+        return {}
     return result
 
 
