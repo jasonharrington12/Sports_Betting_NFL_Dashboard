@@ -136,59 +136,65 @@ _PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
 @st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours
 def fetch_all_depth_charts():
     """
-    Pull the current depth chart for all 32 NFL teams from ESPN.
-    Returns a dict:
-        { "NE": { "QB": ["Drake Maye", "Tommy DeVito"],
-                  "RB": ["Rhamondre Stevenson", ...],
-                  "WR": ["Ja'Lynn Polk", ...],
-                  "TE": ["Hunter Henry", ...] },
+    Pull the current NFL rosters from ESPN's reliable public endpoints:
+      GET /nfl/teams               → all 32 teams with id + abbreviation
+      GET /nfl/teams/{id}/roster   → full roster grouped by position
+
+    Returns:
+        { "NE": { "QB": ["Drake Maye", ...], "RB": [...], "WR": [...], "TE": [...] },
           "KC": { ... }, ... }
-    Uses the 3WR 1TE offensive scheme (most common); falls back to any scheme.
-    Players are ordered starter-first (rank 1, 2, 3…).
+    Players are in roster order (jersey number order within each position group).
     """
+    # Step 1 — fetch all team IDs and abbreviations
+    teams_data = _get_json(
+        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams"
+    )
+    if not teams_data:
+        return {}
+
+    teams_list = (
+        teams_data.get("sports", [{}])[0]
+        .get("leagues", [{}])[0]
+        .get("teams", [])
+    )
+    if not teams_list:
+        return {}
+
     result = {}
-    for abbr, team_id in _TEAM_IDS.items():
-        url = (
+    for entry in teams_list:
+        team = entry.get("team", {})
+        abbr    = team.get("abbreviation", "")
+        team_id = team.get("id", "")
+        if not abbr or not team_id:
+            continue
+
+        # Normalise ESPN abbrs to our internal codes
+        abbr = _TEAM_NORM.get(abbr, abbr)
+
+        # Step 2 — fetch roster for this team
+        roster_data = _get_json(
             f"https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-            f"/teams/{team_id}/depthcharts"
+            f"/teams/{team_id}/roster"
         )
-        data = _get_json(url)
-        if not data:
+        if not roster_data:
             result[abbr] = {}
             continue
 
-        schemes = data.get("depthchart", [])
-        # Prefer the 3WR 1TE pass-heavy scheme; fall back to first scheme
-        scheme = next(
-            (s for s in schemes if "WR" in s.get("name", "").upper()),
-            schemes[0] if schemes else None,
-        )
-        if scheme is None:
-            result[abbr] = {}
-            continue
-
-        positions = scheme.get("positions", {})
-        team_chart = {}
-        for pos_data in positions.values():
-            pos_abbr = pos_data.get("position", {}).get("abbreviation", "")
-            if pos_abbr not in _PROP_POSITIONS:
-                continue
-            # Athletes are already in depth order; sort by rank to be safe
-            athletes = sorted(
-                pos_data.get("athletes", []),
-                key=lambda a: a.get("rank", 99),
-            )
-            names = [a.get("displayName", "") for a in athletes if a.get("displayName")]
-            if names:
-                # WR can appear multiple times (WR1/WR2/WR3 slots) — merge & dedupe
-                existing = team_chart.get(pos_abbr, [])
-                for n in names:
-                    if n not in existing:
-                        existing.append(n)
-                team_chart[pos_abbr] = existing
+        team_chart: dict = {}
+        for grp in roster_data.get("athletes", []):
+            for player in grp.get("items", []):
+                pos = player.get("position", {}).get("abbreviation", "")
+                if pos not in _PROP_POSITIONS:
+                    continue
+                name = player.get("fullName", "").strip()
+                if not name:
+                    continue
+                bucket = team_chart.setdefault(pos, [])
+                if name not in bucket:
+                    bucket.append(name)
 
         result[abbr] = team_chart
-        _time.sleep(0.1)   # be polite to ESPN
+        _time.sleep(0.05)   # be polite
 
     return result
 
