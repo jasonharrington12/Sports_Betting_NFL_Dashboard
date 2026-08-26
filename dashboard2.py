@@ -9,7 +9,7 @@ Tabs
 2. Player Profile  – full game-log table + rolling-average trend line
 3. Team Overview   – fantasy-point bar chart per team + top players per team
 4. League Leaders  – sortable per-stat leaderboard
-5. Data Refresh    – reload fresh data from nflverse without leaving the browser
+5. Data Refresh    – scrape fresh data from the ESPN API without leaving the browser
 """
 
 import time
@@ -78,7 +78,7 @@ _ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
 
 _ESPN_SCOREBOARD = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-    "?seasontype=2&week={week}&season={year}"
+    "?seasontype=2&week={week}&dates={year}"
 )
 _ESPN_SUMMARY = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
@@ -105,17 +105,8 @@ def _get_json(url):
         r = _requests.get(url, headers=_HEADERS, timeout=15)
         if r.status_code == 200:
             return r.json()
-        # Surface non-200 status codes for debugging
-        if hasattr(st, 'session_state'):
-            if 'api_errors' not in st.session_state:
-                st.session_state.api_errors = []
-            st.session_state.api_errors.append(f"ESPN API {r.status_code}: {url[:80]}...")
-    except Exception as e:
-        # Surface exceptions for debugging
-        if hasattr(st, 'session_state'):
-            if 'api_errors' not in st.session_state:
-                st.session_state.api_errors = []
-            st.session_state.api_errors.append(f"ESPN request failed: {e}")
+    except Exception:
+        pass
     return None
 
 # Normalise ESPN schedule abbreviations → what's stored in the CSV game logs
@@ -200,6 +191,160 @@ def fetch_all_depth_charts():
         _time.sleep(0.1)   # be polite to ESPN
 
     return result
+
+
+# ── Highlightly abbreviation → our internal team code ────────────────────────
+# Highlightly uses full city/name slugs; we map them to the same abbrs used
+# everywhere else in this app so the depth charts slot straight in.
+_HIGHLIGHTLY_TEAM_MAP = {
+    # Full display names that Highlightly may return → our abbr
+    "Arizona Cardinals":       "ARI", "Atlanta Falcons":      "ATL",
+    "Baltimore Ravens":        "BAL", "Buffalo Bills":        "BUF",
+    "Carolina Panthers":       "CAR", "Chicago Bears":        "CHI",
+    "Cincinnati Bengals":      "CIN", "Cleveland Browns":     "CLE",
+    "Dallas Cowboys":          "DAL", "Denver Broncos":       "DEN",
+    "Detroit Lions":           "DET", "Green Bay Packers":    "GB",
+    "Houston Texans":          "HOU", "Indianapolis Colts":   "IND",
+    "Jacksonville Jaguars":    "JAX", "Kansas City Chiefs":   "KC",
+    "Las Vegas Raiders":       "LV",  "Los Angeles Chargers": "LAC",
+    "Los Angeles Rams":        "LA",  "Miami Dolphins":       "MIA",
+    "Minnesota Vikings":       "MIN", "New England Patriots": "NE",
+    "New Orleans Saints":      "NO",  "New York Giants":      "NYG",
+    "New York Jets":           "NYJ", "Philadelphia Eagles":  "PHI",
+    "Pittsburgh Steelers":     "PIT", "San Francisco 49ers":  "SF",
+    "Seattle Seahawks":        "SEA", "Tampa Bay Buccaneers": "TB",
+    "Tennessee Titans":        "TEN", "Washington Commanders":"WAS",
+}
+
+# Position name variants Highlightly may return → our prop positions
+_HL_POS_MAP = {
+    "quarterback": "QB", "qb": "QB",
+    "running back": "RB", "rb": "RB", "halfback": "RB", "fullback": "RB",
+    "wide receiver": "WR", "wr": "WR",
+    "tight end": "TE", "te": "TE",
+}
+
+
+@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours — same as ESPN depth charts
+def fetch_highlightly_depth_charts(api_key: str) -> dict:
+    """
+    Pull current NFL depth charts from the Highlightly API.
+
+    Endpoint pattern (from their docs):
+      GET https://sports.highlightly.net/american-football/teams?leagueId=1
+        → list of teams with id, name, shortName
+      GET https://sports.highlightly.net/american-football/teams/{id}/squad
+        → players list with position and depthChartOrder / order
+
+    Returns the same shape as fetch_all_depth_charts():
+        { "NE": { "QB": ["Drake Maye", ...], "WR": [...], ... }, ... }
+
+    Falls back gracefully on any network / key error — callers treat an
+    empty dict the same as ESPN returning no data.
+    """
+    base     = "https://sports.highlightly.net/american-football"
+    headers  = {"x-api-key": api_key, "User-Agent": "Mozilla/5.0"}
+
+    def _hl_get(url):
+        try:
+            r = _requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
+    # Step 1 — fetch all NFL teams (leagueId=1 is NFL)
+    teams_data = _hl_get(f"{base}/teams?leagueId=1")
+    if not teams_data:
+        return {}
+
+    # Highlightly may return {"teams": [...]} or a bare list
+    teams_list = teams_data if isinstance(teams_data, list) else teams_data.get("teams", [])
+    if not teams_list:
+        return {}
+
+    result = {}
+
+    for team in teams_list:
+        full_name  = team.get("name", "") or team.get("fullName", "")
+        short_name = team.get("shortName", "") or team.get("abbreviation", "")
+
+        # Map to our internal abbreviation
+        abbr = _HIGHLIGHTLY_TEAM_MAP.get(full_name)
+        if abbr is None:
+            # Try short name directly (e.g. "NE", "KC")
+            abbr = short_name.upper() if short_name else None
+        if abbr is None:
+            continue
+
+        team_id = team.get("id")
+        if team_id is None:
+            continue
+
+        # Step 2 — fetch squad/depth chart for this team
+        squad_data = _hl_get(f"{base}/teams/{team_id}/squad")
+        if not squad_data:
+            result[abbr] = {}
+            continue
+
+        players_list = (
+            squad_data if isinstance(squad_data, list)
+            else squad_data.get("players", squad_data.get("squad", []))
+        )
+
+        team_chart: dict[str, list] = {}
+        # Sort by depthChartOrder / order ascending so starter comes first
+        try:
+            players_list = sorted(
+                players_list,
+                key=lambda p: int(p.get("depthChartOrder", p.get("order", 99)) or 99),
+            )
+        except Exception:
+            pass
+
+        for player in players_list:
+            # Position can be nested {"name": "Quarterback"} or a plain string
+            raw_pos = player.get("position", {})
+            if isinstance(raw_pos, dict):
+                pos_str = (raw_pos.get("name", "") or raw_pos.get("abbreviation", "")).lower()
+            else:
+                pos_str = str(raw_pos).lower()
+
+            pos = _HL_POS_MAP.get(pos_str)
+            if pos is None:
+                continue   # not a prop-relevant position
+
+            name = (
+                player.get("name")
+                or player.get("displayName")
+                or player.get("fullName")
+                or ""
+            ).strip()
+            if not name:
+                continue
+
+            bucket = team_chart.setdefault(pos, [])
+            if name not in bucket:
+                bucket.append(name)
+
+        result[abbr] = team_chart
+        _time.sleep(0.05)   # be polite
+
+    return result
+
+
+def get_depth_charts(highlightly_key: str = "") -> dict:
+    """
+    Dispatcher: use Highlightly when a key is provided, else fall back to ESPN.
+    This is the single call site used by all tabs.
+    """
+    if highlightly_key.strip():
+        data = fetch_highlightly_depth_charts(highlightly_key.strip())
+        if data:
+            return data
+    # Fallback (or no key) → ESPN free endpoint
+    return fetch_all_depth_charts()
 
 
 @st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
@@ -289,60 +434,148 @@ def _full_team_name_to_abbr(full: str) -> str:
     return _MAP.get(full, full[:3].upper())
 
 
+def _scrape_game(game_id, season, week, home, away):
+    data = _get_json(_ESPN_SUMMARY.format(game_id=game_id))
+    if not data:
+        return []
+    rows = []
+    for grp in data.get("boxscore", {}).get("players", []):
+        team = grp.get("team", {}).get("abbreviation", "UNK")
+        sbn  = {s["name"]: s for s in grp.get("statistics", [])}
+        aids = {}
+        for cat in sbn.values():
+            for e in cat.get("athletes", []):
+                a = e.get("athlete", {})
+                if a.get("id") and a["id"] not in aids:
+                    aids[a["id"]] = a.get("displayName", "Unknown")
+        for aid, name in aids.items():
+            row = dict(player_id=aid,
+                       game_id=f"{season}_{week:02d}_{away}_{home}",
+                       completions=0, attempts=0, passing_yards=0, passing_tds=0,
+                       interceptions=0, rush_attempts=0, rush_yards=0, rush_tds=0,
+                       receptions=0, targets=0, receiving_yards=0, receiving_tds=0,
+                       season=season, player_name=name, team=team)
+            for e in sbn.get("passing",   {}).get("athletes", []):
+                if e["athlete"]["id"] == aid:
+                    s = e.get("stats", [])
+                    if len(s) >= 5:
+                        c, a2 = _parse_ca(s[0])
+                        row.update(completions=c, attempts=a2,
+                                   passing_yards=_safe_int(s[1]),
+                                   passing_tds=_safe_int(s[3]),
+                                   interceptions=_safe_int(s[4]))
+                    break
+            for e in sbn.get("rushing",   {}).get("athletes", []):
+                if e["athlete"]["id"] == aid:
+                    s = e.get("stats", [])
+                    if len(s) >= 4:
+                        row.update(rush_attempts=_safe_int(s[0]),
+                                   rush_yards=_safe_int(s[1]),
+                                   rush_tds=_safe_int(s[3]))
+                    break
+            for e in sbn.get("receiving", {}).get("athletes", []):
+                if e["athlete"]["id"] == aid:
+                    s = e.get("stats", [])
+                    if len(s) >= 4:
+                        row.update(receptions=_safe_int(s[0]),
+                                   receiving_yards=_safe_int(s[1]),
+                                   receiving_tds=_safe_int(s[3]),
+                                   targets=_safe_int(s[5]) if len(s) >= 6 else 0)
+                    break
+            # Skip low-participation rows so backups/gadget players with minimal
+            # snaps don't pollute averages or prop recommendations.
+            # Rules (per game):
+            #   Passer:   must have ≥ 5 pass attempts
+            #   Rusher:   must have ≥ 3 rush attempts  (or any receiving involvement)
+            #   Receiver: must have ≥ 1 target
+            is_passer   = row["attempts"] > 0
+            is_rusher   = row["rush_attempts"] > 0
+            is_receiver = row["targets"] > 0 or row["receptions"] > 0
+
+            if not is_passer and not is_rusher and not is_receiver:
+                continue   # no meaningful involvement at all
+
+            if is_passer and not is_rusher and not is_receiver:
+                # Pure passer role — require at least 5 attempts to be meaningful
+                if row["attempts"] < 5:
+                    continue
+
+            if is_rusher and not is_passer and not is_receiver:
+                # Pure rusher role — require at least 3 rush attempts
+                if row["rush_attempts"] < 3:
+                    continue
+            row["fantasy_points"] = round(_calc_fp(row), 4)
+            rows.append(row)
+    return rows
+
+def _scrape_season_live(year, progress_text=None):
+    """Scrape a full season into a DataFrame with no disk I/O."""
+    all_rows = []
+    for week in range(1, 19):
+        if progress_text:
+            progress_text.text(f"Scraping {year} — week {week}/18…")
+        data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
+        if not data:
+            continue
+        events = data.get("events", [])
+        if not events:
+            break
+        for event in events:
+            completed = (event.get("competitions", [{}])[0]
+                         .get("status", {}).get("type", {})
+                         .get("completed", False))
+            if not completed:
+                continue
+            gid   = event["id"]
+            comps = event.get("competitions", [{}])[0].get("competitors", [])
+            home = away = "UNK"
+            for c in comps:
+                ab = c.get("team", {}).get("abbreviation", "UNK")
+                if c.get("homeAway") == "home": home = ab
+                else: away = ab
+            all_rows.extend(_scrape_game(gid, year, week, home, away))
+            _time.sleep(0.35)
+    if not all_rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_rows).drop_duplicates()
+    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  —  CSV (generated by scrape_data.py, run locally)
-# The dashboard reads the committed CSV instantly.
-# scrape_data.py uses the ESPN core API from your local machine where it is
-# not blocked, and saves results to final_nfl_2024_2025_player_game_logs.csv.
+# DATA LOADING  (ESPN API only — cached for 1 hour so data stays fresh)
+# ttl=3600 means: first visitor triggers a scrape, everyone else for the next
+# hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
+# any new games that were played.
 # ──────────────────────────────────────────────────────────────────────────────
-
-_CSV_PATH = "final_nfl_2024_2025_player_game_logs.csv"
-
-_CSV_DROP_COLS = [
-    "changed_team", "weight", "completion_percentage",
-    "yards_per_attempt", "yards_per_reception",
-    "pass_yards_over", "rush_yards_over", "rec_yards_over",
-    "last_3_pass_yards_avg", "last_3_rec_yards_avg", "last_3_rush_yards_avg",
-    "passing_yards_std_weighted",
-]
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
-    import os, datetime as _dt
+    import datetime as _dt
+    # Auto-detect current and previous NFL season years.
+    # NFL seasons straddle two calendar years: the 2025 season runs Sep 2025–Jan 2026.
+    # Jan–Aug = still the previous season year; Sep–Dec = new season year.
     _today = _dt.date.today()
-    if _today.month >= 9:
-        _cur_year = _today.year
-    elif _today.month >= 2:
-        _cur_year = _today.year
-    else:
-        _cur_year = _today.year - 1
+    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
     _prev_year = _cur_year - 1
 
-    if not os.path.exists(_CSV_PATH):
+    msg  = st.empty()
+    prog = st.empty()
+    msg.info(f"Loading {_prev_year} + {_cur_year} data from ESPN API... "
+             "this takes ~5 min on first load, then caches for 1 hour.")
+    df_prev = _scrape_season_live(_prev_year, prog)
+    df_cur  = _scrape_season_live(_cur_year,  prog)
+    prog.empty()
+    msg.empty()
+
+    # Current season may be empty before it starts (offseason) — that's fine
+    if df_prev.empty and df_cur.empty:
         raise RuntimeError(
-            "Data file not found. Run `python scrape_data.py` locally "
-            "to generate final_nfl_2024_2025_player_game_logs.csv, "
-            "then commit and push it to your repo."
+            "ESPN API returned no data. It may be temporarily unavailable — "
+            "try refreshing the page in a minute."
         )
 
-    df = pd.read_csv(_CSV_PATH, low_memory=False)
-    df.columns = df.columns.str.lower().str.strip()
-    drop = [c for c in _CSV_DROP_COLS if c in df.columns]
-    if drop:
-        df = df.drop(columns=drop)
-    combined = df.drop_duplicates().reset_index(drop=True)
-
-    # Split into per-season frames for the rest of load_data()
-    df_2024 = combined[combined["season"] == _prev_year].copy()
-    df_2025 = combined[combined["season"] == _cur_year].copy()
-
-    # Ensure columns are present even if one season is empty
-    ref_cols = combined.columns
-    if df_2024.empty:
-        df_2024 = pd.DataFrame(columns=ref_cols)
-    if df_2025.empty:
-        df_2025 = pd.DataFrame(columns=ref_cols)
+    # Use whichever frames have data
+    df_2024 = df_prev if not df_prev.empty else pd.DataFrame(columns=df_cur.columns)
+    df_2025 = df_cur  if not df_cur.empty  else pd.DataFrame(columns=df_prev.columns)
 
     for df in [df_2024, df_2025]:
         df.columns = df.columns.str.lower().str.strip()
@@ -387,18 +620,15 @@ def load_data():
     nfl["weight"] = nfl.apply(_weight, axis=1)
 
     # ── efficiency metrics ─────────────────────────────────────────────────
-    # Use pandas divide() with fill_value=0 — this avoids np.where entirely
-    # and never triggers numexpr, so int32/float32 zero-denominators are
-    # handled safely regardless of the data source.
-    att  = pd.to_numeric(nfl["attempts"],      errors="coerce").fillna(0)
-    rec  = pd.to_numeric(nfl["receptions"],    errors="coerce").fillna(0)
-    comp = pd.to_numeric(nfl["completions"],   errors="coerce").fillna(0)
-    pyd  = pd.to_numeric(nfl["passing_yards"], errors="coerce").fillna(0)
-    reyd = pd.to_numeric(nfl["receiving_yards"], errors="coerce").fillna(0)
-
-    nfl["completion_percentage"] = comp.where(att == 0, comp / att.replace(0, np.nan)).fillna(0)
-    nfl["yards_per_attempt"]     = pyd.where( att == 0, pyd  / att.replace(0, np.nan)).fillna(0)
-    nfl["yards_per_reception"]   = reyd.where(rec == 0, reyd / rec.replace(0, np.nan)).fillna(0)
+    nfl["completion_percentage"] = np.where(
+        nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0
+    )
+    nfl["yards_per_attempt"] = np.where(
+        nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0
+    )
+    nfl["yards_per_reception"] = np.where(
+        nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0
+    )
 
     # ── rolling averages ───────────────────────────────────────────────────
     nfl = nfl.sort_values(["player_name", "season", "game_id"])
@@ -426,6 +656,39 @@ def load_data():
 # ──────────────────────────────────────────────────────────────────────────────
 # SHARED HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def build_player_team_map(nfl):
+    """
+    Returns a dict {player_name: current_team} where current_team is:
+      - the team from the player's most recent 2025 game, or
+      - the team from the player's most recent 2024 game if no 2025 data exists.
+    Used to show players on their new teams in dropdowns and headers.
+    """
+    p25 = (
+        nfl[nfl["season"] == 2025]
+        .sort_values("game_id")
+        .groupby("player_name")["team"]
+        .last()
+    )
+    p24 = (
+        nfl[nfl["season"] == 2024]
+        .sort_values("game_id")
+        .groupby("player_name")["team"]
+        .last()
+    )
+    # Combine: 2025 takes priority over 2024
+    combined = p24.to_dict()
+    combined.update(p25.to_dict())
+    return combined
+
+
+def _player_label(name, team_map):
+    """Return 'Player Name (TEAM)' display label for a selectbox."""
+    team = team_map.get(name, "")
+    return f"{name} ({team})" if team else name
+
+
 def find_player(nfl, name):
     return nfl[nfl["player_name"].str.contains(name, case=False, na=False)]
 
@@ -703,12 +966,13 @@ st.caption("Live data via ESPN API  ·  2024 + 2025 regular seasons  ·  PPR sco
 with st.spinner("Loading data…"):
     try:
         nfl_df, team_changes = load_data()
+        player_team_map = build_player_team_map(nfl_df)
         data_ok = True
     except Exception as e:
         st.error(
             f"**Data load failed:** {e}\n\n"
-            "If running locally, use the **Data Refresh** tab to reload data first. "
-            "If this is a fresh cloud deploy, nflverse data may be temporarily unavailable — "
+            "If running locally, use the **Data Refresh** tab to scrape data first. "
+            "If this is a fresh cloud deploy, the ESPN API may be temporarily unavailable — "
             "try refreshing the page in a minute."
         )
         data_ok = False
@@ -747,6 +1011,7 @@ with main_bet:
         with tab1:
             all_players  = sorted(nfl_df["player_name"].unique())
             all_teams_pa = ["None (skip matchup)"] + sorted(nfl_df["team"].dropna().unique().tolist())
+            _pa_fmt = lambda n: _player_label(n, player_team_map)
 
             # Build opponent defense lookup once (reuse Matchup Edge logic)
             @st.cache_data(show_spinner=False)
@@ -767,6 +1032,7 @@ with main_bet:
                 player_sel = st.selectbox(
                     "Player", all_players,
                     index=all_players.index("Drake Maye") if "Drake Maye" in all_players else 0,
+                    format_func=_pa_fmt,
                     key="pa_player",
                 )
                 cat_sel = st.selectbox(
@@ -1079,12 +1345,14 @@ with main_players:
         # ── PLAYER PROFILE ────────────────────────────────────────────────────
         with tab2:
             all_players2 = sorted(nfl_df["player_name"].unique())
+            _pp_fmt = lambda n: _player_label(n, player_team_map)
             col_a, col_b = st.columns([1, 4])
             with col_a:
                 st.subheader("Player")
                 pp_player = st.selectbox(
                     "Select player", all_players2,
                     index=all_players2.index("Drake Maye") if "Drake Maye" in all_players2 else 0,
+                    format_func=_pp_fmt,
                     key="pp_player",
                 )
                 pp_cat = st.selectbox(
@@ -1099,11 +1367,19 @@ with main_players:
                     st.error("Player not found.")
                 else:
                     full = pdf["player_name"].iloc[0]
-                    team = pdf.sort_values("game_id")["team"].iloc[-1]
+                    # Show current team (most recent 2025 game, or latest 2024)
+                    team = player_team_map.get(full) or pdf.sort_values("game_id")["team"].iloc[-1]
                     p24  = pdf[pdf["season"] == 2024]
                     p25  = pdf[pdf["season"] == 2025]
 
-                    st.subheader(f"{full}  ·  {team}")
+                    # Check for team change and note old team
+                    old_team = p24["team"].iloc[-1] if not p24.empty else None
+                    team_change_note = (
+                        f" _(was {old_team} in 2024)_"
+                        if old_team and old_team != team and not p25.empty
+                        else ""
+                    )
+                    st.subheader(f"{full}  ·  {team}{team_change_note}")
                     h1, h2, h3, h4, h5 = st.columns(5)
                     h1.metric("Games (2025)", len(p25))
                     h2.metric("Games (2024)", len(p24))
@@ -1271,13 +1547,20 @@ with main_teams:
         # ── DEPTH CHARTS ─────────────────────────────────────────────────────
         with tab_depth:
             st.subheader("📋 Current NFL Depth Charts")
-            st.caption("Live from ESPN · QB / RB / WR / TE starters & backups · cached 6 hours")
+            _hl_active = bool(st.session_state.get("highlightly_key", ""))
+            st.caption(
+                ("📋 **Highlightly** depth charts active · QB / RB / WR / TE · cached 6 hrs  "
+                 "_(set key in ⚙️ Settings → 🔑 API Keys)_")
+                if _hl_active else
+                "Live from ESPN · QB / RB / WR / TE starters & backups · cached 6 hours  "
+                "_(add a Highlightly key in ⚙️ Settings → 🔑 API Keys for richer data)_"
+            )
 
-            with st.spinner("Loading depth charts for all 32 teams…"):
-                dc_data = fetch_all_depth_charts()
+            with st.spinner("Loading depth charts…"):
+                dc_data = get_depth_charts(st.session_state.get("highlightly_key", ""))
 
             if not dc_data:
-                st.warning("Could not load depth charts from ESPN. Try again in a moment.")
+                st.warning("Could not load depth charts. Try again in a moment.")
             else:
                 dc_c1, dc_c2 = st.columns([1, 3])
                 with dc_c1:
@@ -1345,35 +1628,38 @@ with main_teams:
 # MAIN TAB 4 — SETTINGS & DATA
 # Sub-tabs: Data Refresh
 # ══════════════════════════════════════════════════════════════════════════════
+# Initialise Highlightly key from secrets or session state (persists across reruns)
+if "highlightly_key" not in st.session_state:
+    _hl_secret = st.secrets.get("HIGHLIGHTLY_API_KEY", "") if hasattr(st, "secrets") else ""
+    st.session_state["highlightly_key"] = _hl_secret
+
 with main_settings:
-    tab5, = st.tabs(["🔄 Data Refresh"])
+    tab5, tab_keys = st.tabs(["🔄 Data Refresh", "🔑 API Keys"])
 
     with tab5:
         import datetime as _dt
 
         st.subheader("🔄 Data Refresh")
         st.markdown(
-            "Data loads instantly from a committed CSV file. "
-            "To update with new games, run **`python scrape_data.py`** locally, "
-            "then commit and push the updated CSV."
+            "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
+            "After 1 hour the cache expires and the next page load automatically "
+            "fetches the latest games — no action needed week-to-week."
         )
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### ℹ️ How to update data")
+            st.markdown("### ℹ️ How it works")
             st.markdown(
                 """
-1. Run locally: `python scrape_data.py`
-2. It fetches only new weeks from ESPN (skips what you already have)
-3. Commit & push: `git add final_nfl_2024_2025_player_game_logs.csv && git push`
-4. Streamlit Cloud redeploys automatically
-- **Full rescrape:** `python scrape_data.py --full`
-- **One season:** `python scrape_data.py --year 2025`
+- **First load of the day** → scrapes 2024 + 2025 from ESPN (~5 min)
+- **Everyone else within that hour** → instant load from cache
+- **After 1 hour** → cache expires, next visitor triggers a fresh scrape
+- **New games** appear automatically the next time the cache refreshes
                 """
             )
         with c2:
-            st.markdown("### ⚡ Reload Cache")
-            st.caption("Force the app to re-read the CSV (useful after a fresh deploy).")
+            st.markdown("### ⚡ Manual Refresh")
+            st.caption("Force a fresh scrape right now — useful after a big game or if data looks out of date.")
             if data_ok:
                 season_counts = nfl_df.groupby("season")["game_id"].nunique()
                 for season, games in season_counts.items():
@@ -1391,6 +1677,66 @@ with main_settings:
                 time.sleep(0.5)
                 st.rerun()
 
+    with tab_keys:
+        st.subheader("🔑 API Keys")
+        st.caption(
+            "API keys are stored in your browser session only — they are never written to disk. "
+            "You can also set them permanently in your Streamlit **secrets.toml** file."
+        )
+
+        st.markdown("#### 📋 Highlightly — Depth Charts")
+        st.markdown(
+            "The [Highlightly NFL API](https://highlightly.net/nfl-api/documentation/) provides "
+            "up-to-date team rosters and depth charts. When a key is set, **all tabs** (Depth Charts, "
+            "Matchup Finder, SGP Builder, Auto-Parlay) use Highlightly instead of the ESPN fallback."
+        )
+
+        hl_key_input = st.text_input(
+            "Highlightly API key",
+            value=st.session_state["highlightly_key"],
+            type="password",
+            key="hl_key_input",
+            placeholder="Paste your Highlightly API key here",
+        )
+        hl_save = st.button("💾 Save & Test Key", type="primary", key="hl_save")
+
+        if hl_save:
+            st.session_state["highlightly_key"] = hl_key_input.strip()
+            if hl_key_input.strip():
+                with st.spinner("Testing Highlightly API key…"):
+                    test_result = fetch_highlightly_depth_charts(hl_key_input.strip())
+                if test_result:
+                    n_teams = sum(1 for v in test_result.values() if v)
+                    st.success(
+                        f"✅ Key works — depth chart data returned for **{n_teams}** teams. "
+                        "All tabs will now use Highlightly depth charts."
+                    )
+                else:
+                    st.error(
+                        "Key saved but the API returned no data. "
+                        "Check that your key is correct and has NFL access. "
+                        "The app will fall back to ESPN depth charts until this is resolved."
+                    )
+            else:
+                st.info("Key cleared — the app will use ESPN depth charts.")
+
+        if st.session_state["highlightly_key"]:
+            st.success("✅ Highlightly key is active — depth charts sourced from Highlightly.")
+        else:
+            st.info("No Highlightly key set — using ESPN depth charts (free, no key required).")
+
+        st.divider()
+        st.markdown("#### 📈 The Odds API — Live Prop Lines")
+        st.caption(
+            "Set `ODDS_API_KEY` in your **secrets.toml** or paste it in the Vegas Lines tab. "
+            "500 free requests/month at [the-odds-api.com](https://the-odds-api.com)."
+        )
+        _odds_active = bool(st.secrets.get("ODDS_API_KEY", "")) if hasattr(st, "secrets") else False
+        if _odds_active:
+            st.success("✅ Odds API key found in secrets.")
+        else:
+            st.info("No Odds API key in secrets — use the Vegas Lines tab to paste a key per session.")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONTENT BLOCKS FOR SUB-TABS DECLARED INSIDE main_bet / main_players / main_teams
@@ -1398,8 +1744,10 @@ with main_settings:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── MATCHUP EDGE (tab6 inside main_bet) ──────────────────────────────────────
-if data_ok:
-    with tab6:
+with tab6:
+    if not data_ok:
+        st.info("Load data first using the **Data Refresh** tab.")
+    else:
         # ── How it works ──────────────────────────────────────────────────────
         # "Defensive average" = how many yards / TDs that stat category's
         # position group has put up AGAINST each team on average.
@@ -1433,11 +1781,13 @@ if data_ok:
         with me_col1:
             st.subheader("Matchup Setup")
 
+            _me_all = sorted(nfl_df["player_name"].unique())
             me_player = st.selectbox(
                 "Player",
-                sorted(nfl_df["player_name"].unique()),
-                index=sorted(nfl_df["player_name"].unique()).index("Drake Maye")
-                if "Drake Maye" in nfl_df["player_name"].values else 0,
+                _me_all,
+                index=_me_all.index("Drake Maye")
+                if "Drake Maye" in _me_all else 0,
+                format_func=lambda n: _player_label(n, player_team_map),
                 key="me_player",
             )
             me_cat = st.selectbox(
@@ -1646,13 +1996,16 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # PARLAY BUILDER (tab7 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab7:
+with tab7:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         # ── session-state parlay list ─────────────────────────────────────────
         if "parlay_legs" not in st.session_state:
             st.session_state["parlay_legs"] = []   # list of dicts
 
         all_players_pb = sorted(nfl_df["player_name"].unique())
+        _pb_fmt = lambda n: _player_label(n, player_team_map)
 
         # ── PARLAY MATH HELPERS ───────────────────────────────────────────────
         def american_to_prob(odds: int) -> float:
@@ -1700,12 +2053,6 @@ if data_ok:
             """
             Returns a dict with hit_rate (%), weighted_avg, recommendation,
             implied_prob for this leg based on historical data.
-
-            Accuracy improvements:
-            - Sample size confidence: shrinks implied prob toward 50% for small samples
-            - Variance penalty: high-σ players get probability pulled toward 50%
-            - UNDER threshold: requires 60%+ raw hit rate before recommending UNDER
-              (books shade lines above median, so UNDER is harder to hit)
             """
             col = CAT_MAP[category.lower()][0]
             pdf = find_player(nfl, player_name)
@@ -1714,95 +2061,31 @@ if data_ok:
 
             vals = pdf[col].values
             wts  = pdf["weight"].values
-            n    = len(vals)
 
-            if use_weighted and n > 0:
-                w_avg = float(np.average(vals, weights=wts))
-                w_hit = float(np.average((vals > line).astype(float), weights=wts))
+            if use_weighted:
+                w_avg = np.average(vals, weights=wts)
+                w_hit = np.average((vals > line).astype(float), weights=wts)
             else:
-                w_avg = float(vals.mean()) if n > 0 else 0.0
-                w_hit = float((vals > line).mean()) if n > 0 else 0.5
+                w_avg = vals.mean()
+                w_hit = (vals > line).mean()
 
-            # ── Sample size confidence: blend toward 50% for small samples ──────
-            # At n=1 → 50% weight on prior; at n=10+ → full weight on data
-            prior_weight = max(0.0, 1.0 - n / 10.0)
-            w_hit_adj = w_hit * (1 - prior_weight) + 0.5 * prior_weight
-
-            # ── Variance penalty: high σ relative to line shrinks edge ───────────
-            if n >= 3:
-                std = float(np.std(vals))
-                cv  = std / (line + 1e-6)   # coefficient of variation vs line
-                var_penalty = min(0.15, cv * 0.05)   # max 15% pull toward 50%
-                w_hit_adj = w_hit_adj * (1 - var_penalty) + 0.5 * var_penalty
-
-            # ── Direction: require 60%+ hit rate to call UNDER ───────────────────
-            # Books shade lines above median so UNDER needs more edge to be +EV
-            if w_hit_adj >= 0.55:
-                rec = "OVER"
-            elif (1 - w_hit_adj) >= 0.60:
-                rec = "UNDER"
-            else:
-                # Weak signal — still pick the better side but flag low confidence
-                rec = "OVER" if w_hit_adj >= 0.5 else "UNDER"
-
-            implied = w_hit_adj if rec == "OVER" else 1 - w_hit_adj
+            rec = "OVER" if w_avg > line else "UNDER"
+            # implied prob: if bet OVER, use hit rate; if UNDER use (1 - hit rate)
+            implied = w_hit if rec == "OVER" else 1 - w_hit
+            # cap between 11% and 89% → American odds stay within ±800/+600
             implied = max(0.111, min(0.889, implied))
 
-            # ── Last 3 games trend ───────────────────────────────────────────────
-            last3_avg = float(pdf[col].tail(3).mean()) if n >= 3 else w_avg
-
             return {
-                "player":         pdf["player_name"].iloc[0],
-                "category":       category,
-                "line":           line,
-                "col":            col,
-                "w_avg":          round(w_avg, 1),
-                "last3_avg":      round(last3_avg, 1),
-                "hit_rate_pct":   round(w_hit * 100, 1),       # raw hit rate for display
-                "sample_size":    n,
+                "player":      pdf["player_name"].iloc[0],
+                "category":    category,
+                "line":        line,
+                "col":         col,
+                "w_avg":       round(float(w_avg), 1),
+                "hit_rate_pct": round(float(w_hit) * 100, 1),
                 "recommendation": rec,
-                "implied_prob":   round(implied, 4),
-                "american_odds":  prob_to_american(implied),
+                "implied_prob": round(implied, 4),
+                "american_odds": prob_to_american(implied),
             }
-
-        # ── Odds API key (module-level so both manual + auto-suggest use it) ──
-        _pb_secret_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
-        pb_api_key = st.text_input(
-            "The Odds API key — optional (pre-fills real DraftKings lines)",
-            value=_pb_secret_key,
-            type="password",
-            key="pb_api_key",
-            placeholder="Leave blank to use model-projected lines",
-        )
-
-        # Fetch real lines once and share across manual + auto-suggest
-        pb_real_lines: dict = {}   # {player_name_lower: {cat: line}}
-        if pb_api_key.strip():
-            with st.spinner("Fetching live prop lines…"):
-                _pb_raw_props = fetch_odds_api_props(pb_api_key.strip())
-            for _rr in _pb_raw_props:
-                _k = _rr["player_raw"].lower().strip()
-                if _k not in pb_real_lines:
-                    pb_real_lines[_k] = {}
-                pb_real_lines[_k][_rr["cat"]] = _rr["line"]
-            if pb_real_lines:
-                st.success(
-                    f"✅ Live lines loaded for **{len(pb_real_lines)}** players "
-                    f"from {_pb_raw_props[0]['bookmaker'] if _pb_raw_props else 'book'} · cached 15 min"
-                )
-            else:
-                st.warning("Odds API returned no lines — using model-projected lines.")
-
-        def _pb_real_line(player_name: str, cat: str):
-            """Return real book line for a player+cat, or None."""
-            key = player_name.lower().strip()
-            line = pb_real_lines.get(key, {}).get(cat)
-            if line is None:
-                last = key.split()[-1]
-                for k, v in pb_real_lines.items():
-                    if k.endswith(last) and cat in v:
-                        return v[cat]
-            return line
 
         # ─────────────────────────────────────────────────────────────────────
         # LAYOUT: add-leg panel (left) | parlay slip (right)
@@ -1818,6 +2101,7 @@ if data_ok:
                 all_players_pb,
                 index=all_players_pb.index("Drake Maye")
                 if "Drake Maye" in all_players_pb else 0,
+                format_func=_pb_fmt,
                 key="pb_player",
             )
             pb_cat = st.selectbox(
@@ -1826,13 +2110,9 @@ if data_ok:
                 format_func=str.title,
                 key="pb_cat",
             )
-            # Pre-fill line from real book if API key is set
-            _pb_default_line = _pb_real_line(pb_player, pb_cat) or 200.5
             pb_line = st.number_input(
-                "Prop Line" + (" 📖" if _pb_real_line(pb_player, pb_cat) else " 📐"),
-                min_value=0.0, value=float(_pb_default_line), step=0.5,
+                "Prop Line", min_value=0.0, value=200.5, step=0.5,
                 format="%.1f", key="pb_line",
-                help="📖 = real book line  ·  📐 = model projection",
             )
             pb_weighted = st.toggle(
                 "Season weighting", value=True, key="pb_weighted"
@@ -1853,6 +2133,7 @@ if data_ok:
                     if result is None:
                         st.error("Player not found.")
                     else:
+                        # prevent duplicate legs
                         exists = any(
                             l["player"] == result["player"]
                             and l["category"] == result["category"]
@@ -1863,152 +2144,6 @@ if data_ok:
                             st.warning("This exact leg is already in your parlay.")
                         else:
                             st.session_state["parlay_legs"].append(result)
-                            st.rerun()
-
-            st.divider()
-            st.markdown("##### ⚡ Auto-Suggest")
-            pb_auto_n    = st.slider("Legs to suggest", 2, 8, 4, key="pb_auto_n")
-            pb_auto_cats = st.multiselect(
-                "Stats to consider",
-                list(CAT_MAP.keys()),
-                default=["pass yards", "rush yards", "rec yards", "receptions"],
-                format_func=str.title,
-                key="pb_auto_cats",
-            )
-            pb_auto_min_hr = st.slider(
-                "Min hit rate %", 40, 80, 55, key="pb_auto_min_hr"
-            )
-            _oc1, _oc2 = st.columns(2)
-            pb_auto_min_odds = _oc1.number_input(
-                "Min parlay odds (+)", min_value=100, max_value=50000,
-                value=300, step=50, key="pb_auto_min_odds",
-                help="Suggested parlay must pay at least this much. Increase to force more legs or longer shots.",
-            )
-            pb_auto_max_odds = _oc2.number_input(
-                "Max parlay odds (+)", min_value=100, max_value=100000,
-                value=3000, step=100, key="pb_auto_max_odds",
-                help="Suggested parlay won't exceed this payout. Keeps you from building lottery-ticket slips.",
-            )
-            pb_auto_btn = st.button(
-                "⚡ Suggest Best Legs", use_container_width=True, key="pb_auto_btn"
-            )
-
-            # Minimum average thresholds per stat — filters out backups
-            _PB_MIN_AVG = {
-                "passing_yards":   150.0,   # QB1s average 220+; 150 filters out backups
-                "passing_tds":       0.8,   # must average nearly 1 TD/game
-                "rush_yards":       35.0,   # RB1s average 60+; 35 filters out change-of-pace backs
-                "rush_tds":          0.2,
-                "receiving_yards":  25.0,   # WR/TE starters average 50+; 25 filters out gadget players
-                "receptions":        2.5,   # must average 2.5+ catches/game
-                "fantasy_points":   10.0,
-            }
-
-            if pb_auto_btn:
-                if not pb_auto_cats:
-                    st.warning("Select at least one stat category.")
-                else:
-                    candidates = []
-                    seen_pk = set()
-                    for cat in pb_auto_cats:
-                        col_key = CAT_MAP[cat.lower()][0]
-                        min_avg = _PB_MIN_AVG.get(col_key, 0.0)
-                        for pname in nfl_df["player_name"].unique():
-                            pk = (pname, cat)
-                            if pk in seen_pk:
-                                continue
-                            pdf = find_player(nfl_df, pname)
-                            if len(pdf) < 8:
-                                continue   # need min 8 games for reliable stats
-                            vals = pdf[col_key].values
-                            wts  = pdf["weight"].values
-                            w_avg = float(np.average(vals, weights=wts))
-                            # Skip backups / gadget players below the meaningful avg threshold
-                            if w_avg < min_avg:
-                                continue
-                            # Use real book line if available, else model projection
-                            real_line = _pb_real_line(pname, cat)
-                            if real_line is not None:
-                                line_val = real_line
-                            else:
-                                proj = w_avg
-                                if col_key == "passing_yards":
-                                    incs = [i + 0.5 for i in range(50, 500, 25)]
-                                elif col_key in ("rush_yards", "receiving_yards"):
-                                    incs = [i + 0.5 for i in range(0, 250, 10)]
-                                elif col_key == "receptions":
-                                    incs = [i + 0.5 for i in range(0, 20, 1)]
-                                elif col_key == "passing_tds":
-                                    incs = [0.5, 1.5, 2.5, 3.5]
-                                else:
-                                    incs = [i + 0.5 for i in range(0, 60, 5)]
-                                line_val = min(incs, key=lambda x: abs(x - proj))
-                            # Score the leg
-                            scored = score_leg(nfl_df, pname, cat, line_val, pb_weighted)
-                            if scored is None:
-                                continue
-                            hr = scored["hit_rate_pct"]
-                            if hr < pb_auto_min_hr:
-                                continue
-                            # Composite: hit rate × consistency (1/cv) × recency
-                            std = float(np.std(vals))
-                            cv  = std / (w_avg + 1e-6)
-                            consistency = 1 / (1 + cv)
-                            last3 = float(pdf[col_key].tail(3).mean())
-                            recency = max(0.5, min(2.0, last3 / (w_avg + 1e-6)))
-                            composite = (scored["implied_prob"] * 100) * consistency * recency
-                            candidates.append({**scored, "_composite": composite,
-                                               "last3_avg": round(last3, 1),
-                                               "sample_size": len(vals)})
-                            seen_pk.add(pk)
-
-                    # Sort, deduplicate by player, pick top N
-                    candidates.sort(key=lambda x: x["_composite"], reverse=True)
-                    seen_players = set()
-                    best_legs = []
-                    for c in candidates:
-                        if c["player"] not in seen_players:
-                            best_legs.append({k: v for k, v in c.items() if k != "_composite"})
-                            seen_players.add(c["player"])
-                        if len(best_legs) >= pb_auto_n:
-                            break
-
-                    if len(best_legs) < 2:
-                        st.warning("Not enough qualifying legs. Lower the min hit rate or add more stat categories.")
-                    else:
-                        # Check combined parlay odds against min/max
-                        combined_prob = 1.0
-                        for leg in best_legs:
-                            combined_prob *= leg["implied_prob"]
-                        combined_american = prob_to_american(combined_prob)
-
-                        if combined_american < pb_auto_min_odds:
-                            st.warning(
-                                f"Suggested parlay pays **+{combined_american}**, "
-                                f"which is below your min of **+{pb_auto_min_odds}**. "
-                                "Try increasing legs, lowering min hit rate, or raising min odds."
-                            )
-                        elif combined_american > pb_auto_max_odds:
-                            st.warning(
-                                f"Suggested parlay pays **+{combined_american}**, "
-                                f"which exceeds your max of **+{pb_auto_max_odds}**. "
-                                "Try fewer legs or raising the min hit rate."
-                            )
-
-                        # Load legs regardless — user can see the odds and decide
-                        added = 0
-                        for leg in best_legs:
-                            if len(st.session_state["parlay_legs"]) >= 8:
-                                break
-                            exists = any(
-                                l["player"] == leg["player"]
-                                and l["category"] == leg["category"]
-                                for l in st.session_state["parlay_legs"]
-                            )
-                            if not exists:
-                                st.session_state["parlay_legs"].append(leg)
-                                added += 1
-                        if added:
                             st.rerun()
 
             # clear button
@@ -2034,12 +2169,8 @@ if data_ok:
                     c1, c2, c3, c4, c5, c6 = st.columns([2, 1.2, 1, 1, 1, 0.5])
                     c1.markdown(f"**{leg['player']}**")
                     c2.markdown(f"{leg['category'].title()} {leg['recommendation']} **{leg['line']}**")
-                    c3.metric("Wtd Avg", leg["w_avg"],
-                              delta=f"L3: {leg.get('last3_avg', leg['w_avg'])}",
-                              delta_color="normal")
-                    c4.metric("Hit Rate", f"{leg['hit_rate_pct']}%",
-                              delta=f"n={leg.get('sample_size','?')}",
-                              delta_color="off")
+                    c3.metric("Wtd Avg", leg["w_avg"])
+                    c4.metric("Hit Rate", f"{leg['hit_rate_pct']}%")
                     c5.markdown(
                         f"<span style='color:{rec_color};font-weight:700;font-size:15px'>"
                         f"{leg['recommendation']}</span>",
@@ -2151,107 +2282,83 @@ if data_ok:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SCHEDULE HELPER  —  fetch_this_weeks_games
-# Uses sports.core.api.espn.com (not blocked).
-# Returns the current/upcoming week's games as a list of dicts:
-#   { espn_id, home, away, week, date, completed }
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=1800, show_spinner=False)   # cache 30 min
-def fetch_this_weeks_games() -> list:
-    import datetime as _dt
-    _CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
-    _H    = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-
-    def _cget(url):
-        try:
-            r = _requests.get(url.replace("http://", "https://"), headers=_H, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return None
-
-    today = _dt.date.today()
-    # Determine current NFL season year
-    cur_year = today.year if today.month >= 9 else today.year if today.month >= 2 else today.year - 1
-
-    # Find the current/most-recent week by checking the season calendar
-    weeks_data = _cget(f"{_CORE}/seasons/{cur_year}/types/2/weeks")
-    if not weeks_data:
-        return []
-
-    # Pick the week closest to today — prefer upcoming, fall back to most recent past
-    best_week = 1
-    best_diff = None
-    for w in weeks_data.get("items", []):
-        w_detail = _cget(w.get("$ref", "").replace("http://", "https://"))
-        if not w_detail:
-            continue
-        try:
-            start = _dt.date.fromisoformat(w_detail.get("startDate", "")[:10])
-            end   = _dt.date.fromisoformat(w_detail.get("endDate",   "")[:10])
-            week_num = w_detail.get("number", 0)
-        except Exception:
-            continue
-        # Use this week if today falls within it, or pick closest
-        if start <= today <= end:
-            best_week = week_num
-            break
-        diff = abs((start - today).days)
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            best_week = week_num
-
-    events_data = _cget(
-        f"{_CORE}/seasons/{cur_year}/types/2/weeks/{best_week}/events?limit=20"
-    )
-    if not events_data:
-        return []
-
-    games = []
-    for item in events_data.get("items", []):
-        event = _cget(item.get("$ref", ""))
-        if not event:
-            continue
-        short = event.get("shortName", "")
-        parts = short.split(" @ ")
-        if len(parts) != 2:
-            continue
-        away = _TEAM_NORM.get(parts[0].strip(), parts[0].strip())
-        home = _TEAM_NORM.get(parts[1].strip(), parts[1].strip())
-
-        # Completed status via status $ref
-        comp_ref = (event.get("competitions") or [{}])[0].get("$ref", "")
-        completed = False
-        espn_id   = event.get("id", "")
-        date_str  = event.get("date", "")[:10]
-        if comp_ref:
-            comp = _cget(comp_ref)
-            if comp:
-                status_ref = (comp.get("status") or {}).get("$ref", "")
-                if status_ref:
-                    status = _cget(status_ref)
-                    completed = bool((status or {}).get("type", {}).get("completed", False))
-
-        games.append({
-            "espn_id":   espn_id,
-            "home":      home,
-            "away":      away,
-            "week":      best_week,
-            "date":      date_str,
-            "completed": completed,
-        })
-    return games
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab8:
+with tab8:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         # ── helpers ───────────────────────────────────────────────────────────
         # build_defense_table and _COL_TO_POS are now at module level (above)
+
+        @st.cache_data(ttl=3600, show_spinner=False)
+        def fetch_this_weeks_games():
+            """
+            Finds the next/current NFL week and returns upcoming (unplayed) games.
+            Checks the next calendar year first so the upcoming season's schedule
+            shows during the offseason (e.g. 2025 schedule visible in May 2025).
+            Falls back to the most recent completed week if nothing is found.
+            """
+            import datetime as _dt
+            today     = _dt.date.today()
+            cur_year  = today.year if today.month >= 9 else today.year - 1
+            next_year = cur_year + 1
+
+            def _scrape_year(year):
+                """
+                Walk weeks 1-18 for the given year.
+                Returns (upcoming_this_week, last_completed_list).
+                Stops as soon as it finds the first week that has ANY upcoming
+                (not-yet-played) game — so we never accumulate the whole season.
+                """
+                last_completed = []
+                for week in range(1, 19):
+                    url = (
+                        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                        f"?seasontype=2&week={week}&dates={year}"
+                    )
+                    data = _get_json(url)
+                    if not data:
+                        continue
+                    events = data.get("events", [])
+                    if not events:
+                        break
+                    week_upcoming = []
+                    for e in events:
+                        comp  = e["competitions"][0]
+                        done  = comp["status"]["type"]["completed"]
+                        teams = {c["homeAway"]: c["team"]["abbreviation"]
+                                 for c in comp["competitors"]}
+                        entry = {
+                            "home":      teams.get("home", "UNK"),
+                            "away":      teams.get("away", "UNK"),
+                            "date":      e["date"][:10],
+                            "week":      week,
+                            "season":    year,
+                            "completed": done,
+                            "name":      e.get("shortName", e.get("name", "")),
+                            "espn_id":   e.get("id", ""),
+                        }
+                        if not done:
+                            week_upcoming.append(entry)
+                        else:
+                            last_completed.append(entry)
+                    # As soon as we find a week with upcoming games, return just those
+                    if week_upcoming:
+                        return week_upcoming, last_completed
+                return [], last_completed
+
+            # Try current season first
+            upcoming, last_completed = _scrape_year(cur_year)
+
+            # If no upcoming games in current year, check next year's schedule
+            # (handles offseason when ESPN has already posted the upcoming season)
+            if not upcoming:
+                upcoming_next, _ = _scrape_year(next_year)
+                if upcoming_next:
+                    upcoming = upcoming_next
+
+            return upcoming if upcoming else last_completed[-16:]  # final fallback
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_game_odds(espn_id: str) -> dict:
@@ -2339,7 +2446,9 @@ if data_ok:
             total_teams = len(def_agg)
 
             # Fetch schedule, odds, depth charts, and (optionally) real prop lines
-            with st.spinner("Fetching schedule, odds, and depth charts from ESPN..."):
+            _hl_key_mf = st.session_state.get("highlightly_key", "")
+            _dc_source  = "Highlightly" if _hl_key_mf else "ESPN"
+            with st.spinner(f"Fetching schedule, odds, and depth charts ({_dc_source})..."):
                 games = fetch_this_weeks_games()
                 for g in games:
                     if g.get("espn_id"):
@@ -2347,7 +2456,7 @@ if data_ok:
                     else:
                         g["odds"] = {"over_under": None, "home_spread": None,
                                      "away_spread": None, "book_name": None}
-                depth_charts = fetch_all_depth_charts()
+                depth_charts = get_depth_charts(_hl_key_mf)
 
             # Build a lookup: player name (lower) → {cat → real book line}
             # Only populated when an Odds API key is provided.
@@ -2889,8 +2998,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # INJURY REPORT (tab9 inside main_teams)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab9:
+with tab9:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         @st.cache_data(ttl=1800, show_spinner=False)  # refresh every 30 min
         def fetch_injuries():
             """Fetch current NFL injury report from ESPN API."""
@@ -2990,8 +3101,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # HOME / AWAY SPLITS (tab10 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab10:
+with tab10:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         @st.cache_data(show_spinner=False)
         def build_home_away(nfl):
             """Add is_home column: True if player's team is the home team in game_id."""
@@ -3016,6 +3129,7 @@ if data_ok:
                 "Player", all_players_ha,
                 index=all_players_ha.index("Drake Maye")
                 if "Drake Maye" in all_players_ha else 0,
+                format_func=lambda n: _player_label(n, player_team_map),
                 key="ha_player",
             )
             ha_cat    = st.selectbox("Stat", list(CAT_MAP.keys()),
@@ -3111,8 +3225,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # START / SIT ADVISOR (tab11 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab11:
+with tab11:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         @st.cache_data(show_spinner=False)
         def build_opp_defense(nfl):
             df = nfl.copy()
@@ -3127,6 +3243,7 @@ if data_ok:
         nfl_ss = build_opp_defense(nfl_df)
         all_players_ss = sorted(nfl_df["player_name"].unique())
         all_teams_ss   = sorted(nfl_df["team"].unique())
+        _ss_fmt = lambda n: _player_label(n, player_team_map)
 
         st.subheader("🏆 Start / Sit Advisor")
         st.caption("Compare two players and get a fantasy start recommendation based on stats + matchup.")
@@ -3137,6 +3254,7 @@ if data_ok:
             ss_p1     = st.selectbox("Player A", all_players_ss,
                                       index=all_players_ss.index("Drake Maye")
                                       if "Drake Maye" in all_players_ss else 0,
+                                      format_func=_ss_fmt,
                                       key="ss_p1")
             ss_opp1   = st.selectbox("Player A opponent this week",
                                       all_teams_ss, key="ss_opp1")
@@ -3145,6 +3263,7 @@ if data_ok:
             st.markdown("#### Player B")
             ss_p2     = st.selectbox("Player B", all_players_ss,
                                       index=min(1, len(all_players_ss)-1),
+                                      format_func=_ss_fmt,
                                       key="ss_p2")
             ss_opp2   = st.selectbox("Player B opponent this week",
                                       all_teams_ss, key="ss_opp2")
@@ -3283,8 +3402,10 @@ if data_ok:
 # Falls back to manual paste if no API key is set.
 # ══════════════════════════════════════════════════════════════════════════════
 
-if data_ok:
-    with tab_vegas:
+with tab_vegas:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         st.subheader("📈 Vegas Lines — Live Prop Odds")
         st.caption(
             "Pulls live NFL player prop lines from The Odds API (DraftKings / consensus) "
@@ -3719,15 +3840,19 @@ with main_tracker:
         st.subheader("➕ Log a New Bet")
 
         if data_ok:
-            all_players_bt = ["(type manually)"] + sorted(nfl_df["player_name"].unique())
+            _sorted_players_bt = sorted(nfl_df["player_name"].unique())
+            all_players_bt = ["(type manually)"] + _sorted_players_bt
+            _bt_fmt = lambda n: n if n == "(type manually)" else _player_label(n, player_team_map)
         else:
             all_players_bt = ["(type manually)"]
+            _bt_fmt = lambda n: n
 
         bl_c1, bl_c2 = st.columns([1, 1])
 
         with bl_c1:
             bt_date    = st.date_input("Date", value=_dtbt.date.today(), key="bt_date")
-            bt_player_sel = st.selectbox("Player (from data)", all_players_bt, key="bt_player_sel")
+            bt_player_sel = st.selectbox("Player (from data)", all_players_bt,
+                                          format_func=_bt_fmt, key="bt_player_sel")
             bt_player_txt = st.text_input(
                 "Player name (manual override)",
                 value="" if bt_player_sel == "(type manually)" else bt_player_sel,
@@ -4112,8 +4237,10 @@ with main_tracker:
 # ══════════════════════════════════════════════════════════════════════════════
 # SAME-GAME PARLAY BUILDER  (tab_sgp inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab_sgp:
+with tab_sgp:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         st.subheader("🏟️ Same-Game Parlay Builder")
         st.caption(
             "Pick a live or upcoming game, add prop legs for players in that game, "
@@ -4300,7 +4427,9 @@ if data_ok:
 
                             # Depth charts (already cached from Matchup Finder if loaded)
                             with st.spinner("Loading depth charts…"):
-                                sgp_depth_charts = fetch_all_depth_charts()
+                                sgp_depth_charts = get_depth_charts(
+                                    st.session_state.get("highlightly_key", "")
+                                )
 
                             def _sgp_dc_players(team, stat_col, max_rank=3):
                                 chart = sgp_depth_charts.get(team, {})
@@ -4378,17 +4507,6 @@ if data_ok:
 
                                         # Weighted avg
                                         w_avg = float(np.average(vals, weights=wts))
-
-                                        # Skip backups — must meet minimum average for this stat
-                                        _sgp_min_avg = {
-                                            "passing_yards": 150.0, "passing_tds": 0.8,
-                                            "rush_yards": 35.0,     "rush_tds": 0.2,
-                                            "receiving_yards": 25.0,"receptions": 2.5,
-                                            "fantasy_points": 10.0,
-                                        }
-                                        if w_avg < _sgp_min_avg.get(col_key, 0.0):
-                                            continue
-
                                         # Matchup-adjusted projection
                                         proj = w_avg * matchup_factor
 
@@ -4412,63 +4530,45 @@ if data_ok:
                                             line_val = min(incs, key=lambda x: abs(x - proj))
                                             lsrc = "📐 Model"
 
-                                        n_games = len(vals)
-                                        if n_games < 3:
-                                            continue
+                                        # Direction: always take OVER on soft matchup, else model's call
+                                        direction = "OVER" if proj > line_val else "UNDER"
 
-                                        # Weighted hit rate
-                                        w_hit_raw = float(np.average(
+                                        # Hit rate (weighted)
+                                        w_hit = float(np.average(
                                             (vals > line_val).astype(float), weights=wts
-                                        ))
+                                        )) * 100
+                                        hr_for_direction = w_hit if direction == "OVER" else (100 - w_hit)
 
-                                        # Sample size confidence
-                                        prior_w = max(0.0, 1.0 - n_games / 10.0)
-                                        w_hit_adj = w_hit_raw * (1 - prior_w) + 0.5 * prior_w
-
-                                        # Variance penalty
-                                        std_v = float(np.std(vals))
-                                        cv_v  = std_v / (line_val + 1e-6)
-                                        var_pen = min(0.15, cv_v * 0.05)
-                                        w_hit_adj = w_hit_adj * (1 - var_pen) + 0.5 * var_pen
-
-                                        # Direction with UNDER threshold
-                                        if w_hit_adj >= 0.55:
-                                            direction = "OVER"
-                                        elif (1 - w_hit_adj) >= 0.60:
-                                            direction = "UNDER"
-                                        else:
-                                            direction = "OVER" if w_hit_adj >= 0.5 else "UNDER"
-
-                                        hr_for_direction = (w_hit_adj if direction == "OVER"
-                                                            else 1 - w_hit_adj) * 100
-
+                                        # Apply min hit rate filter
                                         if hr_for_direction < sgp_auto_min_hr:
                                             continue
 
+                                        # Implied prob (capped)
                                         implied = max(0.111, min(0.889, hr_for_direction / 100))
 
-                                        last3 = float(pdf[col_key].tail(3).mean()) if n_games >= 3 else w_avg
-                                        recency = max(0.5, min(2.0, (last3 / w_avg) if w_avg > 0 else 1.0))
-                                        consistency = 1 / (1 + cv_v)
-                                        composite = hr_for_direction * matchup_factor * recency * consistency
+                                        # Composite score: hit rate × matchup factor × recency boost
+                                        last3 = float(pdf[col_key].tail(3).mean()) if len(pdf) >= 3 else w_avg
+                                        recency = (last3 / w_avg) if w_avg > 0 else 1.0
+                                        recency = max(0.5, min(2.0, recency))
+                                        composite = hr_for_direction * matchup_factor * recency
 
                                         candidate_legs.append({
-                                            "player":         pname,
-                                            "category":       cat,
-                                            "col":            col_key,
-                                            "line":           line_val,
-                                            "line_source":    lsrc,
+                                            "player":       pname,
+                                            "category":     cat,
+                                            "col":          col_key,
+                                            "line":         line_val,
+                                            "line_source":  lsrc,
                                             "recommendation": direction,
-                                            "w_avg":          round(w_avg, 1),
-                                            "last3":          round(last3, 1),
-                                            "hit_rate_pct":   round(w_hit_raw * 100, 1),
-                                            "implied_prob":   round(implied, 4),
-                                            "american_odds":  prob_to_american(implied),
-                                            "matchup_grade":  matchup_grade,
+                                            "w_avg":        round(w_avg, 1),
+                                            "last3":        round(last3, 1),
+                                            "hit_rate_pct": round(w_hit, 1),
+                                            "implied_prob": round(implied, 4),
+                                            "american_odds": prob_to_american(implied),
+                                            "matchup_grade": matchup_grade,
                                             "matchup_factor": round(matchup_factor, 2),
-                                            "defense":        defense_team,
-                                            "game":           sgp_game_labels[sgp_game_idx],
-                                            "_composite":     composite,
+                                            "defense":      defense_team,
+                                            "game":         sgp_game_labels[sgp_game_idx],
+                                            "_composite":   composite,
                                         })
                                         seen_player_cats.add(pk)
 
