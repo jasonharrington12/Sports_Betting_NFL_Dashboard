@@ -334,17 +334,97 @@ def fetch_highlightly_depth_charts(api_key: str) -> dict:
     return result
 
 
-def get_depth_charts(highlightly_key: str = "") -> dict:
+def get_depth_charts(highlightly_key: str = "", nfl: "pd.DataFrame | None" = None) -> dict:
     """
-    Dispatcher: use Highlightly when a key is provided, else fall back to ESPN.
-    This is the single call site used by all tabs.
+    Dispatcher: use Highlightly when a key is provided, else fall back to ESPN,
+    then to a game-log derived chart if ESPN is unavailable.
+    Priority order:
+      1. Highlightly (if key set and returns data)
+      2. ESPN depth chart endpoint (if it returns data)
+      3. Game-log derived depth chart (always works — built from nfl_df)
     """
     if highlightly_key.strip():
         data = fetch_highlightly_depth_charts(highlightly_key.strip())
         if data:
             return data
-    # Fallback (or no key) → ESPN free endpoint
-    return fetch_all_depth_charts()
+    # Try ESPN free endpoint
+    espn_data = fetch_all_depth_charts()
+    if espn_data:
+        return espn_data
+    # Final fallback — build from game log (always available)
+    if nfl is not None and not nfl.empty:
+        return _build_depth_chart_from_gamelog(nfl)
+    return {}
+
+
+@st.cache_data(show_spinner=False)
+def _build_depth_chart_from_gamelog(nfl) -> dict:
+    """
+    Derive a depth chart from the game log DataFrame.
+    Uses 2025 data first (most recent team), falls back to 2024.
+    Infers position from which stats a player accumulated:
+      QB  → avg passing_yards >= 50
+      RB  → avg rush_yards >= 15 and not a QB
+      WR  → top receivers by targets (up to 6 per team)
+      TE  → remaining receivers
+    Players are ranked starter-first by average stat.
+    Returns same shape: { "NE": { "QB": [...], "RB": [...], "WR": [...], "TE": [...] } }
+    """
+    result = {}
+
+    p25 = nfl[nfl["season"] == 2025]
+    p24 = nfl[nfl["season"] == 2024]
+
+    for season_df in [p25, p24]:
+        if season_df.empty:
+            continue
+
+        for team in season_df["team"].unique():
+            if team in result:
+                continue   # already populated from a more recent season
+
+            tdf = season_df[season_df["team"] == team]
+            if tdf.empty:
+                continue
+
+            player_avgs = (
+                tdf.groupby("player_name")
+                .agg(
+                    pass_yds=("passing_yards",  "mean"),
+                    rush_yds=("rush_yards",      "mean"),
+                    rec_yds =("receiving_yards", "mean"),
+                    targets =("targets",         "mean"),
+                )
+                .reset_index()
+            )
+
+            qbs = player_avgs[player_avgs["pass_yds"] >= 50].sort_values(
+                "pass_yds", ascending=False
+            )
+            rbs = player_avgs[
+                (player_avgs["rush_yds"] >= 15) & (player_avgs["pass_yds"] < 50)
+            ].sort_values("rush_yds", ascending=False)
+            receivers = player_avgs[
+                (player_avgs["rec_yds"] >= 10) & (player_avgs["pass_yds"] < 50)
+            ].sort_values("targets", ascending=False)
+
+            wrs = receivers.head(6)
+            tes = receivers.iloc[6:]
+
+            team_chart = {}
+            if not qbs.empty:
+                team_chart["QB"] = qbs["player_name"].tolist()[:3]
+            if not rbs.empty:
+                team_chart["RB"] = rbs["player_name"].tolist()[:4]
+            if not wrs.empty:
+                team_chart["WR"] = wrs["player_name"].tolist()
+            if not tes.empty:
+                team_chart["TE"] = tes["player_name"].tolist()[:3]
+
+            if team_chart:
+                result[team] = team_chart
+
+    return result
 
 
 @st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
@@ -1549,15 +1629,14 @@ with main_teams:
             st.subheader("📋 Current NFL Depth Charts")
             _hl_active = bool(st.session_state.get("highlightly_key", ""))
             st.caption(
-                ("📋 **Highlightly** depth charts active · QB / RB / WR / TE · cached 6 hrs  "
-                 "_(set key in ⚙️ Settings → 🔑 API Keys)_")
+                "📋 **Highlightly** depth charts active · QB / RB / WR / TE · cached 6 hrs"
                 if _hl_active else
-                "Live from ESPN · QB / RB / WR / TE starters & backups · cached 6 hours  "
-                "_(add a Highlightly key in ⚙️ Settings → 🔑 API Keys for richer data)_"
+                "QB / RB / WR / TE — sourced from ESPN if available, otherwise derived from "
+                "2025/2024 game logs · Add a Highlightly key in ⚙️ Settings → 🔑 API Keys for live data"
             )
 
             with st.spinner("Loading depth charts…"):
-                dc_data = get_depth_charts(st.session_state.get("highlightly_key", ""))
+                dc_data = get_depth_charts(st.session_state.get("highlightly_key", ""), nfl=nfl_df)
 
             if not dc_data:
                 st.warning("Could not load depth charts. Try again in a moment.")
@@ -2456,7 +2535,7 @@ with tab8:
                     else:
                         g["odds"] = {"over_under": None, "home_spread": None,
                                      "away_spread": None, "book_name": None}
-                depth_charts = get_depth_charts(_hl_key_mf)
+                depth_charts = get_depth_charts(_hl_key_mf, nfl=nfl_df)
 
             # Build a lookup: player name (lower) → {cat → real book line}
             # Only populated when an Odds API key is provided.
@@ -4428,7 +4507,8 @@ with tab_sgp:
                             # Depth charts (already cached from Matchup Finder if loaded)
                             with st.spinner("Loading depth charts…"):
                                 sgp_depth_charts = get_depth_charts(
-                                    st.session_state.get("highlightly_key", "")
+                                    st.session_state.get("highlightly_key", ""),
+                                    nfl=nfl_df,
                                 )
 
                             def _sgp_dc_players(team, stat_col, max_rank=3):
