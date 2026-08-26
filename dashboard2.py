@@ -141,12 +141,11 @@ _INACTIVE_STATUSES = {"IR", "PUP", "R, IR"}
 
 _ROSTER_CSV = _os.path.join(_os.path.dirname(__file__), "nfl_rosters_with_positions.csv")
 
-@st.cache_data(show_spinner=False)   # no TTL — reload only when CSV changes
 def fetch_all_depth_charts():
     """
     Build depth charts from the local nfl_rosters_with_positions.csv file.
     Row order within each team+position group is the depth chart order.
-    Players with Status IR / PUP are included but flagged — callers can filter.
+    Players with Status IR / PUP are flagged with 🔴.
 
     Returns:
         { "NE": { "QB": ["Drake Maye", ...], "RB": [...], "WR": [...], "TE": [...] },
@@ -162,14 +161,13 @@ def fetch_all_depth_charts():
                 if pos not in _PROP_POSITIONS:
                     continue
                 abbr   = row.get("Team", "").strip()
-                abbr   = _CSV_TEAM_NORM.get(abbr, abbr)   # normalise to app codes
+                abbr   = _CSV_TEAM_NORM.get(abbr, abbr)
                 name   = row.get("Player", "").strip()
                 status = row.get("Status", "").strip()
                 if not name or not abbr:
                     continue
                 team_chart = result.setdefault(abbr, {})
                 bucket     = team_chart.setdefault(pos, [])
-                # append with optional injury flag so UI can show it
                 display    = f"{name} 🔴" if status in _INACTIVE_STATUSES else name
                 bucket.append(display)
     except FileNotFoundError:
