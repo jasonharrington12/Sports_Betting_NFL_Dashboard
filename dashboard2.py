@@ -2489,8 +2489,8 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER helpers — module level so cache is stable across reruns
 # ══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_this_weeks_games(_v=2):   # _v bumps cache key when logic changes
+@st.cache_data(ttl=300, show_spinner=False)   # 5 min — schedule changes infrequently but stale cache is worse
+def fetch_this_weeks_games():
     """
     Finds the next/current NFL week and returns upcoming (unplayed) games.
     Falls back to the most recent completed week during the offseason.
