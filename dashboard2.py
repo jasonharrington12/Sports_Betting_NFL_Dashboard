@@ -2493,8 +2493,9 @@ if data_ok:
 def _odds_api_schedule(api_key: str) -> list:
     """
     Pull this week's NFL games from The Odds API events endpoint.
+    Filters to only games whose commence_time falls within the next 10 days
+    (Thu–Mon window covers the full NFL week including MNF).
     Returns same shape as fetch_this_weeks_games: list of game dicts.
-    One API call, instant — no ESPN week-walking needed.
     """
     import datetime as _dt
     url = (
@@ -2505,24 +2506,41 @@ def _odds_api_schedule(api_key: str) -> list:
     if not data or not isinstance(data, list):
         return []
 
+    today     = _dt.datetime.utcnow().date()
+    cutoff    = today + _dt.timedelta(days=10)
+
     games = []
     for event in data:
+        commence = event.get("commence_time", "")
+        if not commence:
+            continue
+        game_date = _dt.date.fromisoformat(commence[:10])
+        if game_date > cutoff:
+            continue          # skip games more than 10 days away
         home_full = event.get("home_team", "")
         away_full = event.get("away_team", "")
         home = _full_team_name_to_abbr(home_full)
         away = _full_team_name_to_abbr(away_full)
-        commence = event.get("commence_time", "")
-        date = commence[:10] if commence else ""
         games.append({
             "home":      home,
             "away":      away,
-            "date":      date,
-            "week":      0,        # Odds API doesn't give week number
-            "season":    int(date[:4]) if date else 2026,
+            "date":      commence[:10],
+            "week":      1,
+            "season":    game_date.year,
             "completed": False,
             "name":      away + " @ " + home,
-            "espn_id":   "",       # no ESPN id from Odds API
+            "espn_id":   "",
         })
+
+    # Narrow further: only the earliest game-date batch
+    # (handles bye weeks where Odds API may return 2 separate weeks)
+    if games:
+        earliest = min(g["date"] for g in games)
+        earliest_dt = _dt.date.fromisoformat(earliest)
+        # Keep only games within 4 days of the first game (covers Thu–Sun/Mon)
+        games = [g for g in games
+                 if _dt.date.fromisoformat(g["date"]) <= earliest_dt + _dt.timedelta(days=4)]
+
     return games
 
 
