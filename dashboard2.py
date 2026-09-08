@@ -652,7 +652,7 @@ def _scrape_season_live(year, progress_text=None, from_week=1):
                 if c.get("homeAway") == "home": home = ab
                 else: away = ab
             all_rows.extend(_scrape_game(gid, year, week, home, away))
-            _time.sleep(0.35)
+            _time.sleep(0.15)
 
         # Stop scraping forward weeks once we hit a week with zero completed games
         if not completed_any:
@@ -685,8 +685,28 @@ def load_data():
 
     # NFL season year: Sep–Dec uses the current calendar year,
     # Jan–Aug uses the previous calendar year (e.g. Jan 2026 → 2025 season).
-    _today     = _dt.date.today()
-    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
+    # Extra check: if the calendar says the new season should have started but
+    # ESPN shows 0 completed games (pre-season / opening week not yet played),
+    # treat the previous season as the current one so we don't load empty data.
+    _today    = _dt.date.today()
+    _cal_year = _today.year if _today.month >= 9 else _today.year - 1
+
+    # Quick probe: does _cal_year have any completed regular-season games?
+    def _has_completed_games(year):
+        d = _get_json(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week=1&dates={year}"
+        )
+        if not d:
+            return False
+        events = d.get("events", [])
+        return any(
+            e.get("competitions", [{}])[0]
+             .get("status", {}).get("type", {}).get("completed", False)
+            for e in events
+        )
+
+    _cur_year  = _cal_year if _has_completed_games(_cal_year) else _cal_year - 1
     _prev_year = _cur_year - 1
 
     msg  = st.empty()
