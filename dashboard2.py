@@ -1805,6 +1805,32 @@ with main_settings:
             "fetches the latest games — no action needed week-to-week."
         )
         st.divider()
+
+        # ── ESPN API live status check ────────────────────────────────────────
+        st.markdown("### 📡 ESPN API Status")
+        _espn_test_url = (
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            "?seasontype=2&week=1&dates=2024"
+        )
+        try:
+            _espn_resp = _requests.get(_espn_test_url, headers=_HEADERS, timeout=8)
+            _espn_ok   = _espn_resp.status_code == 200 and bool(_espn_resp.json().get("events"))
+        except Exception:
+            _espn_ok = False
+
+        _checked_at = _dt.datetime.now().strftime("%I:%M %p")
+        if _espn_ok:
+            st.success(
+                f"✅ **ESPN API is online** — data feed is live and responding normally.  "
+                f"Checked at {_checked_at}."
+            )
+        else:
+            st.error(
+                f"❌ **ESPN API is unreachable** — the feed did not respond at {_checked_at}. "
+                "Try the manual refresh below or wait a few minutes and reload the page."
+            )
+
+        st.divider()
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### ℹ️ How it works")
