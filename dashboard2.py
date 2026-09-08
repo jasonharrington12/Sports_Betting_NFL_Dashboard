@@ -2489,19 +2489,62 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER helpers — module level so cache is stable across reruns
 # ══════════════════════════════════════════════════════════════════════════════
-@st.cache_data(ttl=300, show_spinner=False)   # 5 min — schedule changes infrequently but stale cache is worse
-def fetch_this_weeks_games():
-    """
-    Finds the next/current NFL week and returns upcoming (unplayed) games.
-    Falls back to the most recent completed week during the offseason.
 
-    Fast path: derives the latest week from the already-loaded CSV so
-    only 1-2 ESPN calls are ever needed (no walking all 18 weeks).
+def _odds_api_schedule(api_key: str) -> list:
+    """
+    Pull this week's NFL games from The Odds API events endpoint.
+    Returns same shape as fetch_this_weeks_games: list of game dicts.
+    One API call, instant — no ESPN week-walking needed.
     """
     import datetime as _dt
+    url = (
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+        f"?apiKey={api_key}&dateFormat=iso"
+    )
+    data = _get_json(url)
+    if not data or not isinstance(data, list):
+        return []
+
+    games = []
+    for event in data:
+        home_full = event.get("home_team", "")
+        away_full = event.get("away_team", "")
+        home = _full_team_name_to_abbr(home_full)
+        away = _full_team_name_to_abbr(away_full)
+        commence = event.get("commence_time", "")
+        date = commence[:10] if commence else ""
+        games.append({
+            "home":      home,
+            "away":      away,
+            "date":      date,
+            "week":      0,        # Odds API doesn't give week number
+            "season":    int(date[:4]) if date else 2026,
+            "completed": False,
+            "name":      away + " @ " + home,
+            "espn_id":   "",       # no ESPN id from Odds API
+        })
+    return games
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_this_weeks_games(odds_api_key: str = ""):
+    """
+    Finds this week's NFL games.
+    Priority:
+      1. The Odds API (if key provided) — 1 call, always current
+      2. ESPN scoreboard walk — free but slower
+    Falls back to most recent completed week during offseason.
+    """
+    # ── Option 1: Odds API (fast, reliable) ──────────────────────────────
+    if odds_api_key.strip():
+        games = _odds_api_schedule(odds_api_key.strip())
+        if games:
+            return games
+
+    # ── Option 2: ESPN scoreboard walk ───────────────────────────────────
+    import datetime as _dt
     today     = _dt.date.today()
-    cal_year  = today.year if today.month >= 9 else today.year - 1
-    cur_year  = int(nfl_df["season"].max()) if data_ok else cal_year
+    cur_year  = today.year if today.month >= 9 else today.year - 1
     next_year = cur_year + 1
 
     def _parse_entries(events, year, week):
@@ -2523,56 +2566,35 @@ def fetch_this_weeks_games():
             })
         return entries
 
-    # Derive latest completed week from the CSV (free — no ESPN call)
-    if data_ok:
-        try:
-            latest_week = int(
-                nfl_df[nfl_df["season"] == cur_year]["game_id"]
-                .str.split("_", expand=True)[1]
-                .dropna().astype(int).max()
-            )
-        except Exception:
-            latest_week = 18
-    else:
-        latest_week = 1
-
-    # Check if the NEXT week has upcoming games (active season)
-    next_week = latest_week + 1
-    if next_week <= 18:
-        d = _get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week={next_week}&dates={cur_year}"
-        )
-        if d:
-            upcoming = [e for e in _parse_entries(d.get("events", []), cur_year, next_week)
-                        if not e["completed"]]
-            if upcoming:
-                return upcoming
-
-    # Check next year's schedule (offseason — ESPN posts it early)
-    d_ny = _get_json(
-        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-        f"?seasontype=2&week=1&dates={next_year}"
-    )
-    if d_ny:
-        upcoming_ny = [e for e in _parse_entries(d_ny.get("events", []), next_year, 1)
-                       if not e["completed"]]
-        if upcoming_ny:
-            return upcoming_ny
-
-    # Fallback — return latest completed week (1 ESPN call)
-    if data_ok:
-        try:
-            d_last = _get_json(
+    def _scrape_year(year):
+        last_completed = []
+        for week in range(1, 19):
+            d = _get_json(
                 "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                f"?seasontype=2&week={latest_week}&dates={cur_year}"
+                f"?seasontype=2&week={week}&dates={year}"
             )
-            if d_last:
-                return _parse_entries(d_last.get("events", []), cur_year, latest_week)
-        except Exception:
-            pass
+            if not d:
+                continue
+            events = d.get("events", [])
+            if not events:
+                break
+            entries   = _parse_entries(events, year, week)
+            upcoming  = [e for e in entries if not e["completed"]]
+            completed = [e for e in entries if e["completed"]]
+            last_completed.extend(completed)
+            if upcoming:
+                return upcoming, last_completed
+        return [], last_completed
 
-    return []
+    upcoming, last_completed = _scrape_year(cur_year)
+    if upcoming:
+        return upcoming
+
+    upcoming_next, _ = _scrape_year(next_year)
+    if upcoming_next:
+        return upcoming_next
+
+    return last_completed[-16:] if last_completed else []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2666,7 +2688,7 @@ if data_ok:
             _hl_key_mf = st.session_state.get("highlightly_key", "")
             _dc_source  = "Highlightly" if _hl_key_mf else "ESPN"
             with st.spinner(f"Fetching schedule, odds, and depth charts ({_dc_source})..."):
-                games = fetch_this_weeks_games()
+                games = fetch_this_weeks_games(odds_api_key=mf_api_key)
                 for g in games:
                     if g.get("espn_id"):
                         g["odds"] = fetch_game_odds(g["espn_id"])
@@ -4434,7 +4456,8 @@ if data_ok:
         with sgp_top_l:
             # Fetch this week's games (reuses cached fetch_this_weeks_games)
             with st.spinner("Fetching schedule from ESPN…"):
-                sgp_games = fetch_this_weeks_games()
+                _sgp_odds_key = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+                sgp_games = fetch_this_weeks_games(odds_api_key=_sgp_odds_key)
 
             if not sgp_games:
                 st.warning("No schedule data available right now. Try again shortly.")
