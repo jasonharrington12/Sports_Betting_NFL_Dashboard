@@ -2559,11 +2559,27 @@ def fetch_this_weeks_games(odds_api_key: str = ""):
         if games:
             return games
 
-    # ── Option 2: ESPN scoreboard walk ───────────────────────────────────
+    # ── Option 2: ESPN scoreboard — smart single-call approach ───────────
     import datetime as _dt
     today     = _dt.date.today()
     cur_year  = today.year if today.month >= 9 else today.year - 1
     next_year = cur_year + 1
+
+    # Latest completed week from CSV — tells us exactly where to look next
+    if data_ok:
+        try:
+            csv_max_season = int(nfl_df["season"].max())
+            csv_max_week   = int(
+                nfl_df[nfl_df["season"] == csv_max_season]["game_id"]
+                .str.split("_", expand=True)[1]
+                .dropna().astype(int).max()
+            )
+        except Exception:
+            csv_max_season = cur_year
+            csv_max_week   = 18
+    else:
+        csv_max_season = cur_year
+        csv_max_week   = 0
 
     def _parse_entries(events, year, week):
         entries = []
@@ -2584,35 +2600,38 @@ def fetch_this_weeks_games(odds_api_key: str = ""):
             })
         return entries
 
-    def _scrape_year(year):
-        last_completed = []
-        for week in range(1, 19):
-            d = _get_json(
-                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                f"?seasontype=2&week={week}&dates={year}"
-            )
-            if not d:
-                continue
-            events = d.get("events", [])
-            if not events:
-                break
-            entries   = _parse_entries(events, year, week)
-            upcoming  = [e for e in entries if not e["completed"]]
-            completed = [e for e in entries if e["completed"]]
-            last_completed.extend(completed)
-            if upcoming:
-                return upcoming, last_completed
-        return [], last_completed
+    def _fetch_week(year, week):
+        d = _get_json(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week={week}&dates={year}"
+        )
+        if not d:
+            return [], []
+        entries  = _parse_entries(d.get("events", []), year, week)
+        upcoming = [e for e in entries if not e["completed"]]
+        done     = [e for e in entries if e["completed"]]
+        return upcoming, done
 
-    upcoming, last_completed = _scrape_year(cur_year)
-    if upcoming:
-        return upcoming
+    # Case 1: active season — check the week after the latest in CSV
+    if csv_max_week < 18 and csv_max_season == cur_year:
+        upcoming, _ = _fetch_week(cur_year, csv_max_week + 1)
+        if upcoming:
+            return upcoming
 
-    upcoming_next, _ = _scrape_year(next_year)
-    if upcoming_next:
-        return upcoming_next
+    # Case 2: cur_year season is complete — jump straight to next_year week 1
+    upcoming_ny, _ = _fetch_week(next_year, 1)
+    if upcoming_ny:
+        return upcoming_ny
 
-    return last_completed[-16:] if last_completed else []
+    # Case 3: also try cur_year week 1 (handles calendar year = new season)
+    if cur_year != csv_max_season:
+        upcoming_cy, _ = _fetch_week(cur_year, 1)
+        if upcoming_cy:
+            return upcoming_cy
+
+    # Fallback: last completed week from CSV season
+    last, completed = _fetch_week(csv_max_season, csv_max_week)
+    return completed if completed else []
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
