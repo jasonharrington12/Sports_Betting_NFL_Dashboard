@@ -2487,133 +2487,127 @@ if data_ok:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MATCHUP FINDER helpers — module level so cache is stable across reruns
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_this_weeks_games():
+    """
+    Finds the next/current NFL week and returns upcoming (unplayed) games.
+    Falls back to the most recent completed week during the offseason.
+
+    Fast path: derives the latest week from the already-loaded CSV so
+    only 1-2 ESPN calls are ever needed (no walking all 18 weeks).
+    """
+    import datetime as _dt
+    today     = _dt.date.today()
+    cal_year  = today.year if today.month >= 9 else today.year - 1
+    cur_year  = int(nfl_df["season"].max()) if data_ok else cal_year
+    next_year = cur_year + 1
+
+    def _parse_entries(events, year, week):
+        entries = []
+        for e in events:
+            comp  = e["competitions"][0]
+            done  = comp["status"]["type"]["completed"]
+            teams = {c["homeAway"]: c["team"]["abbreviation"]
+                     for c in comp["competitors"]}
+            entries.append({
+                "home":      teams.get("home", "UNK"),
+                "away":      teams.get("away", "UNK"),
+                "date":      e["date"][:10],
+                "week":      week,
+                "season":    year,
+                "completed": done,
+                "name":      e.get("shortName", e.get("name", "")),
+                "espn_id":   e.get("id", ""),
+            })
+        return entries
+
+    # Derive latest completed week from the CSV (free — no ESPN call)
+    if data_ok:
+        try:
+            latest_week = int(
+                nfl_df[nfl_df["season"] == cur_year]["game_id"]
+                .str.split("_", expand=True)[1]
+                .dropna().astype(int).max()
+            )
+        except Exception:
+            latest_week = 18
+    else:
+        latest_week = 1
+
+    # Check if the NEXT week has upcoming games (active season)
+    next_week = latest_week + 1
+    if next_week <= 18:
+        d = _get_json(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week={next_week}&dates={cur_year}"
+        )
+        if d:
+            upcoming = [e for e in _parse_entries(d.get("events", []), cur_year, next_week)
+                        if not e["completed"]]
+            if upcoming:
+                return upcoming
+
+    # Check next year's schedule (offseason — ESPN posts it early)
+    d_ny = _get_json(
+        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+        f"?seasontype=2&week=1&dates={next_year}"
+    )
+    if d_ny:
+        upcoming_ny = [e for e in _parse_entries(d_ny.get("events", []), next_year, 1)
+                       if not e["completed"]]
+        if upcoming_ny:
+            return upcoming_ny
+
+    # Fallback — return latest completed week (1 ESPN call)
+    if data_ok:
+        try:
+            d_last = _get_json(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                f"?seasontype=2&week={latest_week}&dates={cur_year}"
+            )
+            if d_last:
+                return _parse_entries(d_last.get("events", []), cur_year, latest_week)
+        except Exception:
+            pass
+
+    return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_game_odds(espn_id: str) -> dict:
+    """
+    Pull game-level odds (spread + over/under) from ESPN's free odds endpoint.
+    Returns a dict with keys: over_under, home_spread, away_spread, book_name.
+    """
+    url = (
+        f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
+        f"/events/{espn_id}/competitions/{espn_id}/odds"
+    )
+    data = _get_json(url)
+    result = {"over_under": None, "home_spread": None,
+              "away_spread": None, "book_name": None}
+    if not data:
+        return result
+    items = data.get("items", [])
+    if not items:
+        return result
+    provider = items[0]
+    result["book_name"]   = provider.get("provider", {}).get("name", "ESPN")
+    result["over_under"]  = provider.get("overUnder")
+    result["home_spread"] = provider.get("homeTeamOdds", {}).get("spreadOdds")
+    result["away_spread"] = provider.get("awayTeamOdds", {}).get("spreadOdds")
+    if result["home_spread"] is None:
+        result["home_spread"] = provider.get("spread")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
 if data_ok:
     with tab8:
-        # ── helpers ───────────────────────────────────────────────────────────
-        # build_defense_table and _COL_TO_POS are now at module level (above)
-
-        @st.cache_data(ttl=3600, show_spinner=False)
-        def fetch_this_weeks_games():
-            """
-            Finds the next/current NFL week and returns upcoming (unplayed) games.
-            Falls back to the most recent completed week during the offseason.
-
-            Fast path: derives the latest week from the already-loaded CSV so
-            only 1–2 ESPN calls are ever needed (no walking all 18 weeks).
-            """
-            import datetime as _dt
-            today    = _dt.date.today()
-            cal_year = today.year if today.month >= 9 else today.year - 1
-            cur_year = int(nfl_df["season"].max()) if data_ok else cal_year
-            next_year = cur_year + 1
-
-            def _parse_entries(events, year, week):
-                entries = []
-                for e in events:
-                    comp  = e["competitions"][0]
-                    done  = comp["status"]["type"]["completed"]
-                    teams = {c["homeAway"]: c["team"]["abbreviation"]
-                             for c in comp["competitors"]}
-                    entries.append({
-                        "home":      teams.get("home", "UNK"),
-                        "away":      teams.get("away", "UNK"),
-                        "date":      e["date"][:10],
-                        "week":      week,
-                        "season":    year,
-                        "completed": done,
-                        "name":      e.get("shortName", e.get("name", "")),
-                        "espn_id":   e.get("id", ""),
-                    })
-                return entries
-
-            # Derive latest completed week from the CSV (free — no ESPN call)
-            if data_ok:
-                try:
-                    latest_week = int(
-                        nfl_df[nfl_df["season"] == cur_year]["game_id"]
-                        .str.split("_", expand=True)[1]
-                        .dropna().astype(int).max()
-                    )
-                except Exception:
-                    latest_week = 18
-            else:
-                latest_week = 1
-
-            # Check if the NEXT week has upcoming games (active season)
-            next_week = latest_week + 1
-            if next_week <= 18:
-                data = _get_json(
-                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                    f"?seasontype=2&week={next_week}&dates={cur_year}"
-                )
-                if data:
-                    events = data.get("events", [])
-                    upcoming = [e for e in _parse_entries(events, cur_year, next_week)
-                                if not e["completed"]]
-                    if upcoming:
-                        return upcoming
-
-            # Check next year's schedule (offseason — ESPN posts it early)
-            data_ny = _get_json(
-                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                f"?seasontype=2&week=1&dates={next_year}"
-            )
-            if data_ny:
-                events_ny = data_ny.get("events", [])
-                upcoming_ny = [e for e in _parse_entries(events_ny, next_year, 1)
-                               if not e["completed"]]
-                if upcoming_ny:
-                    return upcoming_ny
-
-            # Fallback — return latest completed week from the CSV directly
-            # (no ESPN call needed — fast even when ESPN is unavailable)
-            if data_ok:
-                try:
-                    last_week_data = _get_json(
-                        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                        f"?seasontype=2&week={latest_week}&dates={cur_year}"
-                    )
-                    if last_week_data:
-                        events = last_week_data.get("events", [])
-                        return _parse_entries(events, cur_year, latest_week)
-                except Exception:
-                    pass
-
-            return []
-
-        @st.cache_data(ttl=3600, show_spinner=False)
-        def fetch_game_odds(espn_id: str) -> dict:
-            """
-            Pull game-level odds (spread + over/under) from ESPN's free
-            odds endpoint for a single game event ID.
-            Returns a dict with keys: over_under, home_spread, away_spread,
-            book_name.  All values are None if not available.
-            """
-            url = (
-                f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
-                f"/events/{espn_id}/competitions/{espn_id}/odds"
-            )
-            data = _get_json(url)
-            result = {"over_under": None, "home_spread": None,
-                      "away_spread": None, "book_name": None}
-            if not data:
-                return result
-            # ESPN returns a list of odds providers; take the first (consensus)
-            items = data.get("items", [])
-            if not items:
-                return result
-            provider = items[0]
-            result["book_name"]   = provider.get("provider", {}).get("name", "ESPN")
-            result["over_under"]  = provider.get("overUnder")
-            result["home_spread"] = provider.get("homeTeamOdds", {}).get("spreadOdds")
-            result["away_spread"] = provider.get("awayTeamOdds", {}).get("spreadOdds")
-            # spreadOdds is a signed float, e.g. -3.5; try "spread" key as fallback
-            if result["home_spread"] is None:
-                result["home_spread"] = provider.get("spread")
-            return result
-
         # ── build defensive stats table ───────────────────────────────────────
         nfl_def = build_defense_table(nfl_df)
 
