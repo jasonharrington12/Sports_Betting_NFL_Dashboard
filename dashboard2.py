@@ -2751,7 +2751,7 @@ if data_ok:
                         f"from {raw_prop_rows[0]['bookmaker'] if raw_prop_rows else 'book'}."
                     )
                 else:
-                    st.warning("Odds API returned no prop lines — using model-projected lines.")
+                    st.warning("No real prop lines from the Odds API yet — props are usually posted 1–2 days before kickoff. Add your Odds API key above to load them.")
 
             def depth_chart_players(team, stat_col, max_rank=3):
                 """Return the top-N depth chart players for a team/stat combo."""
@@ -2927,26 +2927,10 @@ if data_ok:
                                     real_line = v[mf_stat.lower()]
                                     break
 
-                        if real_line is not None:
-                            suggested_line = real_line
-                            line_source    = "📖 Book"
-                        else:
-                            # If Odds API key is set and returned lines, skip players
-                            # with no book line — only show real posted props
-                            if mf_real_lines:
-                                continue
-                            if col == "passing_yards":
-                                increments = [i + 0.5 for i in range(50, 500, 25)]
-                            elif col in ("rush_yards", "receiving_yards"):
-                                increments = [i + 0.5 for i in range(0, 250, 10)]
-                            elif col == "receptions":
-                                increments = [i + 0.5 for i in range(0, 20, 1)]
-                            elif col == "passing_tds":
-                                increments = [0.5, 1.5, 2.5, 3.5]
-                            else:
-                                increments = [i + 0.5 for i in range(0, 60, 5)]
-                            suggested_line = min(increments, key=lambda x: abs(x - proj))
-                            line_source    = "📐 Model"
+                        if real_line is None:
+                            continue   # no real book line — skip this player entirely
+                        suggested_line = real_line
+                        line_source    = "📖 Book"
 
                         rec = "OVER" if proj > suggested_line else "UNDER"
                         confidence = abs(proj - suggested_line)
@@ -2983,6 +2967,8 @@ if data_ok:
                             "_conf":        confidence,
                         })
 
+                if not prop_rows:
+                    st.info("No real book lines available yet. Add your Odds API key above — props are usually posted 1–2 days before kickoff.")
                 if prop_rows:
                     prop_df = pd.DataFrame(prop_rows).sort_values("_conf", ascending=False)
                     prop_df = prop_df.drop(columns=["_conf"])
