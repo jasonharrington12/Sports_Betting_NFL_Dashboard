@@ -670,43 +670,107 @@ def _scrape_season_live(year, progress_text=None, from_week=1):
 # hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
 # any new games that were played.
 # ──────────────────────────────────────────────────────────────────────────────
+_CSV_GAME_LOGS = _os.path.join(_os.path.dirname(__file__), "nfl_game_logs.csv")
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data():
     """
-    Load 2024 + current-season NFL game logs from the ESPN API.
+    Load 2024 + current-season NFL game logs.
 
-    Cache TTL = 1 hour — new weeks appear automatically after the cache
-    expires.  The scraper stops at the first week with no completed games
-    so it never wastes requests on future weeks.
+    Strategy (fast cold-start for Streamlit Cloud):
+      1. Load bundled nfl_game_logs.csv instantly (no ESPN calls needed).
+      2. Determine the latest week already in the CSV.
+      3. Call ESPN only for weeks newer than what the CSV contains —
+         typically 0–1 scoreboard calls on a game day, nothing otherwise.
 
     Returns (nfl_df, team_changes_df).
     """
     import datetime as _dt
 
-    # NFL season year: Sep–Dec uses the current calendar year,
-    # Jan–Aug uses the previous calendar year (e.g. Jan 2026 → 2025 season).
-    _today     = _dt.date.today()
-    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
+    # Season year detection — probe ESPN week 1 if calendar says new season
+    # may have started but we're not sure games have been played yet.
+    _today    = _dt.date.today()
+    _cal_year = _today.year if _today.month >= 9 else _today.year - 1
+
+    def _has_completed(_year):
+        d = _get_json(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week=1&dates={_year}"
+        )
+        return bool(d and any(
+            e.get("competitions", [{}])[0]
+             .get("status", {}).get("type", {}).get("completed", False)
+            for e in d.get("events", [])
+        ))
+
+    _cur_year  = _cal_year if _has_completed(_cal_year) else _cal_year - 1
     _prev_year = _cur_year - 1
 
+    # ── Step 1: load bundled CSV ───────────────────────────────────────────
+    try:
+        base_df = pd.read_csv(_CSV_GAME_LOGS, low_memory=False)
+        base_df = base_df[base_df["season"].isin([_prev_year, _cur_year])]
+    except FileNotFoundError:
+        base_df = pd.DataFrame()
+
+    # ── Step 2: find latest week already covered per season ───────────────
+    def _latest_week(df, year):
+        sub = df[df["season"] == year] if not df.empty else pd.DataFrame()
+        if sub.empty:
+            return 0
+        try:
+            return (
+                sub["game_id"].str.split("_", expand=True)[1]
+                .dropna().astype(int).max()
+            )
+        except Exception:
+            return 0
+
+    prev_latest = _latest_week(base_df, _prev_year)
+    cur_latest  = _latest_week(base_df, _cur_year)
+
+    # ── Step 3: top-up only new weeks from ESPN ───────────────────────────
     msg  = st.empty()
     prog = st.empty()
-    msg.info(
-        f"Loading {_prev_year} + {_cur_year} NFL data from ESPN… "
-        "first load takes ~3–5 min, then caches for 1 hour."
-    )
 
-    df_prev = _scrape_season_live(_prev_year, prog)
-    df_cur  = _scrape_season_live(_cur_year,  prog)
+    new_rows = []
+    for _year, _from_week in [(_prev_year, prev_latest + 1), (_cur_year, cur_latest + 1)]:
+        if _from_week > 18:
+            continue
+        # Quick check: does ESPN have anything new for this season?
+        probe = _get_json(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week={_from_week}&dates={_year}"
+        )
+        if not probe:
+            continue
+        events = probe.get("events", [])
+        has_new = any(
+            e.get("competitions", [{}])[0]
+             .get("status", {}).get("type", {}).get("completed", False)
+            for e in events
+        )
+        if not has_new:
+            continue
+        msg.info(f"New games found — fetching {_year} from week {_from_week}…")
+        new_df = _scrape_season_live(_year, prog, from_week=_from_week)
+        if not new_df.empty:
+            new_rows.append(new_df)
 
     prog.empty()
     msg.empty()
 
-    if df_prev.empty and df_cur.empty:
+    # ── Combine CSV base + any new rows ───────────────────────────────────
+    parts = [p for p in ([base_df] + new_rows) if not p.empty]
+    if not parts:
         raise RuntimeError(
-            "ESPN API returned no data. It may be temporarily unavailable — "
-            "try refreshing in a minute."
+            "No game log data available. The bundled CSV is missing and ESPN "
+            "did not return data. Try refreshing in a minute."
         )
+
+    combined = pd.concat(parts, ignore_index=True).drop_duplicates()
+    df_prev = combined[combined["season"] == _prev_year].copy()
+    df_cur  = combined[combined["season"] == _cur_year].copy()
 
     # Normalise columns
     _COLS = [
