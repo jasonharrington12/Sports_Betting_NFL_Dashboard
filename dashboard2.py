@@ -2931,6 +2931,10 @@ if data_ok:
                             suggested_line = real_line
                             line_source    = "📖 Book"
                         else:
+                            # If Odds API key is set and returned lines, skip players
+                            # with no book line — only show real posted props
+                            if mf_real_lines:
+                                continue
                             if col == "passing_yards":
                                 increments = [i + 0.5 for i in range(50, 500, 25)]
                             elif col in ("rush_yards", "receiving_yards"):
