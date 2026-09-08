@@ -1828,25 +1828,31 @@ with main_settings:
 
         # ── ESPN API live status check ────────────────────────────────────────
         st.markdown("### 📡 ESPN API Status")
+        # Use the plain scoreboard endpoint (no date params) — lightest possible
+        # ping, always returns the current/most-recent week regardless of season.
         _espn_test_url = (
             "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            "?seasontype=2&week=1&dates=2024"
         )
+        _espn_ok   = False
+        _espn_note = ""
         try:
-            _espn_resp = _requests.get(_espn_test_url, headers=_HEADERS, timeout=8)
-            _espn_ok   = _espn_resp.status_code == 200 and bool(_espn_resp.json().get("events"))
-        except Exception:
-            _espn_ok = False
+            _espn_resp = _requests.get(_espn_test_url, headers=_HEADERS, timeout=15)
+            if _espn_resp.status_code == 200:
+                _espn_ok   = True
+                _espn_note = f"HTTP 200 · {len(_espn_resp.json().get('events', []))} events returned"
+            else:
+                _espn_note = f"HTTP {_espn_resp.status_code}"
+        except Exception as _e:
+            _espn_note = str(_e)
 
         _checked_at = _dt.datetime.now().strftime("%I:%M %p")
         if _espn_ok:
             st.success(
-                f"✅ **ESPN API is online** — data feed is live and responding normally.  "
-                f"Checked at {_checked_at}."
+                f"✅ **ESPN API is online** — {_espn_note}.  Checked at {_checked_at}."
             )
         else:
             st.error(
-                f"❌ **ESPN API is unreachable** — the feed did not respond at {_checked_at}. "
+                f"❌ **ESPN API is unreachable** at {_checked_at} — {_espn_note}.  "
                 "Try the manual refresh below or wait a few minutes and reload the page."
             )
 
