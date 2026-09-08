@@ -2498,73 +2498,90 @@ if data_ok:
         def fetch_this_weeks_games():
             """
             Finds the next/current NFL week and returns upcoming (unplayed) games.
-            Checks the next calendar year first so the upcoming season's schedule
-            shows during the offseason (e.g. 2025 schedule visible in May 2025).
-            Falls back to the most recent completed week if nothing is found.
+            Falls back to the most recent completed week during the offseason.
+
+            Fast path: derives the latest week from the already-loaded CSV so
+            only 1–2 ESPN calls are ever needed (no walking all 18 weeks).
             """
             import datetime as _dt
-            today     = _dt.date.today()
-            cal_year  = today.year if today.month >= 9 else today.year - 1
-            # Use the latest season present in the loaded data as the reference —
-            # this handles the gap between calendar Sep and actual season kick-off.
-            cur_year  = int(nfl_df["season"].max()) if data_ok else cal_year
+            today    = _dt.date.today()
+            cal_year = today.year if today.month >= 9 else today.year - 1
+            cur_year = int(nfl_df["season"].max()) if data_ok else cal_year
             next_year = cur_year + 1
 
-            def _scrape_year(year):
-                """
-                Walk weeks 1-18 for the given year.
-                Returns (upcoming_this_week, last_completed_list).
-                Stops as soon as it finds the first week that has ANY upcoming
-                (not-yet-played) game — so we never accumulate the whole season.
-                """
-                last_completed = []
-                for week in range(1, 19):
-                    url = (
-                        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-                        f"?seasontype=2&week={week}&dates={year}"
+            def _parse_entries(events, year, week):
+                entries = []
+                for e in events:
+                    comp  = e["competitions"][0]
+                    done  = comp["status"]["type"]["completed"]
+                    teams = {c["homeAway"]: c["team"]["abbreviation"]
+                             for c in comp["competitors"]}
+                    entries.append({
+                        "home":      teams.get("home", "UNK"),
+                        "away":      teams.get("away", "UNK"),
+                        "date":      e["date"][:10],
+                        "week":      week,
+                        "season":    year,
+                        "completed": done,
+                        "name":      e.get("shortName", e.get("name", "")),
+                        "espn_id":   e.get("id", ""),
+                    })
+                return entries
+
+            # Derive latest completed week from the CSV (free — no ESPN call)
+            if data_ok:
+                try:
+                    latest_week = int(
+                        nfl_df[nfl_df["season"] == cur_year]["game_id"]
+                        .str.split("_", expand=True)[1]
+                        .dropna().astype(int).max()
                     )
-                    data = _get_json(url)
-                    if not data:
-                        continue
+                except Exception:
+                    latest_week = 18
+            else:
+                latest_week = 1
+
+            # Check if the NEXT week has upcoming games (active season)
+            next_week = latest_week + 1
+            if next_week <= 18:
+                data = _get_json(
+                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                    f"?seasontype=2&week={next_week}&dates={cur_year}"
+                )
+                if data:
                     events = data.get("events", [])
-                    if not events:
-                        break
-                    week_upcoming = []
-                    for e in events:
-                        comp  = e["competitions"][0]
-                        done  = comp["status"]["type"]["completed"]
-                        teams = {c["homeAway"]: c["team"]["abbreviation"]
-                                 for c in comp["competitors"]}
-                        entry = {
-                            "home":      teams.get("home", "UNK"),
-                            "away":      teams.get("away", "UNK"),
-                            "date":      e["date"][:10],
-                            "week":      week,
-                            "season":    year,
-                            "completed": done,
-                            "name":      e.get("shortName", e.get("name", "")),
-                            "espn_id":   e.get("id", ""),
-                        }
-                        if not done:
-                            week_upcoming.append(entry)
-                        else:
-                            last_completed.append(entry)
-                    # As soon as we find a week with upcoming games, return just those
-                    if week_upcoming:
-                        return week_upcoming, last_completed
-                return [], last_completed
+                    upcoming = [e for e in _parse_entries(events, cur_year, next_week)
+                                if not e["completed"]]
+                    if upcoming:
+                        return upcoming
 
-            # Try current season first
-            upcoming, last_completed = _scrape_year(cur_year)
+            # Check next year's schedule (offseason — ESPN posts it early)
+            data_ny = _get_json(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                f"?seasontype=2&week=1&dates={next_year}"
+            )
+            if data_ny:
+                events_ny = data_ny.get("events", [])
+                upcoming_ny = [e for e in _parse_entries(events_ny, next_year, 1)
+                               if not e["completed"]]
+                if upcoming_ny:
+                    return upcoming_ny
 
-            # If no upcoming games in current year, check next year's schedule
-            # (handles offseason when ESPN has already posted the upcoming season)
-            if not upcoming:
-                upcoming_next, _ = _scrape_year(next_year)
-                if upcoming_next:
-                    upcoming = upcoming_next
+            # Fallback — return latest completed week from the CSV directly
+            # (no ESPN call needed — fast even when ESPN is unavailable)
+            if data_ok:
+                try:
+                    last_week_data = _get_json(
+                        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+                        f"?seasontype=2&week={latest_week}&dates={cur_year}"
+                    )
+                    if last_week_data:
+                        events = last_week_data.get("events", [])
+                        return _parse_entries(events, cur_year, latest_week)
+                except Exception:
+                    pass
 
-            return upcoming if upcoming else last_completed[-16:]  # final fallback
+            return []
 
         @st.cache_data(ttl=3600, show_spinner=False)
         def fetch_game_odds(espn_id: str) -> dict:
