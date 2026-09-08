@@ -652,7 +652,7 @@ def _scrape_season_live(year, progress_text=None, from_week=1):
                 if c.get("homeAway") == "home": home = ab
                 else: away = ab
             all_rows.extend(_scrape_game(gid, year, week, home, away))
-            _time.sleep(0.15)
+            _time.sleep(0.35)
 
         # Stop scraping forward weeks once we hit a week with zero completed games
         if not completed_any:
@@ -685,28 +685,8 @@ def load_data():
 
     # NFL season year: Sep–Dec uses the current calendar year,
     # Jan–Aug uses the previous calendar year (e.g. Jan 2026 → 2025 season).
-    # Extra check: if the calendar says the new season should have started but
-    # ESPN shows 0 completed games (pre-season / opening week not yet played),
-    # treat the previous season as the current one so we don't load empty data.
-    _today    = _dt.date.today()
-    _cal_year = _today.year if _today.month >= 9 else _today.year - 1
-
-    # Quick probe: does _cal_year have any completed regular-season games?
-    def _has_completed_games(year):
-        d = _get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week=1&dates={year}"
-        )
-        if not d:
-            return False
-        events = d.get("events", [])
-        return any(
-            e.get("competitions", [{}])[0]
-             .get("status", {}).get("type", {}).get("completed", False)
-            for e in events
-        )
-
-    _cur_year  = _cal_year if _has_completed_games(_cal_year) else _cal_year - 1
+    _today     = _dt.date.today()
+    _cur_year  = _today.year if _today.month >= 9 else _today.year - 1
     _prev_year = _cur_year - 1
 
     msg  = st.empty()
@@ -1825,38 +1805,6 @@ with main_settings:
             "fetches the latest games — no action needed week-to-week."
         )
         st.divider()
-
-        # ── ESPN API live status check ────────────────────────────────────────
-        st.markdown("### 📡 ESPN API Status")
-        # Use the plain scoreboard endpoint (no date params) — lightest possible
-        # ping, always returns the current/most-recent week regardless of season.
-        _espn_test_url = (
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-        )
-        _espn_ok   = False
-        _espn_note = ""
-        try:
-            _espn_resp = _requests.get(_espn_test_url, headers=_HEADERS, timeout=15)
-            if _espn_resp.status_code == 200:
-                _espn_ok   = True
-                _espn_note = f"HTTP 200 · {len(_espn_resp.json().get('events', []))} events returned"
-            else:
-                _espn_note = f"HTTP {_espn_resp.status_code}"
-        except Exception as _e:
-            _espn_note = str(_e)
-
-        _checked_at = _dt.datetime.now().strftime("%I:%M %p")
-        if _espn_ok:
-            st.success(
-                f"✅ **ESPN API is online** — {_espn_note}.  Checked at {_checked_at}."
-            )
-        else:
-            st.error(
-                f"❌ **ESPN API is unreachable** at {_checked_at} — {_espn_note}.  "
-                "Try the manual refresh below or wait a few minutes and reload the page."
-            )
-
-        st.divider()
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### ℹ️ How it works")
@@ -1955,8 +1903,10 @@ with main_settings:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── MATCHUP EDGE (tab6 inside main_bet) ──────────────────────────────────────
-if data_ok:
-    with tab6:
+with tab6:
+    if not data_ok:
+        st.info("Load data first using the **Data Refresh** tab.")
+    else:
         # ── How it works ──────────────────────────────────────────────────────
         # "Defensive average" = how many yards / TDs that stat category's
         # position group has put up AGAINST each team on average.
@@ -2191,8 +2141,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # PARLAY BUILDER (tab7 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab7:
+with tab7:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         # ── session-state parlay list ─────────────────────────────────────────
         if "parlay_legs" not in st.session_state:
             st.session_state["parlay_legs"] = []   # list of dicts
@@ -2477,8 +2429,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab8:
+with tab8:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         # ── helpers ───────────────────────────────────────────────────────────
         # build_defense_table and _COL_TO_POS are now at module level (above)
 
@@ -3188,8 +3142,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # INJURY REPORT (tab9 inside main_teams)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab9:
+with tab9:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         @st.cache_data(ttl=1800, show_spinner=False)  # refresh every 30 min
         def fetch_injuries():
             """Fetch current NFL injury report from ESPN API."""
@@ -3289,8 +3245,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # HOME / AWAY SPLITS (tab10 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab10:
+with tab10:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         # Reuse the shared opponent table; derive is_home from the opponent column
         _nfl_ha_base = build_defense_table(nfl_df)
         _ha_parts = _nfl_ha_base["game_id"].str.split("_", expand=True)
@@ -3403,8 +3361,10 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 # START / SIT ADVISOR (tab11 inside main_players)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab11:
+with tab11:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         nfl_ss = build_defense_table(nfl_df)
         all_players_ss = sorted(nfl_df["player_name"].unique())
         all_teams_ss   = sorted(nfl_df["team"].unique())
@@ -3567,8 +3527,10 @@ if data_ok:
 # Falls back to manual paste if no API key is set.
 # ══════════════════════════════════════════════════════════════════════════════
 
-if data_ok:
-    with tab_vegas:
+with tab_vegas:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         st.subheader("📈 Vegas Lines — Live Prop Odds")
         st.caption(
             "Pulls live NFL player prop lines from The Odds API (DraftKings / consensus) "
@@ -4389,8 +4351,10 @@ with main_tracker:
 # ══════════════════════════════════════════════════════════════════════════════
 # SAME-GAME PARLAY BUILDER  (tab_sgp inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
-if data_ok:
-    with tab_sgp:
+with tab_sgp:
+    if not data_ok:
+        st.info("Load data first using the **⚙️ Settings & Data** tab.")
+    else:
         st.subheader("🏟️ Same-Game Parlay Builder")
         st.caption(
             "Pick a live or upcoming game, add prop legs for players in that game, "
