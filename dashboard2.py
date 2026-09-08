@@ -2504,7 +2504,10 @@ if data_ok:
             """
             import datetime as _dt
             today     = _dt.date.today()
-            cur_year  = today.year if today.month >= 9 else today.year - 1
+            cal_year  = today.year if today.month >= 9 else today.year - 1
+            # Use the latest season present in the loaded data as the reference —
+            # this handles the gap between calendar Sep and actual season kick-off.
+            cur_year  = int(nfl_df["season"].max()) if data_ok else cal_year
             next_year = cur_year + 1
 
             def _scrape_year(year):
