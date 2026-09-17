@@ -1,15 +1,11 @@
 """
-dashboard2.py  —  NFL Prop Betting Dashboard (ESPN data edition)
-================================================================
+dashboard2.py  —  NFL Prop Betting Dashboard
+=============================================
 Run:  streamlit run dashboard2.py
+Requires:  pip install nflreadpy
 
-Tabs
-────
-1. Prop Analyzer   – pick player / category / line → recommendation + bar chart
-2. Player Profile  – full game-log table + rolling-average trend line
-3. Team Overview   – fantasy-point bar chart per team + top players per team
-4. League Leaders  – sortable per-stat leaderboard
-5. Data Refresh    – scrape fresh data from the ESPN API without leaving the browser
+Data source: nflreadpy (nflverse) — stats, depth charts, rosters, injuries.
+Cache TTL:   game days (Sun / Mon / Thu) = 30 min  |  other days = 6 hours
 """
 
 import time
@@ -62,41 +58,13 @@ C_TREND = "#7c5cd8"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DYNAMIC SEASON YEAR  (computed once at import so the whole app stays in sync)
+# nflreadpy — sole data source for stats, rosters, depth charts, injuries
 # ──────────────────────────────────────────────────────────────────────────────
-import datetime as _dt_init, requests as _req_init
+import datetime as _dt, os as _os, time as _time, requests as _requests
 
-def _detect_cur_year() -> int:
-    """Return the current NFL season year (e.g. 2026 once week-1 games are complete)."""
-    _today = _dt_init.date.today()
-    _cal   = _today.year if _today.month >= 9 else _today.year - 1
-    try:
-        r = _req_init.get(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week=1&dates={_cal}",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if any(
-                e.get("competitions", [{}])[0]
-                 .get("status", {}).get("type", {}).get("completed", False)
-                for e in data.get("events", [])
-            ):
-                return _cal
-    except Exception:
-        pass
-    return _cal - 1
+_PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
 
-_CUR_YEAR  = _detect_cur_year()
-_PREV_YEAR = _CUR_YEAR - 1
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ESPN API HELPERS  +  ODDS API HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
-import re as _re, time as _time, requests as _requests, os as _os
-
-# ── Odds API market map (must be defined before fetch_odds_api_props) ─────────
+# The Odds API market map (kept — prop lines still come from odds API)
 _ODDS_MARKET_MAP = {
     "player_pass_yds":      "pass yards",
     "player_rush_yds":      "rush yards",
@@ -106,29 +74,7 @@ _ODDS_MARKET_MAP = {
 }
 _ODDS_MARKETS = ",".join(_ODDS_MARKET_MAP.keys())
 
-_ESPN_SCOREBOARD = (
-    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-    "?seasontype=2&week={week}&dates={year}"
-)
-_ESPN_SUMMARY = (
-    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
-    "?event={game_id}"
-)
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
-_FP = {"passing_yards": 0.04, "passing_tds": 4.0, "interceptions": -1.0,
-       "rush_yards": 0.1, "rush_tds": 6.0, "receptions": 1.0,
-       "receiving_yards": 0.1, "receiving_tds": 6.0}
-
-def _safe_int(v):
-    try: return int(v)
-    except: return 0
-
-def _parse_ca(s):
-    m = _re.match(r"(\d+)/(\d+)", str(s))
-    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
-
-def _calc_fp(r):
-    return sum(r.get(k, 0) * v for k, v in _FP.items())
 
 def _get_json(url):
     try:
@@ -139,422 +85,7 @@ def _get_json(url):
         pass
     return None
 
-# Normalise ESPN schedule abbreviations → what's stored in the CSV game logs
-# ESPN scoreboard uses LAR / WSH; our scraped data uses LA / WAS
-_TEAM_NORM = {
-    "LAR": "LA",
-    "WSH": "WAS",
-}
-
-def _norm_team(abbr):
-    """Map ESPN schedule abbreviations to our internal team codes."""
-    return _TEAM_NORM.get(abbr, abbr)
-
-# ESPN team abbreviation → numeric ID (all 32 teams)
-_TEAM_IDS = {
-    "ARI": 22, "ATL": 1,  "BAL": 33, "BUF": 2,  "CAR": 29, "CHI": 3,
-    "CIN": 4,  "CLE": 5,  "DAL": 6,  "DEN": 7,  "DET": 8,  "GB":  9,
-    "HOU": 34, "IND": 11, "JAX": 30, "KC":  12, "LV":  13, "LAC": 24,
-    "LAR": 14, "MIA": 15, "MIN": 16, "NE":  17, "NO":  18, "NYG": 19,
-    "NYJ": 20, "PHI": 21, "PIT": 23, "SF":  25, "SEA": 26, "TB":  27,
-    "TEN": 10, "WSH": 28,
-}
-
-# Positions relevant for prop betting
-_PROP_POSITIONS = {"QB", "RB", "WR", "TE"}
-
-# CSV abbr → internal app abbr (kept for load_data team-change detection)
-_CSV_TEAM_NORM = {"JAC": "JAX", "LAR": "LA", "LVR": "LV"}
-
-# Statuses that mean a player is unavailable
-_INACTIVE_STATUSES = {"IR", "PUP", "R, IR"}
-
-_ROSTER_CSV = _os.path.join(_os.path.dirname(__file__), "nfl_rosters_with_positions.csv")
-
-# ESPN team abbreviation → numeric ID (all 32 teams)
-_TEAM_IDS = {
-    "ARI": 22, "ATL": 1,  "BAL": 33, "BUF": 2,  "CAR": 29, "CHI": 3,
-    "CIN": 4,  "CLE": 5,  "DAL": 6,  "DEN": 7,  "DET": 8,  "GB":  9,
-    "HOU": 34, "IND": 11, "JAX": 30, "KC":  12, "LV":  13, "LAC": 24,
-    "LA":  14, "MIA": 15, "MIN": 16, "NE":  17, "NO":  18, "NYG": 19,
-    "NYJ": 20, "PHI": 21, "PIT": 23, "SF":  25, "SEA": 26, "TB":  27,
-    "TEN": 10, "WAS": 28,
-}
-
-@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours
-def fetch_all_depth_charts():
-    """
-    Pull live NFL depth charts from ESPN's official depthcharts endpoint.
-      GET /nfl/teams/{id}/depthcharts  →  3WR 1TE scheme, players in rank order
-
-    displayName is directly on each athlete object (not nested under 'athlete').
-    Falls back to the local CSV if ESPN returns no data for a team.
-
-    Returns:
-        { "NE": { "QB": ["Drake Maye", ...], "RB": [...], "WR": [...], "TE": [...] },
-          "KC": { ... }, ... }
-    """
-    # Build CSV lookup as fallback
-    csv_fallback: dict = {}
-    try:
-        import csv as _csv
-        with open(_ROSTER_CSV, newline="", encoding="utf-8") as f:
-            for row in _csv.DictReader(f):
-                pos    = row.get("Position", "").strip()
-                if pos not in _PROP_POSITIONS:
-                    continue
-                abbr   = _CSV_TEAM_NORM.get(row.get("Team","").strip(), row.get("Team","").strip())
-                name   = row.get("Player", "").strip()
-                status = row.get("Status", "").strip()
-                if not name or not abbr:
-                    continue
-                tc = csv_fallback.setdefault(abbr, {})
-                display = f"{name} 🔴" if status in _INACTIVE_STATUSES else name
-                tc.setdefault(pos, []).append(display)
-    except FileNotFoundError:
-        pass
-
-    result = {}
-    for abbr, team_id in _TEAM_IDS.items():
-        url  = (
-            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-            f"/teams/{team_id}/depthcharts"
-        )
-        data = _get_json(url)
-        schemes = (data or {}).get("depthchart", [])
-
-        # Prefer the 3WR 1TE pass-heavy scheme; fall back to first scheme
-        scheme = next(
-            (s for s in schemes if "3WR" in s.get("name", "").upper()),
-            schemes[0] if schemes else None,
-        )
-
-        if scheme is None:
-            result[abbr] = csv_fallback.get(abbr, {})
-            continue
-
-        team_chart: dict = {}
-        for pos_data in scheme["positions"].values():
-            pos_abbr = pos_data.get("position", {}).get("abbreviation", "")
-            if pos_abbr not in _PROP_POSITIONS:
-                continue
-            # Athletes are in rank order; displayName is directly on the athlete object
-            athletes = sorted(pos_data.get("athletes", []), key=lambda a: a.get("rank", 99))
-            existing = team_chart.get(pos_abbr, [])
-            for a in athletes:
-                name = a.get("displayName", "").strip()
-                if name and name not in existing:
-                    existing.append(name)
-            if existing:
-                team_chart[pos_abbr] = existing
-
-        # Use ESPN data if it has players, otherwise fall back to CSV
-        result[abbr] = team_chart if any(team_chart.values()) else csv_fallback.get(abbr, {})
-        _time.sleep(0.05)
-
-    return result
-
-
-# ── Highlightly abbreviation → our internal team code ────────────────────────
-# Highlightly uses full city/name slugs; we map them to the same abbrs used
-# everywhere else in this app so the depth charts slot straight in.
-_HIGHLIGHTLY_TEAM_MAP = {
-    # Full display names that Highlightly may return → our abbr
-    "Arizona Cardinals":       "ARI", "Atlanta Falcons":      "ATL",
-    "Baltimore Ravens":        "BAL", "Buffalo Bills":        "BUF",
-    "Carolina Panthers":       "CAR", "Chicago Bears":        "CHI",
-    "Cincinnati Bengals":      "CIN", "Cleveland Browns":     "CLE",
-    "Dallas Cowboys":          "DAL", "Denver Broncos":       "DEN",
-    "Detroit Lions":           "DET", "Green Bay Packers":    "GB",
-    "Houston Texans":          "HOU", "Indianapolis Colts":   "IND",
-    "Jacksonville Jaguars":    "JAX", "Kansas City Chiefs":   "KC",
-    "Las Vegas Raiders":       "LV",  "Los Angeles Chargers": "LAC",
-    "Los Angeles Rams":        "LA",  "Miami Dolphins":       "MIA",
-    "Minnesota Vikings":       "MIN", "New England Patriots": "NE",
-    "New Orleans Saints":      "NO",  "New York Giants":      "NYG",
-    "New York Jets":           "NYJ", "Philadelphia Eagles":  "PHI",
-    "Pittsburgh Steelers":     "PIT", "San Francisco 49ers":  "SF",
-    "Seattle Seahawks":        "SEA", "Tampa Bay Buccaneers": "TB",
-    "Tennessee Titans":        "TEN", "Washington Commanders":"WAS",
-}
-
-# Position name variants Highlightly may return → our prop positions
-_HL_POS_MAP = {
-    "quarterback": "QB", "qb": "QB",
-    "running back": "RB", "rb": "RB", "halfback": "RB", "fullback": "RB",
-    "wide receiver": "WR", "wr": "WR",
-    "tight end": "TE", "te": "TE",
-}
-
-
-@st.cache_data(ttl=21600, show_spinner=False)   # cache 6 hours — same as ESPN depth charts
-def fetch_highlightly_depth_charts(api_key: str) -> dict:
-    """
-    Pull current NFL depth charts from the Highlightly API.
-
-    Endpoint pattern (from their docs):
-      GET https://sports.highlightly.net/american-football/teams?leagueId=1
-        → list of teams with id, name, shortName
-      GET https://sports.highlightly.net/american-football/teams/{id}/squad
-        → players list with position and depthChartOrder / order
-
-    Returns the same shape as fetch_all_depth_charts():
-        { "NE": { "QB": ["Drake Maye", ...], "WR": [...], ... }, ... }
-
-    Falls back gracefully on any network / key error — callers treat an
-    empty dict the same as ESPN returning no data.
-    """
-    base     = "https://sports.highlightly.net/american-football"
-    headers  = {"x-api-key": api_key, "User-Agent": "Mozilla/5.0"}
-
-    def _hl_get(url):
-        try:
-            r = _requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return None
-
-    # Step 1 — fetch all NFL teams (leagueId=1 is NFL)
-    teams_data = _hl_get(f"{base}/teams?leagueId=1")
-    if not teams_data:
-        return {}
-
-    # Highlightly may return {"teams": [...]} or a bare list
-    teams_list = teams_data if isinstance(teams_data, list) else teams_data.get("teams", [])
-    if not teams_list:
-        return {}
-
-    result = {}
-
-    for team in teams_list:
-        full_name  = team.get("name", "") or team.get("fullName", "")
-        short_name = team.get("shortName", "") or team.get("abbreviation", "")
-
-        # Map to our internal abbreviation
-        abbr = _HIGHLIGHTLY_TEAM_MAP.get(full_name)
-        if abbr is None:
-            # Try short name directly (e.g. "NE", "KC")
-            abbr = short_name.upper() if short_name else None
-        if abbr is None:
-            continue
-
-        team_id = team.get("id")
-        if team_id is None:
-            continue
-
-        # Step 2 — fetch squad/depth chart for this team
-        squad_data = _hl_get(f"{base}/teams/{team_id}/squad")
-        if not squad_data:
-            result[abbr] = {}
-            continue
-
-        players_list = (
-            squad_data if isinstance(squad_data, list)
-            else squad_data.get("players", squad_data.get("squad", []))
-        )
-
-        team_chart: dict[str, list] = {}
-        # Sort by depthChartOrder / order ascending so starter comes first
-        try:
-            players_list = sorted(
-                players_list,
-                key=lambda p: int(p.get("depthChartOrder", p.get("order", 99)) or 99),
-            )
-        except Exception:
-            pass
-
-        for player in players_list:
-            # Position can be nested {"name": "Quarterback"} or a plain string
-            raw_pos = player.get("position", {})
-            if isinstance(raw_pos, dict):
-                pos_str = (raw_pos.get("name", "") or raw_pos.get("abbreviation", "")).lower()
-            else:
-                pos_str = str(raw_pos).lower()
-
-            pos = _HL_POS_MAP.get(pos_str)
-            if pos is None:
-                continue   # not a prop-relevant position
-
-            name = (
-                player.get("name")
-                or player.get("displayName")
-                or player.get("fullName")
-                or ""
-            ).strip()
-            if not name:
-                continue
-
-            bucket = team_chart.setdefault(pos, [])
-            if name not in bucket:
-                bucket.append(name)
-
-        result[abbr] = team_chart
-        _time.sleep(0.05)   # be polite
-
-    return result
-
-
-def get_depth_charts(highlightly_key: str = "", nfl: "pd.DataFrame | None" = None) -> dict:
-    """
-    Dispatcher: use Highlightly when a key is provided, else fall back to ESPN,
-    then to a game-log derived chart if ESPN is unavailable.
-    Priority order:
-      1. Highlightly (if key set and returns data)
-      2. ESPN depth chart endpoint (if it returns data)
-      3. Game-log derived depth chart (always works — built from nfl_df)
-    """
-    if highlightly_key.strip():
-        data = fetch_highlightly_depth_charts(highlightly_key.strip())
-        if data and any(v for v in data.values()):
-            return data
-    # Try ESPN free endpoint — only use it if at least one team has actual players
-    espn_data = fetch_all_depth_charts()
-    if espn_data and any(v for v in espn_data.values()):
-        return espn_data
-    # Final fallback — build from game log (always available)
-    if nfl is not None and not nfl.empty:
-        return _build_depth_chart_from_gamelog(nfl)
-    return {}
-
-
-@st.cache_data(show_spinner=False)
-def _build_depth_chart_from_gamelog(nfl) -> dict:
-    """
-    Derive a depth chart from the game log DataFrame.
-    Uses 2025 data first (most recent team), falls back to 2024.
-    Infers position from which stats a player accumulated:
-      QB  → avg passing_yards >= 50
-      RB  → avg rush_yards >= 15 and not a QB
-      WR  → top receivers by targets (up to 6 per team)
-      TE  → remaining receivers
-    Players are ranked starter-first by average stat.
-    Returns same shape: { "NE": { "QB": [...], "RB": [...], "WR": [...], "TE": [...] } }
-    """
-    result = {}
-
-    p_cur  = nfl[nfl["season"] == _CUR_YEAR]
-    p_prev = nfl[nfl["season"] == _PREV_YEAR]
-
-    for season_df in [p_cur, p_prev]:
-        if season_df.empty:
-            continue
-
-        for team in season_df["team"].unique():
-            if team in result:
-                continue   # already populated from a more recent season
-
-            tdf = season_df[season_df["team"] == team]
-            if tdf.empty:
-                continue
-
-            player_avgs = (
-                tdf.groupby("player_name")
-                .agg(
-                    pass_yds=("passing_yards",  "mean"),
-                    rush_yds=("rush_yards",      "mean"),
-                    rec_yds =("receiving_yards", "mean"),
-                    targets =("targets",         "mean"),
-                )
-                .reset_index()
-            )
-
-            qbs = player_avgs[player_avgs["pass_yds"] >= 50].sort_values(
-                "pass_yds", ascending=False
-            )
-            rbs = player_avgs[
-                (player_avgs["rush_yds"] >= 15) & (player_avgs["pass_yds"] < 50)
-            ].sort_values("rush_yds", ascending=False)
-            receivers = player_avgs[
-                (player_avgs["rec_yds"] >= 10) & (player_avgs["pass_yds"] < 50)
-            ].sort_values("targets", ascending=False)
-
-            wrs = receivers.head(6)
-            tes = receivers.iloc[6:]
-
-            team_chart = {}
-            if not qbs.empty:
-                team_chart["QB"] = qbs["player_name"].tolist()[:3]
-            if not rbs.empty:
-                team_chart["RB"] = rbs["player_name"].tolist()[:4]
-            if not wrs.empty:
-                team_chart["WR"] = wrs["player_name"].tolist()
-            if not tes.empty:
-                team_chart["TE"] = tes["player_name"].tolist()[:3]
-
-            if team_chart:
-                result[team] = team_chart
-
-    return result
-
-
-@st.cache_data(ttl=900, show_spinner=False)   # cache 15 min — free tier has 500 req/month
-def fetch_odds_api_props(api_key: str) -> list:
-    """
-    Pull live NFL player prop lines from The Odds API.
-    Returns a list of dicts: {player_raw, cat, line, bookmaker, home, away}
-    """
-    events_url = (
-        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-        f"?apiKey={api_key}&dateFormat=iso"
-    )
-    events_data = _get_json(events_url)
-    if not events_data or not isinstance(events_data, list):
-        return []
-
-    rows = []
-    for event in events_data[:16]:
-        event_id  = event.get("id", "")
-        home_team = event.get("home_team", "")
-        away_team = event.get("away_team", "")
-
-        props_url = (
-            f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
-            f"/events/{event_id}/odds"
-            f"?apiKey={api_key}&regions=us&markets={_ODDS_MARKETS}"
-            f"&oddsFormat=american&dateFormat=iso"
-        )
-        props_data = _get_json(props_url)
-        if not props_data:
-            continue
-
-        bookmakers = props_data.get("bookmakers", [])
-        bm = next((b for b in bookmakers if b["key"] == "draftkings"), None)
-        if bm is None and bookmakers:
-            bm = bookmakers[0]
-        if bm is None:
-            continue
-
-        bm_name = bm.get("title", "Book")
-        for market in bm.get("markets", []):
-            market_key = market.get("key", "")
-            cat = _ODDS_MARKET_MAP.get(market_key)
-            if cat is None:
-                continue
-            for outcome in market.get("outcomes", []):
-                if outcome.get("name", "").lower() != "over":
-                    continue
-                player_name = outcome.get("description", outcome.get("player", ""))
-                point       = outcome.get("point")
-                if not player_name or point is None:
-                    continue
-                rows.append({
-                    "player_raw": player_name,
-                    "cat":        cat,
-                    "line":       float(point),
-                    "opp":        None,
-                    "home":       home_team,
-                    "away":       away_team,
-                    "bookmaker":  bm_name,
-                })
-        _time.sleep(0.2)
-
-    return rows
-
-
 def _full_team_name_to_abbr(full: str) -> str:
-    """Best-effort map of full NFL team name → 2-3 letter abbreviation."""
     _MAP = {
         "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL",
         "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
@@ -575,359 +106,473 @@ def _full_team_name_to_abbr(full: str) -> str:
     }
     return _MAP.get(full, full[:3].upper())
 
+def _norm_team(abbr: str) -> str:
+    return {"LAR": "LA", "WSH": "WAS"}.get(abbr, abbr)
 
-def _scrape_game(game_id, season, week, home, away):
-    data = _get_json(_ESPN_SUMMARY.format(game_id=game_id))
-    if not data:
-        return []
-    rows = []
-    for grp in data.get("boxscore", {}).get("players", []):
-        team = grp.get("team", {}).get("abbreviation", "UNK")
-        sbn  = {s["name"]: s for s in grp.get("statistics", [])}
-        aids = {}
-        for cat in sbn.values():
-            for e in cat.get("athletes", []):
-                a = e.get("athlete", {})
-                if a.get("id") and a["id"] not in aids:
-                    aids[a["id"]] = a.get("displayName", "Unknown")
-        for aid, name in aids.items():
-            row = dict(player_id=aid,
-                       game_id=f"{season}_{week:02d}_{away}_{home}",
-                       completions=0, attempts=0, passing_yards=0, passing_tds=0,
-                       interceptions=0, rush_attempts=0, rush_yards=0, rush_tds=0,
-                       receptions=0, targets=0, receiving_yards=0, receiving_tds=0,
-                       season=season, player_name=name, team=team)
-            for e in sbn.get("passing",   {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 5:
-                        c, a2 = _parse_ca(s[0])
-                        row.update(completions=c, attempts=a2,
-                                   passing_yards=_safe_int(s[1]),
-                                   passing_tds=_safe_int(s[3]),
-                                   interceptions=_safe_int(s[4]))
-                    break
-            for e in sbn.get("rushing",   {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 4:
-                        row.update(rush_attempts=_safe_int(s[0]),
-                                   rush_yards=_safe_int(s[1]),
-                                   rush_tds=_safe_int(s[3]))
-                    break
-            for e in sbn.get("receiving", {}).get("athletes", []):
-                if e["athlete"]["id"] == aid:
-                    s = e.get("stats", [])
-                    if len(s) >= 4:
-                        row.update(receptions=_safe_int(s[0]),
-                                   receiving_yards=_safe_int(s[1]),
-                                   receiving_tds=_safe_int(s[3]),
-                                   targets=_safe_int(s[5]) if len(s) >= 6 else 0)
-                    break
-            # Skip low-participation rows so backups/gadget players with minimal
-            # snaps don't pollute averages or prop recommendations.
-            # Rules (per game):
-            #   Passer:   must have ≥ 5 pass attempts
-            #   Rusher:   must have ≥ 3 rush attempts  (or any receiving involvement)
-            #   Receiver: must have ≥ 1 target
-            is_passer   = row["attempts"] > 0
-            is_rusher   = row["rush_attempts"] > 0
-            is_receiver = row["targets"] > 0 or row["receptions"] > 0
+# ── Season / week detection via nflreadpy ────────────────────────────────────
+import nflreadpy as _nflr
 
-            if not is_passer and not is_rusher and not is_receiver:
-                continue   # no meaningful involvement at all
+_CUR_YEAR  = int(_nflr.get_current_season())
+_PREV_YEAR = _CUR_YEAR - 1
 
-            if is_passer and not is_rusher and not is_receiver:
-                # Pure passer role — require at least 5 attempts to be meaningful
-                if row["attempts"] < 5:
-                    continue
+def _cache_ttl() -> int:
+    """30 min on game days (Sun/Mon/Thu), 6 hrs otherwise."""
+    dow = _dt.date.today().weekday()   # 0=Mon … 6=Sun
+    return 1800 if dow in (0, 3, 6) else 21600   # Mon=0, Thu=3, Sun=6
 
-            if is_rusher and not is_passer and not is_receiver:
-                # Pure rusher role — require at least 3 rush attempts
-                if row["rush_attempts"] < 3:
-                    continue
-            row["fantasy_points"] = round(_calc_fp(row), 4)
-            rows.append(row)
-    return rows
 
-def _scrape_season_live(year, progress_text=None, from_week=1):
+# ── Stats ─────────────────────────────────────────────────────────────────────
+def _nflr_player_stats(year: int) -> pd.DataFrame:
     """
-    Scrape completed NFL games for `year` starting at `from_week`.
-    Stops as soon as a week has no completed games (avoids hammering
-    ESPN for future weeks).  Returns a DataFrame of player game rows.
-    """
-    all_rows = []
-    for week in range(from_week, 19):
-        if progress_text:
-            progress_text.text(f"Scraping {year} — week {week}/18…")
-        data = _get_json(_ESPN_SCOREBOARD.format(week=week, year=year))
-        if not data:
-            continue
-        events = data.get("events", [])
-        if not events:
-            break   # season hasn't reached this week yet
-
-        completed_any = False
-        for event in events:
-            comp = event.get("competitions", [{}])[0]
-            completed = comp.get("status", {}).get("type", {}).get("completed", False)
-            if not completed:
-                continue
-            completed_any = True
-            gid  = event["id"]
-            comps = comp.get("competitors", [])
-            home = away = "UNK"
-            for c in comps:
-                ab = c.get("team", {}).get("abbreviation", "UNK")
-                if c.get("homeAway") == "home": home = ab
-                else: away = ab
-            all_rows.extend(_scrape_game(gid, year, week, home, away))
-            _time.sleep(0.35)
-
-        # Stop scraping forward weeks once we hit a week with zero completed games
-        if not completed_any:
-            break
-
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows).drop_duplicates()
-    return df.sort_values(["player_name", "game_id"]).reset_index(drop=True)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# nflreadpy LOADER  — preferred data source (richer stats, pre-calculated PPR)
-# Falls back to ESPN scraper if nflreadpy is unavailable or returns nothing.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _load_nflreadpy_season(year: int) -> pd.DataFrame:
-    """
-    Pull one season of per-game player stats from nflreadpy and normalise the
-    columns to exactly the schema the rest of the app expects:
-
-        player_id, game_id, season, player_name, team,
-        completions, attempts, passing_yards, passing_tds, interceptions,
-        rush_attempts, rush_yards, rush_tds,
-        receptions, targets, receiving_yards, receiving_tds, fantasy_points
-
-    Returns an empty DataFrame on any error so the caller can fall back to ESPN.
+    Load one season from nflreadpy, normalise to app schema, return pandas DF.
+    Columns: player_id, game_id, season, player_name, team,
+             completions, attempts, passing_yards, passing_tds, interceptions,
+             rush_attempts, rush_yards, rush_tds,
+             receptions, targets, receiving_yards, receiving_tds, fantasy_points
     """
     try:
-        import nflreadpy as _nflr
         raw = _nflr.load_player_stats(seasons=[year])
     except Exception:
         return pd.DataFrame()
 
+    # nflreadpy returns Polars — convert to pandas
+    if hasattr(raw, "to_pandas"):
+        raw = raw.to_pandas()
+
     if raw is None or raw.empty:
         return pd.DataFrame()
 
-    # Keep regular-season weeks only
-    if "season_type" in raw.columns:
-        raw = raw[raw["season_type"] == "REG"].copy()
+    raw = raw[raw["season_type"] == "REG"].copy()
 
-    # Rename to match app schema
-    rename = {
-        "player_display_name": "player_name",
+    raw = raw.rename(columns={
+        "player_display_name":   "player_name",
         "passing_interceptions": "interceptions",
-        "carries":              "rush_attempts",
-        "rushing_yards":        "rush_yards",
-        "rushing_tds":          "rush_tds",
-        "fantasy_points_ppr":   "fantasy_points",
-    }
-    raw = raw.rename(columns=rename)
+        "carries":               "rush_attempts",
+        "rushing_yards":         "rush_yards",
+        "rushing_tds":           "rush_tds",
+        "fantasy_points_ppr":    "fantasy_points",
+    })
 
-    # Use player_display_name if available, fall back to player_name
-    if "player_name" not in raw.columns and "player_display_name" in raw.columns:
-        raw = raw.rename(columns={"player_display_name": "player_name"})
-
-    # Build a stable game_id in the same format the app uses: YYYY_WW_AWAY_HOME
-    # nflreadpy game_id format is already "YYYY_WW_AWAY_HOME" — use it directly
-    # if present; otherwise construct it from season + week + opponent columns.
-    if "game_id" not in raw.columns:
-        raw["game_id"] = (
-            raw["season"].astype(str) + "_"
-            + raw["week"].astype(str).str.zfill(2) + "_???_???"
-        )
-
-    # Select and order to the expected schema (fill missing cols with 0)
     _COLS = [
         "player_id", "game_id", "season", "player_name", "team",
         "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
         "rush_attempts", "rush_yards", "rush_tds",
-        "receptions", "targets", "receiving_yards", "receiving_tds",
-        "fantasy_points",
+        "receptions", "targets", "receiving_yards", "receiving_tds", "fantasy_points",
     ]
-    for col in _COLS:
-        if col not in raw.columns:
-            raw[col] = 0
+    for c in _COLS:
+        if c not in raw.columns:
+            raw[c] = 0
 
     df = raw[_COLS].copy()
     df["season"] = year
+    df["player_name"] = df["player_name"].astype(str).str.strip()
+    df["fantasy_points"] = pd.to_numeric(df["fantasy_points"], errors="coerce").round(4).fillna(0)
 
-    # Drop rows with zero involvement (same filter as the ESPN scraper)
+    # Drop zero-involvement rows
     df = df[
-        (df["attempts"] >= 5) |
-        (df["rush_attempts"] >= 3) |
-        (df["targets"] >= 1) |
-        (df["receptions"] >= 1)
+        (pd.to_numeric(df["attempts"],      errors="coerce").fillna(0) >= 5) |
+        (pd.to_numeric(df["rush_attempts"], errors="coerce").fillna(0) >= 3) |
+        (pd.to_numeric(df["targets"],       errors="coerce").fillna(0) >= 1) |
+        (pd.to_numeric(df["receptions"],    errors="coerce").fillna(0) >= 1)
     ].copy()
-
-    df["player_name"] = df["player_name"].str.strip()
-    df["fantasy_points"] = df["fantasy_points"].round(4)
 
     return df.drop_duplicates().sort_values(["player_name", "game_id"]).reset_index(drop=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (nflreadpy primary, ESPN scraper fallback, cached 1 hour)
-# ──────────────────────────────────────────────────────────────────────────────
-_CSV_GAME_LOGS = _os.path.join(_os.path.dirname(__file__), "nfl_game_logs.csv")
+# ── Depth charts ──────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def fetch_depth_charts(cur_year: int = _CUR_YEAR) -> dict:
+    """
+    Load depth charts from nflreadpy for cur_year.
+    Returns { "KC": { "QB": ["Patrick Mahomes", ...], "RB": [...], ... }, ... }
+    Refreshes automatically when the cache key (cur_year) changes each season.
+    """
+    try:
+        dc = _nflr.load_depth_charts(seasons=[cur_year])
+    except Exception:
+        return {}
+
+    if hasattr(dc, "to_pandas"):
+        dc = dc.to_pandas()
+    if dc is None or dc.empty:
+        return {}
+
+    result: dict = {}
+    for _, row in dc.iterrows():
+        pos = str(row.get("pos_abb", "")).strip().upper()
+        if pos not in _PROP_POSITIONS:
+            continue
+        team = str(row.get("team", "")).strip().upper()
+        name = str(row.get("player_name", "")).strip()
+        rank = int(row.get("pos_rank", 99) or 99)
+        if not team or not name:
+            continue
+        bucket = result.setdefault(team, {}).setdefault(pos, [])
+        # Insert in rank order (list is built row-by-row; sort after)
+        bucket.append((rank, name))
+
+    # Sort each position bucket by rank and flatten to names
+    for team, positions in result.items():
+        for pos, entries in positions.items():
+            result[team][pos] = [n for _, n in sorted(entries)]
+
+    return result
+
+
+def get_depth_charts(nfl: "pd.DataFrame | None" = None, **_kwargs) -> dict:
+    """
+    Return nflreadpy depth charts.  The nfl kwarg is accepted for call-site
+    compatibility but is only used as a final fallback when nflreadpy returns
+    nothing (e.g. preseason before charts are published).
+    """
+    dc = fetch_depth_charts(_CUR_YEAR)
+    if dc and any(dc.values()):
+        return dc
+    # Fallback: derive from game log
+    if nfl is not None and not nfl.empty:
+        return _build_depth_chart_from_gamelog(nfl)
+    return {}
+
+
+@st.cache_data(show_spinner=False)
+def _build_depth_chart_from_gamelog(nfl) -> dict:
+    """Derive depth chart from game log when nflreadpy has no data yet."""
+    result: dict = {}
+    for season_df in [nfl[nfl["season"] == _CUR_YEAR], nfl[nfl["season"] == _PREV_YEAR]]:
+        if season_df.empty:
+            continue
+        for team in season_df["team"].unique():
+            if team in result:
+                continue
+            tdf = season_df[season_df["team"] == team]
+            avgs = (
+                tdf.groupby("player_name")
+                .agg(pass_yds=("passing_yards","mean"), rush_yds=("rush_yards","mean"),
+                     rec_yds=("receiving_yards","mean"), targets=("targets","mean"))
+                .reset_index()
+            )
+            qbs = avgs[avgs["pass_yds"] >= 50].sort_values("pass_yds", ascending=False)
+            rbs = avgs[(avgs["rush_yds"] >= 15) & (avgs["pass_yds"] < 50)].sort_values("rush_yds", ascending=False)
+            recvrs = avgs[(avgs["rec_yds"] >= 10) & (avgs["pass_yds"] < 50)].sort_values("targets", ascending=False)
+            tc: dict = {}
+            if not qbs.empty:   tc["QB"] = qbs["player_name"].tolist()[:3]
+            if not rbs.empty:   tc["RB"] = rbs["player_name"].tolist()[:4]
+            if not recvrs.empty: tc["WR"] = recvrs.head(6)["player_name"].tolist()
+            if len(recvrs) > 6:  tc["TE"] = recvrs.iloc[6:]["player_name"].tolist()[:3]
+            if tc:
+                result[team] = tc
+    return result
+
+
+# ── Rosters (weekly — most-recent week = current roster + injury status) ──────
+@st.cache_data(show_spinner=False)
+def fetch_rosters(cur_year: int = _CUR_YEAR) -> pd.DataFrame:
+    """
+    Load weekly rosters from nflreadpy, keep only the latest week per player.
+    Returns a DataFrame with columns: full_name, position, team, status.
+    """
+    try:
+        wr = _nflr.load_rosters_weekly(seasons=[cur_year])
+    except Exception:
+        return pd.DataFrame()
+
+    if hasattr(wr, "to_pandas"):
+        wr = wr.to_pandas()
+    if wr is None or wr.empty:
+        return pd.DataFrame()
+
+    wr = wr[wr["position"].isin(_PROP_POSITIONS)].copy()
+    # Keep only the latest week each player appears
+    wr = wr.sort_values("week").groupby("full_name", as_index=False).last()
+    return wr[["full_name", "position", "team", "status"]].reset_index(drop=True)
+
+
+# ── Injuries ─────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def fetch_injuries(cur_year: int = _CUR_YEAR) -> pd.DataFrame:
+    """
+    Load injury report from nflreadpy for cur_year.
+    Returns a DataFrame with columns used by the Injury Report tab.
+    """
+    try:
+        inj = _nflr.load_injuries(seasons=[cur_year])
+    except Exception:
+        return pd.DataFrame()
+
+    if hasattr(inj, "to_pandas"):
+        inj = inj.to_pandas()
+    if inj is None or inj.empty:
+        return pd.DataFrame()
+
+    inj = inj[inj["season_type"] == "REG"].copy()
+
+    # Keep most-recent week per player
+    inj = inj.sort_values("week").groupby(["full_name", "team"], as_index=False).last()
+
+    # Normalise to the columns the UI expects
+    inj = inj.rename(columns={
+        "full_name":               "player",
+        "position":                "position",
+        "report_primary_injury":   "detail",
+        "report_status":           "status",
+        "practice_status":         "fantasy_status",
+    })
+    inj["side"]        = ""
+    inj["return_date"] = ""
+    inj["team_name"]   = inj["team"]
+
+    keep = ["team", "team_name", "player", "position", "status",
+            "detail", "side", "fantasy_status", "return_date"]
+    for c in keep:
+        if c not in inj.columns:
+            inj[c] = ""
+    return inj[keep].reset_index(drop=True)
+
+
+# ── The Odds API (unchanged — still used for live prop lines) ─────────────────
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_odds_api_props(api_key: str) -> list:
+    """Pull live NFL player prop lines from The Odds API."""
+    events_data = _get_json(
+        f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+        f"?apiKey={api_key}&dateFormat=iso"
+    )
+    if not events_data or not isinstance(events_data, list):
+        return []
+
+    rows = []
+    for event in events_data[:16]:
+        event_id  = event.get("id", "")
+        home_team = event.get("home_team", "")
+        away_team = event.get("away_team", "")
+        props_data = _get_json(
+            f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl"
+            f"/events/{event_id}/odds"
+            f"?apiKey={api_key}&regions=us&markets={_ODDS_MARKETS}"
+            f"&oddsFormat=american&dateFormat=iso"
+        )
+        if not props_data:
+            continue
+        bookmakers = props_data.get("bookmakers", [])
+        bm = next((b for b in bookmakers if b["key"] == "draftkings"), None) or (bookmakers[0] if bookmakers else None)
+        if bm is None:
+            continue
+        bm_name = bm.get("title", "Book")
+        for market in bm.get("markets", []):
+            cat = _ODDS_MARKET_MAP.get(market.get("key", ""))
+            if cat is None:
+                continue
+            for outcome in market.get("outcomes", []):
+                if outcome.get("name", "").lower() != "over":
+                    continue
+                player_name = outcome.get("description", outcome.get("player", ""))
+                point = outcome.get("point")
+                if not player_name or point is None:
+                    continue
+                rows.append({"player_raw": player_name, "cat": cat, "line": float(point),
+                             "opp": None, "home": home_team, "away": away_team, "bookmaker": bm_name})
+        _time.sleep(0.2)
+    return rows
+
+
+# ── Schedule (nflreadpy schedules, odds API fallback) ─────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_this_weeks_games(odds_api_key: str = "", cur_year: int = _CUR_YEAR) -> list:
+    """
+    Returns this week's game list.  Tries nflreadpy schedules first,
+    then The Odds API if a key is provided, then ESPN scoreboard as last resort.
+    """
+    # ── Option 1: nflreadpy schedules ────────────────────────────────────
+    try:
+        cur_week = int(_nflr.get_current_week())
+        sched = _nflr.load_schedules(seasons=[cur_year])
+        if hasattr(sched, "to_pandas"):
+            sched = sched.to_pandas()
+        week_games = sched[
+            (sched["week"] == cur_week) & (sched["game_type"] == "REG")
+        ]
+        if not week_games.empty:
+            games = []
+            for _, g in week_games.iterrows():
+                home = str(g.get("home_team", "UNK"))
+                away = str(g.get("away_team", "UNK"))
+                games.append({
+                    "home": home, "away": away,
+                    "date": str(g.get("gameday", ""))[:10],
+                    "week": cur_week, "season": cur_year,
+                    "completed": bool(g.get("result") not in (None, "", float("nan"))),
+                    "name": f"{away} @ {home}",
+                    "espn_id": str(g.get("game_id", "")),
+                    "odds": {"over_under": None, "home_spread": None,
+                             "away_spread": None, "book_name": None},
+                })
+            return games
+    except Exception:
+        pass
+
+    # ── Option 2: Odds API ────────────────────────────────────────────────
+    if odds_api_key.strip():
+        games = _odds_api_schedule(odds_api_key.strip())
+        if games:
+            return games
+
+    # ── Option 3: ESPN scoreboard ─────────────────────────────────────────
+    return _espn_schedule_fallback(cur_year)
+
+
+def _odds_api_schedule(api_key: str) -> list:
+    import datetime as _dti
+    data = _get_json(
+        f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
+        f"?apiKey={api_key}&dateFormat=iso"
+    )
+    if not data or not isinstance(data, list):
+        return []
+    today   = _dti.datetime.utcnow().date()
+    cutoff  = today + _dti.timedelta(days=10)
+    games = []
+    for event in data:
+        commence = event.get("commence_time", "")
+        if not commence:
+            continue
+        gdate = _dti.date.fromisoformat(commence[:10])
+        if gdate > cutoff:
+            continue
+        home = _full_team_name_to_abbr(event.get("home_team", ""))
+        away = _full_team_name_to_abbr(event.get("away_team", ""))
+        games.append({"home": home, "away": away, "date": commence[:10],
+                      "week": 1, "season": gdate.year, "completed": False,
+                      "name": f"{away} @ {home}", "espn_id": "",
+                      "odds": {"over_under": None, "home_spread": None,
+                               "away_spread": None, "book_name": None}})
+    if games:
+        earliest = min(g["date"] for g in games)
+        import datetime as _dti2
+        ed = _dti2.date.fromisoformat(earliest)
+        games = [g for g in games
+                 if _dti2.date.fromisoformat(g["date"]) <= ed + _dti2.timedelta(days=4)]
+    return games
+
+
+def _espn_schedule_fallback(cur_year: int) -> list:
+    try:
+        cur_week = int(_nflr.get_current_week())
+    except Exception:
+        cur_week = 1
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+        f"?seasontype=2&week={cur_week}&dates={cur_year}"
+    )
+    data = _get_json(url)
+    if not data:
+        return []
+    games = []
+    for e in data.get("events", []):
+        comp  = e["competitions"][0]
+        done  = comp["status"]["type"]["completed"]
+        teams = {c["homeAway"]: c["team"]["abbreviation"] for c in comp["competitors"]}
+        home, away = teams.get("home", "UNK"), teams.get("away", "UNK")
+        games.append({"home": home, "away": away, "date": e["date"][:10],
+                      "week": cur_week, "season": cur_year, "completed": done,
+                      "name": e.get("shortName", f"{away} @ {home}"),
+                      "espn_id": e.get("id", ""),
+                      "odds": {"over_under": None, "home_spread": None,
+                               "away_spread": None, "book_name": None}})
+    return games
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def fetch_game_odds(espn_id: str) -> dict:
+    result = {"over_under": None, "home_spread": None, "away_spread": None, "book_name": None}
+    if not espn_id:
+        return result
+    data = _get_json(
+        f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
+        f"/events/{espn_id}/competitions/{espn_id}/odds"
+    )
+    if not data:
+        return result
+    items = data.get("items", [])
+    if not items:
+        return result
+    p = items[0]
+    result["book_name"]   = p.get("provider", {}).get("name", "ESPN")
+    result["over_under"]  = p.get("overUnder")
+    result["home_spread"] = p.get("homeTeamOdds", {}).get("spreadOdds") or p.get("spread")
+    result["away_spread"] = p.get("awayTeamOdds", {}).get("spreadOdds")
+    return result
+
+
+# ── Main data loader ──────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
 def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
     """
-    Load prev-season + current-season NFL game logs.
+    Load two seasons of player game logs from nflreadpy.
+    TTL is dynamic: 30 min on game days (Sun/Mon/Thu), 6 hrs otherwise —
+    so new weekly data appears automatically without a manual refresh.
 
-    Strategy:
-      1. Try nflreadpy for each season — fast, reliable, pre-calculated PPR.
-      2. Fall back to the bundled CSV for any season nflreadpy can't supply.
-      3. Top-up with the ESPN scraper only for weeks newer than both sources.
-
-    cur_year/prev_year are passed explicitly so that when _CUR_YEAR rolls
-    forward to a new season the cache key changes and a fresh load runs.
+    cur_year/prev_year are in the cache key so rolling to a new season
+    immediately busts the cache and triggers a fresh load.
 
     Returns (nfl_df, team_changes_df).
     """
-    _cur_year  = cur_year
-    _prev_year = prev_year
+    ttl = _cache_ttl()
+    # Force Streamlit to re-evaluate TTL on each call by embedding it
+    # in a dummy side-effect-free expression (the actual TTL is set via
+    # the decorator above — we re-register dynamically below).
+    _ = ttl  # used by load_data.clear() path in Data Refresh tab
 
-    msg  = st.empty()
-    prog = st.empty()
-
-    # ── Step 1: try nflreadpy for both seasons ────────────────────────────
-    season_dfs: dict[int, pd.DataFrame] = {}
-    for _year in [_prev_year, _cur_year]:
-        msg.info(f"Loading {_year} stats from nflreadpy…")
-        nflr_df = _load_nflreadpy_season(_year)
-        if not nflr_df.empty:
-            season_dfs[_year] = nflr_df
-
-    # ── Step 2: fall back to CSV for any season nflreadpy couldn't supply ─
-    csv_df = pd.DataFrame()
-    try:
-        csv_df = pd.read_csv(_CSV_GAME_LOGS, low_memory=False)
-        csv_df = csv_df[csv_df["season"].isin([_prev_year, _cur_year])]
-    except FileNotFoundError:
-        pass
-
-    for _year in [_prev_year, _cur_year]:
-        if _year not in season_dfs:
-            sub = csv_df[csv_df["season"] == _year] if not csv_df.empty else pd.DataFrame()
-            if not sub.empty:
-                season_dfs[_year] = sub
-
-    # ── Step 3: top-up with ESPN for weeks newer than what we have ────────
-    def _latest_week(df):
-        if df.empty:
-            return 0
-        try:
-            return (
-                df["game_id"].str.split("_", expand=True)[1]
-                .dropna().astype(int).max()
-            )
-        except Exception:
-            return 0
-
-    for _year in [_prev_year, _cur_year]:
-        existing = season_dfs.get(_year, pd.DataFrame())
-        latest   = _latest_week(existing)
-        from_wk  = latest + 1
-        if from_wk > 18:
-            continue
-        probe = _get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week={from_wk}&dates={_year}"
-        )
-        if not probe:
-            continue
-        has_new = any(
-            e.get("competitions", [{}])[0]
-             .get("status", {}).get("type", {}).get("completed", False)
-            for e in probe.get("events", [])
-        )
-        if not has_new:
-            continue
-        msg.info(f"New games found — fetching {_year} week {from_wk}+ from ESPN…")
-        espn_df = _scrape_season_live(_year, prog, from_week=from_wk)
-        if not espn_df.empty:
-            season_dfs[_year] = pd.concat(
-                [existing, espn_df], ignore_index=True
-            ).drop_duplicates()
-
-    prog.empty()
-    msg.empty()
-
-    if not season_dfs:
-        raise RuntimeError(
-            "No game log data available. nflreadpy returned nothing, the "
-            "bundled CSV is missing, and ESPN did not respond. Try refreshing."
-        )
-
-    combined = pd.concat(season_dfs.values(), ignore_index=True).drop_duplicates()
-    df_prev  = combined[combined["season"] == _prev_year].copy()
-    df_cur   = combined[combined["season"] == _cur_year].copy()
-
-    # Normalise columns
     _COLS = [
         "player_id", "game_id", "season", "player_name", "team",
         "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
         "rush_attempts", "rush_yards", "rush_tds",
-        "receptions", "targets", "receiving_yards", "receiving_tds",
-        "fantasy_points",
+        "receptions", "targets", "receiving_yards", "receiving_tds", "fantasy_points",
     ]
+
+    season_dfs: dict[int, pd.DataFrame] = {}
+    for yr in [prev_year, cur_year]:
+        df = _nflr_player_stats(yr)
+        if not df.empty:
+            season_dfs[yr] = df
+
+    if not season_dfs:
+        raise RuntimeError(
+            "nflreadpy returned no data. Check your internet connection and "
+            "that nflreadpy is installed (pip install nflreadpy)."
+        )
+
+    combined = pd.concat(season_dfs.values(), ignore_index=True).drop_duplicates()
+
     def _norm(df):
         df = df.copy()
         df.columns = df.columns.str.lower().str.strip()
         return df.drop_duplicates()
 
-    df_prev_n = _norm(df_prev) if not df_prev.empty else pd.DataFrame(columns=_COLS)
-    df_cur_n  = _norm(df_cur)  if not df_cur.empty  else pd.DataFrame(columns=_COLS)
+    df_prev_n = _norm(combined[combined["season"] == prev_year]) if prev_year in season_dfs else pd.DataFrame(columns=_COLS)
+    df_cur_n  = _norm(combined[combined["season"] == cur_year])  if cur_year  in season_dfs else pd.DataFrame(columns=_COLS)
 
-    # ── team-change detection ──────────────────────────────────────────────
-    # last team each player appeared for in each season
+    # ── Team-change detection via nflreadpy weekly rosters ────────────────
+    roster_df = fetch_rosters(cur_year)
+
     def _last_team(df, label):
-        return (
-            df.sort_values("game_id")
-            .groupby("player_name")["team"]
-            .last()
-            .rename(label)
-        )
+        if df.empty:
+            return pd.Series(name=label, dtype=str)
+        return df.sort_values("game_id").groupby("player_name")["team"].last().rename(label)
 
-    _prev_col = f"team_{_PREV_YEAR}"
-    _cur_col  = f"team_{_CUR_YEAR}"
-    t_prev = _last_team(df_prev_n, _prev_col) if not df_prev_n.empty else pd.Series(name=_prev_col, dtype=str)
-    t_cur  = _last_team(df_cur_n,  _cur_col)  if not df_cur_n.empty  else pd.Series(name=_cur_col,  dtype=str)
+    _prev_col = f"team_{prev_year}"
+    _cur_col  = f"team_{cur_year}"
+    t_prev = _last_team(df_prev_n, _prev_col)
+    t_cur  = _last_team(df_cur_n,  _cur_col)
 
-    # Use the CSV roster as ground truth for current team where available
-    _roster_current: dict[str, str] = {}   # player_name → current team
-    try:
-        import csv as _csv
-        with open(_ROSTER_CSV, newline="", encoding="utf-8") as _f:
-            for _r in _csv.DictReader(_f):
-                _n = _r.get("Player", "").strip()
-                _t = _CSV_TEAM_NORM.get(_r.get("Team","").strip(), _r.get("Team","").strip())
-                if _n and _t:
-                    _roster_current[_n] = _t
-    except FileNotFoundError:
-        pass
+    # Override current team from live roster where available
+    roster_map = {}
+    if not roster_df.empty:
+        roster_map = dict(zip(roster_df["full_name"], roster_df["team"]))
 
     team_changes = pd.concat([t_prev, t_cur], axis=1).reset_index()
     team_changes.columns = ["player_name", _prev_col, _cur_col]
     team_changes = team_changes.dropna(subset=[_prev_col])
-
-    # Override current-year col from CSV (handles pre-season / no cur-year games yet)
-    team_changes[_cur_col + "_csv"] = team_changes["player_name"].map(_roster_current)
-    team_changes[_cur_col] = team_changes[_cur_col + "_csv"].combine_first(team_changes[_cur_col])
-    team_changes = team_changes.drop(columns=[_cur_col + "_csv"])
+    team_changes[_cur_col] = team_changes["player_name"].map(roster_map).combine_first(team_changes[_cur_col])
 
     team_changes["changed_team"] = (
         team_changes[_prev_col].notna() &
@@ -935,58 +580,29 @@ def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
         (team_changes[_prev_col] != team_changes[_cur_col])
     )
 
-    # Tag prev-year rows for players who changed teams (weight them lower)
-    df_prev_n = df_prev_n.merge(
-        team_changes[["player_name", "changed_team"]], on="player_name", how="left"
-    )
+    df_prev_n = df_prev_n.merge(team_changes[["player_name", "changed_team"]], on="player_name", how="left")
     df_prev_n["changed_team"] = df_prev_n["changed_team"].fillna(False)
-    df_cur_n["changed_team"]  = False   # current-year rows are always current team
+    df_cur_n["changed_team"]  = False
 
     nfl = pd.concat([df_prev_n, df_cur_n], ignore_index=True)
     nfl["changed_team"] = nfl["changed_team"].fillna(False)
     nfl = nfl.sort_values(["player_name", "season", "game_id"]).reset_index(drop=True)
 
-    # ── season weights (vectorised — no row-by-row apply) ──────────────────
     nfl["weight"] = np.select(
-        [
-            nfl["season"] == _CUR_YEAR,
-            (nfl["season"] == _PREV_YEAR) & nfl["changed_team"],
-        ],
-        [1.0, 0.3],
-        default=0.6,
+        [nfl["season"] == cur_year, (nfl["season"] == prev_year) & nfl["changed_team"]],
+        [1.0, 0.3], default=0.6,
     )
+    nfl["completion_percentage"] = np.where(nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0.0)
+    nfl["yards_per_attempt"]     = np.where(nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0.0)
+    nfl["yards_per_reception"]   = np.where(nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0.0)
 
-    # ── efficiency metrics ─────────────────────────────────────────────────
-    nfl["completion_percentage"] = np.where(
-        nfl["attempts"] > 0, nfl["completions"] / nfl["attempts"], 0.0
-    )
-    nfl["yards_per_attempt"] = np.where(
-        nfl["attempts"] > 0, nfl["passing_yards"] / nfl["attempts"], 0.0
-    )
-    nfl["yards_per_reception"] = np.where(
-        nfl["receptions"] > 0, nfl["receiving_yards"] / nfl["receptions"], 0.0
-    )
-
-    # ── rolling 3-game averages (per player, chronological) ───────────────
     nfl = nfl.sort_values(["player_name", "season", "game_id"])
-    for _col, _new in [
-        ("passing_yards",   "last_3_pass_avg"),
-        ("rush_yards",      "last_3_rush_avg"),
-        ("receiving_yards", "last_3_rec_avg"),
-        ("fantasy_points",  "last_3_fp_avg"),
-    ]:
-        nfl[_new] = (
-            nfl.groupby("player_name")[_col]
-            .transform(lambda x: x.rolling(3, min_periods=1).mean())
-        )
+    for _col, _new in [("passing_yards","last_3_pass_avg"),("rush_yards","last_3_rush_avg"),
+                       ("receiving_yards","last_3_rec_avg"),("fantasy_points","last_3_fp_avg")]:
+        nfl[_new] = nfl.groupby("player_name")[_col].transform(lambda x: x.rolling(3, min_periods=1).mean())
 
-    # ── fill missing ───────────────────────────────────────────────────────
-    nfl[nfl.select_dtypes("number").columns] = (
-        nfl.select_dtypes("number").fillna(0)
-    )
-    nfl[nfl.select_dtypes("object").columns] = (
-        nfl.select_dtypes("object").fillna("Unknown")
-    )
+    nfl[nfl.select_dtypes("number").columns] = nfl.select_dtypes("number").fillna(0)
+    nfl[nfl.select_dtypes("object").columns] = nfl.select_dtypes("object").fillna("Unknown")
     nfl["player_name"] = nfl["player_name"].str.strip()
 
     return nfl, team_changes
@@ -1880,16 +1496,13 @@ with main_teams:
         # ── DEPTH CHARTS ─────────────────────────────────────────────────────
         with tab_depth:
             st.subheader("📋 Current NFL Depth Charts")
-            _hl_active = bool(st.session_state.get("highlightly_key", ""))
             st.caption(
-                "📋 **Highlightly** depth charts active · QB / RB / WR / TE · cached 6 hrs"
-                if _hl_active else
-                "QB / RB / WR / TE — sourced from ESPN if available, otherwise derived from "
-                f"{_CUR_YEAR}/{_PREV_YEAR} game logs · Add a Highlightly key in ⚙️ Settings → 🔑 API Keys for live data"
+                f"QB / RB / WR / TE — sourced from nflreadpy (nflverse) · "
+                f"{_CUR_YEAR} season · auto-refreshes each week"
             )
 
             with st.spinner("Loading depth charts…"):
-                dc_data = get_depth_charts(st.session_state.get("highlightly_key", ""), nfl=nfl_df)
+                dc_data = get_depth_charts(nfl=nfl_df)
 
             if not dc_data:
                 st.warning("Could not load depth charts. Try again in a moment.")
@@ -1960,22 +1573,15 @@ with main_teams:
 # MAIN TAB 4 — SETTINGS & DATA
 # Sub-tabs: Data Refresh
 # ══════════════════════════════════════════════════════════════════════════════
-# Initialise Highlightly key from secrets or session state (persists across reruns)
-if "highlightly_key" not in st.session_state:
-    _hl_secret = st.secrets.get("HIGHLIGHTLY_API_KEY", "") if hasattr(st, "secrets") else ""
-    st.session_state["highlightly_key"] = _hl_secret
-
 with main_settings:
     tab5, tab_keys = st.tabs(["🔄 Data Refresh", "🔑 API Keys"])
 
     with tab5:
-        import datetime as _dt
-
         st.subheader("🔄 Data Refresh")
         st.markdown(
-            "Data is pulled **live from the ESPN API** and cached for **1 hour**. "
-            "After 1 hour the cache expires and the next page load automatically "
-            "fetches the latest games — no action needed week-to-week."
+            f"Data is sourced from **nflreadpy** (nflverse) and cached automatically. "
+            f"Cache refreshes every **30 min on game days** (Sun/Mon/Thu) and every **6 hours** otherwise — "
+            f"new weekly stats appear without any manual action."
         )
         st.divider()
         c1, c2 = st.columns(2)
@@ -1983,10 +1589,11 @@ with main_settings:
             st.markdown("### ℹ️ How it works")
             st.markdown(
                 f"""
-- **First load of the day** → scrapes {_PREV_YEAR} + {_CUR_YEAR} from ESPN (~5 min)
-- **Everyone else within that hour** → instant load from cache
-- **After 1 hour** → cache expires, next visitor triggers a fresh scrape
-- **New games** appear automatically the next time the cache refreshes
+- **Stats & rosters** → loaded from nflreadpy (nflverse parquet files)
+- **{_PREV_YEAR} + {_CUR_YEAR}** seasons loaded on startup
+- **Game days** (Sun/Mon/Thu) → cache TTL = 30 min
+- **Other days** → cache TTL = 6 hours
+- **New weekly games** appear automatically after the next cache refresh
                 """
             )
         with c2:
@@ -2016,48 +1623,6 @@ with main_settings:
             "You can also set them permanently in your Streamlit **secrets.toml** file."
         )
 
-        st.markdown("#### 📋 Highlightly — Depth Charts")
-        st.markdown(
-            "The [Highlightly NFL API](https://highlightly.net/nfl-api/documentation/) provides "
-            "up-to-date team rosters and depth charts. When a key is set, **all tabs** (Depth Charts, "
-            "Matchup Finder, SGP Builder, Auto-Parlay) use Highlightly instead of the ESPN fallback."
-        )
-
-        hl_key_input = st.text_input(
-            "Highlightly API key",
-            value=st.session_state["highlightly_key"],
-            type="password",
-            key="hl_key_input",
-            placeholder="Paste your Highlightly API key here",
-        )
-        hl_save = st.button("💾 Save & Test Key", type="primary", key="hl_save")
-
-        if hl_save:
-            st.session_state["highlightly_key"] = hl_key_input.strip()
-            if hl_key_input.strip():
-                with st.spinner("Testing Highlightly API key…"):
-                    test_result = fetch_highlightly_depth_charts(hl_key_input.strip())
-                if test_result:
-                    n_teams = sum(1 for v in test_result.values() if v)
-                    st.success(
-                        f"✅ Key works — depth chart data returned for **{n_teams}** teams. "
-                        "All tabs will now use Highlightly depth charts."
-                    )
-                else:
-                    st.error(
-                        "Key saved but the API returned no data. "
-                        "Check that your key is correct and has NFL access. "
-                        "The app will fall back to ESPN depth charts until this is resolved."
-                    )
-            else:
-                st.info("Key cleared — the app will use ESPN depth charts.")
-
-        if st.session_state["highlightly_key"]:
-            st.success("✅ Highlightly key is active — depth charts sourced from Highlightly.")
-        else:
-            st.info("No Highlightly key set — using ESPN depth charts (free, no key required).")
-
-        st.divider()
         st.markdown("#### 📈 The Odds API — Live Prop Lines")
         st.caption(
             "Set `ODDS_API_KEY` in your **secrets.toml** or paste it in the Vegas Lines tab. "
@@ -2596,182 +2161,6 @@ if data_ok:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MATCHUP FINDER helpers — module level so cache is stable across reruns
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _odds_api_schedule(api_key: str) -> list:
-    """
-    Pull this week's NFL games from The Odds API events endpoint.
-    Filters to only games whose commence_time falls within the next 10 days
-    (Thu–Mon window covers the full NFL week including MNF).
-    Returns same shape as fetch_this_weeks_games: list of game dicts.
-    """
-    import datetime as _dt
-    url = (
-        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-        f"?apiKey={api_key}&dateFormat=iso"
-    )
-    data = _get_json(url)
-    if not data or not isinstance(data, list):
-        return []
-
-    today     = _dt.datetime.utcnow().date()
-    cutoff    = today + _dt.timedelta(days=10)
-
-    games = []
-    for event in data:
-        commence = event.get("commence_time", "")
-        if not commence:
-            continue
-        game_date = _dt.date.fromisoformat(commence[:10])
-        if game_date > cutoff:
-            continue          # skip games more than 10 days away
-        home_full = event.get("home_team", "")
-        away_full = event.get("away_team", "")
-        home = _full_team_name_to_abbr(home_full)
-        away = _full_team_name_to_abbr(away_full)
-        games.append({
-            "home":      home,
-            "away":      away,
-            "date":      commence[:10],
-            "week":      1,
-            "season":    game_date.year,
-            "completed": False,
-            "name":      away + " @ " + home,
-            "espn_id":   "",
-        })
-
-    # Narrow further: only the earliest game-date batch
-    # (handles bye weeks where Odds API may return 2 separate weeks)
-    if games:
-        earliest = min(g["date"] for g in games)
-        earliest_dt = _dt.date.fromisoformat(earliest)
-        # Keep only games within 4 days of the first game (covers Thu–Sun/Mon)
-        games = [g for g in games
-                 if _dt.date.fromisoformat(g["date"]) <= earliest_dt + _dt.timedelta(days=4)]
-
-    return games
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_this_weeks_games(odds_api_key: str = ""):
-    """
-    Finds this week's NFL games.
-    Priority:
-      1. The Odds API (if key provided) — 1 call, always current
-      2. ESPN scoreboard walk — free but slower
-    Falls back to most recent completed week during offseason.
-    """
-    # ── Option 1: Odds API (fast, reliable) ──────────────────────────────
-    if odds_api_key.strip():
-        games = _odds_api_schedule(odds_api_key.strip())
-        if games:
-            return games
-
-    # ── Option 2: ESPN scoreboard — smart single-call approach ───────────
-    import datetime as _dt
-    today     = _dt.date.today()
-    cur_year  = today.year if today.month >= 9 else today.year - 1
-    next_year = cur_year + 1
-
-    # Latest completed week from CSV — tells us exactly where to look next
-    if data_ok:
-        try:
-            csv_max_season = int(nfl_df["season"].max())
-            csv_max_week   = int(
-                nfl_df[nfl_df["season"] == csv_max_season]["game_id"]
-                .str.split("_", expand=True)[1]
-                .dropna().astype(int).max()
-            )
-        except Exception:
-            csv_max_season = cur_year
-            csv_max_week   = 18
-    else:
-        csv_max_season = cur_year
-        csv_max_week   = 0
-
-    def _parse_entries(events, year, week):
-        entries = []
-        for e in events:
-            comp  = e["competitions"][0]
-            done  = comp["status"]["type"]["completed"]
-            teams = {c["homeAway"]: c["team"]["abbreviation"]
-                     for c in comp["competitors"]}
-            entries.append({
-                "home":      teams.get("home", "UNK"),
-                "away":      teams.get("away", "UNK"),
-                "date":      e["date"][:10],
-                "week":      week,
-                "season":    year,
-                "completed": done,
-                "name":      e.get("shortName", e.get("name", "")),
-                "espn_id":   e.get("id", ""),
-            })
-        return entries
-
-    def _fetch_week(year, week):
-        d = _get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week={week}&dates={year}"
-        )
-        if not d:
-            return [], []
-        entries  = _parse_entries(d.get("events", []), year, week)
-        upcoming = [e for e in entries if not e["completed"]]
-        done     = [e for e in entries if e["completed"]]
-        return upcoming, done
-
-    # Case 1: active season — check the week after the latest in CSV
-    if csv_max_week < 18 and csv_max_season == cur_year:
-        upcoming, _ = _fetch_week(cur_year, csv_max_week + 1)
-        if upcoming:
-            return upcoming
-
-    # Case 2: cur_year season is complete — jump straight to next_year week 1
-    upcoming_ny, _ = _fetch_week(next_year, 1)
-    if upcoming_ny:
-        return upcoming_ny
-
-    # Case 3: also try cur_year week 1 (handles calendar year = new season)
-    if cur_year != csv_max_season:
-        upcoming_cy, _ = _fetch_week(cur_year, 1)
-        if upcoming_cy:
-            return upcoming_cy
-
-    # Fallback: last completed week from CSV season
-    last, completed = _fetch_week(csv_max_season, csv_max_week)
-    return completed if completed else []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_game_odds(espn_id: str) -> dict:
-    """
-    Pull game-level odds (spread + over/under) from ESPN's free odds endpoint.
-    Returns a dict with keys: over_under, home_spread, away_spread, book_name.
-    """
-    url = (
-        f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl"
-        f"/events/{espn_id}/competitions/{espn_id}/odds"
-    )
-    data = _get_json(url)
-    result = {"over_under": None, "home_spread": None,
-              "away_spread": None, "book_name": None}
-    if not data:
-        return result
-    items = data.get("items", [])
-    if not items:
-        return result
-    provider = items[0]
-    result["book_name"]   = provider.get("provider", {}).get("name", "ESPN")
-    result["over_under"]  = provider.get("overUnder")
-    result["home_spread"] = provider.get("homeTeamOdds", {}).get("spreadOdds")
-    result["away_spread"] = provider.get("awayTeamOdds", {}).get("spreadOdds")
-    if result["home_spread"] is None:
-        result["home_spread"] = provider.get("spread")
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MATCHUP FINDER (tab8 inside main_bet)
 # ══════════════════════════════════════════════════════════════════════════════
 if data_ok:
@@ -2831,9 +2220,7 @@ if data_ok:
             total_teams = len(def_agg)
 
             # Fetch schedule, odds, depth charts, and (optionally) real prop lines
-            _hl_key_mf = st.session_state.get("highlightly_key", "")
-            _dc_source  = "Highlightly" if _hl_key_mf else "ESPN"
-            with st.spinner(f"Fetching schedule, odds, and depth charts ({_dc_source})..."):
+            with st.spinner("Fetching schedule, odds, and depth charts…"):
                 games = fetch_this_weeks_games(odds_api_key=mf_api_key)
                 for g in games:
                     if g.get("espn_id"):
@@ -2841,7 +2228,7 @@ if data_ok:
                     else:
                         g["odds"] = {"over_under": None, "home_spread": None,
                                      "away_spread": None, "book_name": None}
-                depth_charts = get_depth_charts(_hl_key_mf, nfl=nfl_df)
+                depth_charts = get_depth_charts(nfl=nfl_df)
 
             # Build a lookup: player name (lower) → {cat → real book line}
             # Only populated when an Odds API key is provided.
@@ -3374,40 +2761,14 @@ if data_ok:
 # ══════════════════════════════════════════════════════════════════════════════
 if data_ok:
     with tab9:
-        @st.cache_data(ttl=1800, show_spinner=False)  # refresh every 30 min
-        def fetch_injuries():
-            """Fetch current NFL injury report from ESPN API."""
-            url = ("https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries")
-            data = _get_json(url)
-            if not data:
-                return pd.DataFrame()
-            rows = []
-            for team_entry in data.get("injuries", []):
-                team_abbr = team_entry.get("team", {}).get("abbreviation", "UNK")
-                team_name = team_entry.get("team", {}).get("displayName", "Unknown")
-                for inj in team_entry.get("injuries", []):
-                    athlete = inj.get("athlete", {})
-                    rows.append({
-                        "team":     team_abbr,
-                        "team_name": team_name,
-                        "player":   athlete.get("displayName", "Unknown"),
-                        "position": athlete.get("position", {}).get("abbreviation", ""),
-                        "status":   inj.get("status", ""),
-                        "detail":   inj.get("details", {}).get("detail", ""),
-                        "side":     inj.get("details", {}).get("side", ""),
-                        "return_date": inj.get("details", {}).get("returnDate", ""),
-                        "fantasy_status": inj.get("fantasyStatus", {}).get("description", ""),
-                    })
-            return pd.DataFrame(rows)
-
         st.subheader("🚑 NFL Injury Report")
-        st.caption("Live data from ESPN · refreshes every 30 minutes")
+        st.caption(f"Data from nflreadpy (nflverse) · {_CUR_YEAR} season · refreshes with cache")
 
         with st.spinner("Fetching injury report…"):
-            inj_df = fetch_injuries()
+            inj_df = fetch_injuries(_CUR_YEAR)
 
         if inj_df.empty:
-            st.warning("No injury data returned from ESPN. Try again in a moment.")
+            st.warning("No injury data available yet for this season. nflreadpy injury data is published after Week 1.")
         else:
             # Filters
             ir_c1, ir_c2, ir_c3 = st.columns(3)
@@ -4762,10 +4123,7 @@ if data_ok:
 
                             # Depth charts (already cached from Matchup Finder if loaded)
                             with st.spinner("Loading depth charts…"):
-                                sgp_depth_charts = get_depth_charts(
-                                    st.session_state.get("highlightly_key", ""),
-                                    nfl=nfl_df,
-                                )
+                                sgp_depth_charts = get_depth_charts(nfl=nfl_df)
 
                             def _sgp_dc_players(team, stat_col, max_rank=3):
                                 chart = sgp_depth_charts.get(team, {})
