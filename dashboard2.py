@@ -967,7 +967,7 @@ with main_bet:
     if not data_ok:
         st.info("Load data first using the **⚙️ Settings & Data** tab.")
     else:
-        tab1, tab6, tab8, tab7, tab_streak, tab_vegas, tab_sgp = st.tabs([
+        tab1, tab6, tab8, tab7, tab_streak, tab_vegas, tab_sgp, tab_sim = st.tabs([
             "📊 Prop Analyzer",
             "🆚 Matchup Edge",
             "🎯 Matchup Finder",
@@ -975,6 +975,7 @@ with main_bet:
             "🔥 Streak Finder",
             "📈 Vegas Lines",
             "🏟️ Same-Game Parlay",
+            "🎲 Game Simulator",
         ])
 
         # ── PROP ANALYZER ────────────────────────────────────────────────────
@@ -4704,3 +4705,352 @@ if data_ok:
                         )
                     elif visible_legs:
                         st.info("Add at least **2 legs** (matching the filter) to calculate SGP odds.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAME SIMULATOR  (tab_sim inside main_bet)
+# Simulates a full game N times using each player's historical distribution,
+# trend-adjusted mean, and matchup-adjusted against the opposing defense.
+# Shows per-player over/under probability vs live or manual prop lines.
+# ══════════════════════════════════════════════════════════════════════════════
+if data_ok:
+    with tab_sim:
+        st.subheader("🎲 Game Simulator")
+        st.caption(
+            "Runs a Monte Carlo simulation of a game using each player's historical "
+            "stat distribution, recent trend, and matchup difficulty vs the opposing defense. "
+            "Compare simulated outcomes directly against prop lines."
+        )
+
+        # ── helpers ───────────────────────────────────────────────────────────
+        _sim_nfl_opp = build_defense_table(nfl_df)
+
+        def _sim_player_params(player_name: str, stat_col: str, opp_team: str) -> dict | None:
+            """
+            Compute simulation parameters for one player vs one opponent.
+            Returns dict with keys: mean, std, trend_mean, matchup_factor, n_games
+            or None if insufficient data.
+            """
+            pdf = find_player(nfl_df, player_name)
+            if pdf.empty:
+                return None
+            # prefer current season, fall back to combined
+            p_cur = pdf[pdf["season"] == _CUR_YEAR]
+            base_df = p_cur if len(p_cur) >= 3 else pdf
+            if base_df.empty or stat_col not in base_df.columns:
+                return None
+
+            vals = pd.to_numeric(base_df[stat_col], errors="coerce").dropna()
+            if len(vals) < 2:
+                return None
+
+            mean_val = float(vals.mean())
+            std_val  = float(vals.std()) if len(vals) > 1 else mean_val * 0.35
+            std_val  = max(std_val, mean_val * 0.10)   # floor at 10% of mean
+
+            # Recent trend: compare last-3 avg to season avg → shift mean
+            last3 = float(vals.tail(3).mean())
+            trend_shift = (last3 - mean_val) * 0.4    # 40% weight on trend
+            trend_mean  = mean_val + trend_shift
+
+            # Matchup factor: how many yards does opp allow vs league avg
+            vs_opp = _sim_nfl_opp[_sim_nfl_opp["opponent"] == opp_team]
+            lg_avg = _sim_nfl_opp.groupby("opponent")[stat_col].mean().mean()
+            opp_avg = float(vs_opp[stat_col].mean()) if not vs_opp.empty else lg_avg
+            matchup_factor = (opp_avg / lg_avg) if lg_avg > 0 else 1.0
+            matchup_factor = max(0.5, min(1.8, matchup_factor))  # clamp
+
+            return {
+                "mean":           mean_val,
+                "std":            std_val,
+                "trend_mean":     trend_mean,
+                "matchup_factor": matchup_factor,
+                "adj_mean":       trend_mean * matchup_factor,
+                "n_games":        len(vals),
+                "last3":          last3,
+            }
+
+        def _run_simulation(params: dict, n_sims: int = 10_000) -> np.ndarray:
+            """Draw n_sims outcomes from a clipped normal centred on adj_mean."""
+            rng = np.random.default_rng(42)
+            raw_draws = rng.normal(params["adj_mean"], params["std"], n_sims)
+            return np.clip(raw_draws, 0, None)   # stats can't be negative
+
+        # ── controls ──────────────────────────────────────────────────────────
+        sim_c1, sim_c2 = st.columns([1, 3])
+
+        with sim_c1:
+            st.markdown("### ⚙️ Setup")
+
+            # Team selectors
+            all_sim_teams = sorted(nfl_df["team"].dropna().unique().tolist())
+            sim_away = st.selectbox("Away team", all_sim_teams,
+                                    index=all_sim_teams.index("KC") if "KC" in all_sim_teams else 0,
+                                    key="sim_away")
+            sim_home = st.selectbox("Home team", all_sim_teams,
+                                    index=all_sim_teams.index("BUF") if "BUF" in all_sim_teams else 1,
+                                    key="sim_home")
+
+            sim_stat = st.selectbox(
+                "Stat to simulate",
+                list(CAT_MAP.keys()),
+                format_func=str.title,
+                key="sim_stat",
+            )
+
+            sim_n = st.select_slider(
+                "Simulations",
+                options=[1_000, 5_000, 10_000, 25_000],
+                value=10_000,
+                key="sim_n",
+            )
+
+            sim_use_trend = st.toggle("Apply recent trend adjustment", value=True,
+                                      key="sim_trend")
+            sim_use_matchup = st.toggle("Apply matchup adjustment", value=True,
+                                        key="sim_matchup")
+
+            st.divider()
+            st.markdown("### 📋 Prop Lines")
+            st.caption("Override any player's line below (leave 0 to skip that player).")
+
+            # Odds API key for live lines
+            _sim_odds_secret = st.secrets.get("ODDS_API_KEY", "") if hasattr(st, "secrets") else ""
+            sim_odds_key = st.text_input(
+                "Odds API key (optional — for live lines)",
+                value=_sim_odds_secret,
+                type="password",
+                key="sim_odds_key",
+                placeholder="Leave blank to enter lines manually",
+            )
+
+            sim_run = st.button("▶ Run Simulation", type="primary",
+                                use_container_width=True, key="sim_run")
+
+        # ── main output ───────────────────────────────────────────────────────
+        with sim_c2:
+            if not sim_run:
+                st.info("👈 Choose two teams, a stat, and click **Run Simulation**.")
+            else:
+                if sim_away == sim_home:
+                    st.error("Away and home teams must be different.")
+                    st.stop()
+
+                stat_col, stat_label = CAT_MAP[sim_stat.lower()]
+
+                # ── Fetch live prop lines if key provided ─────────────────────
+                live_lines: dict = {}   # player_name_lower → line float
+                if sim_odds_key.strip():
+                    with st.spinner("Fetching live prop lines…"):
+                        try:
+                            raw_props = fetch_odds_api_props(sim_odds_key.strip())
+                            for rr in raw_props:
+                                if rr["cat"] == sim_stat.lower():
+                                    live_lines[rr["player_raw"].lower().strip()] = rr["line"]
+                        except Exception:
+                            pass
+                    if live_lines:
+                        st.success(f"✅ Live lines loaded for {len(live_lines)} players.")
+
+                # ── Find skill players for each team ──────────────────────────
+                def _team_players(team: str) -> list[str]:
+                    positions = _COL_TO_POS.get(stat_col, ["QB","RB","WR","TE"])
+                    # get depth-chart order from nflreadpy
+                    dc = fetch_depth_charts(_CUR_YEAR)
+                    team_chart = dc.get(team, {})
+                    ordered = []
+                    for pos in positions:
+                        ordered.extend(team_chart.get(pos, [])[:3])
+                    # fall back to game-log leaders if no depth chart
+                    if not ordered:
+                        gl = nfl_df[
+                            (nfl_df["team"] == team) &
+                            (nfl_df["season"] == _CUR_YEAR) &
+                            (pd.to_numeric(nfl_df[stat_col], errors="coerce") > 0)
+                        ]
+                        if gl.empty:
+                            gl = nfl_df[
+                                (nfl_df["team"] == team) &
+                                (pd.to_numeric(nfl_df[stat_col], errors="coerce") > 0)
+                            ]
+                        ordered = (
+                            gl.groupby("player_name")[stat_col].mean()
+                            .sort_values(ascending=False).head(5).index.tolist()
+                        )
+                    return ordered[:5]
+
+                away_players = _team_players(sim_away)
+                home_players = _team_players(sim_home)
+
+                if not away_players and not home_players:
+                    st.warning("No player data found for either team. Try a different stat or season.")
+                    st.stop()
+
+                # ── Run simulations for every player ──────────────────────────
+                sim_results = []
+
+                for team, players, opp in [
+                    (sim_away, away_players, sim_home),
+                    (sim_home, home_players, sim_away),
+                ]:
+                    for pname in players:
+                        params = _sim_player_params(pname, stat_col, opp)
+                        if params is None:
+                            continue
+
+                        # Override adjustments based on toggles
+                        sim_params = dict(params)
+                        if not sim_use_trend:
+                            sim_params["adj_mean"] = params["mean"] * (params["matchup_factor"] if sim_use_matchup else 1.0)
+                        if not sim_use_matchup:
+                            sim_params["adj_mean"] = (params["trend_mean"] if sim_use_trend else params["mean"])
+                            sim_params["matchup_factor"] = 1.0
+
+                        draws = _run_simulation(sim_params, sim_n)
+
+                        # Determine prop line: live → manual fallback → model projection
+                        pkey = pname.lower().strip()
+                        live_line = live_lines.get(pkey)
+                        # partial name match
+                        if live_line is None:
+                            last_nm = pkey.split()[-1]
+                            for k, v in live_lines.items():
+                                if k.endswith(last_nm):
+                                    live_line = v
+                                    break
+
+                        prop_line  = live_line if live_line is not None else round(sim_params["adj_mean"] * 0.95, 1)
+                        line_src   = "📖 Live" if live_line is not None else "📐 Model"
+
+                        over_pct  = float((draws > prop_line).mean() * 100)
+                        under_pct = 100.0 - over_pct
+                        pick      = "OVER" if over_pct >= 50 else "UNDER"
+                        conf      = max(over_pct, under_pct)
+
+                        sim_results.append({
+                            "team":          team,
+                            "player":        pname,
+                            "stat":          stat_label,
+                            "prop_line":     prop_line,
+                            "line_src":      line_src,
+                            "sim_mean":      round(float(draws.mean()), 1),
+                            "sim_median":    round(float(np.median(draws)), 1),
+                            "sim_p10":       round(float(np.percentile(draws, 10)), 1),
+                            "sim_p90":       round(float(np.percentile(draws, 90)), 1),
+                            "over_pct":      round(over_pct, 1),
+                            "under_pct":     round(under_pct, 1),
+                            "pick":          pick,
+                            "confidence":    round(conf, 1),
+                            "n_games":       params["n_games"],
+                            "matchup_factor": round(params["matchup_factor"], 2),
+                            "last3":         round(params["last3"], 1),
+                            "_draws":        draws,
+                            "_params":       sim_params,
+                        })
+
+                if not sim_results:
+                    st.warning("Not enough historical data to simulate these teams. Try a different stat.")
+                    st.stop()
+
+                # ── Scoreboard header ─────────────────────────────────────────
+                st.markdown(
+                    f'<div style="background:#1f2328;color:#fff;padding:16px 24px;'
+                    f'border-radius:10px;text-align:center;margin-bottom:20px;">'
+                    f'<span style="font-size:28px;font-weight:700;">'
+                    f'{sim_away} <span style="opacity:0.5;font-size:20px;">@</span> {sim_home}'
+                    f'</span><br>'
+                    f'<span style="font-size:13px;opacity:0.7;">'
+                    f'Monte Carlo · {sim_n:,} simulations · {stat_label}'
+                    f'</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ── Summary table ─────────────────────────────────────────────
+                st.subheader("📋 All Players — Simulated vs Prop Line")
+
+                tbl_rows = []
+                for r in sorted(sim_results, key=lambda x: x["confidence"], reverse=True):
+                    pick_icon = "🟢 OVER" if r["pick"] == "OVER" else "🔴 UNDER"
+                    tbl_rows.append({
+                        "Team":         r["team"],
+                        "Player":       r["player"],
+                        "Prop Line":    r["prop_line"],
+                        "Line Source":  r["line_src"],
+                        "Sim Avg":      r["sim_mean"],
+                        "Sim Median":   r["sim_median"],
+                        "P10 – P90":    f'{r["sim_p10"]} – {r["sim_p90"]}',
+                        "Last 3 Avg":   r["last3"],
+                        "Matchup":      f'{r["matchup_factor"]}×',
+                        "Over %":       f'{r["over_pct"]}%',
+                        "Under %":      f'{r["under_pct"]}%',
+                        "Pick":         pick_icon,
+                        "Confidence":   f'{r["confidence"]}%',
+                    })
+
+                st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True)
+
+                # ── Top picks banner ──────────────────────────────────────────
+                st.divider()
+                st.subheader("🏆 Strongest Sim-Based Picks")
+                top_picks = sorted(sim_results, key=lambda x: x["confidence"], reverse=True)[:5]
+                for r in top_picks:
+                    col_color = "#2DC653" if r["pick"] == "OVER" else "#D62828"
+                    st.markdown(
+                        f'<div style="border-left:5px solid {col_color};padding:10px 14px;'
+                        f'background:#f7f8fa;border-radius:6px;margin-bottom:8px;font-size:14px;">'
+                        f'<b>{r["player"]}</b> ({r["team"]}) &nbsp;|&nbsp; '
+                        f'<b>{stat_label} {r["pick"]} {r["prop_line"]}</b> '
+                        f'<span style="color:{col_color};font-weight:700;">({r["over_pct"] if r["pick"]=="OVER" else r["under_pct"]}% sim probability)</span>'
+                        f' &nbsp;·&nbsp; Sim avg: <b>{r["sim_mean"]}</b> &nbsp;·&nbsp; '
+                        f'Range: {r["sim_p10"]}–{r["sim_p90"]} &nbsp;·&nbsp; '
+                        f'{r["line_src"]}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ── Per-player histograms ─────────────────────────────────────
+                st.divider()
+                st.subheader("📊 Simulation Distributions")
+                st.caption("Each histogram shows 10,000 simulated game outcomes. Red line = prop line.")
+
+                # lay out in 2-column grid
+                hist_cols_per_row = 2
+                chunks = [sim_results[i:i+hist_cols_per_row]
+                          for i in range(0, len(sim_results), hist_cols_per_row)]
+
+                for chunk in chunks:
+                    cols = st.columns(len(chunk))
+                    for col_idx, r in enumerate(chunk):
+                        with cols[col_idx]:
+                            fig_s, ax_s = plt.subplots(figsize=(5, 3))
+                            draws = r["_draws"]
+                            ax_s.hist(draws, bins=60, color=C_2025, alpha=0.75,
+                                      edgecolor="white", linewidth=0.3)
+                            ax_s.axvline(r["prop_line"], color=C_LINE, linewidth=1.8,
+                                         linestyle="-", label=f'Line: {r["prop_line"]}')
+                            ax_s.axvline(r["sim_mean"], color=C_AVG, linewidth=1.4,
+                                         linestyle="--", label=f'Sim avg: {r["sim_mean"]}')
+                            ax_s.axvspan(r["sim_p10"], r["sim_p90"],
+                                         alpha=0.10, color=C_TREND,
+                                         label=f'P10–P90: {r["sim_p10"]}–{r["sim_p90"]}')
+                            over_pct = r["over_pct"]
+                            pick_color = "#2DC653" if over_pct >= 50 else "#D62828"
+                            ax_s.set_title(
+                                f'{r["player"]} ({r["team"]})\n'
+                                f'OVER {r["prop_line"]}: {over_pct:.1f}%',
+                                fontsize=9, fontweight="bold", color=pick_color,
+                            )
+                            ax_s.set_xlabel(stat_label, fontsize=8)
+                            ax_s.set_ylabel("Frequency", fontsize=8)
+                            ax_s.legend(fontsize=7, framealpha=0.8)
+                            ax_s.spines["top"].set_visible(False)
+                            ax_s.spines["right"].set_visible(False)
+                            ax_s.tick_params(labelsize=7)
+                            plt.tight_layout()
+                            st.pyplot(fig_s, use_container_width=True)
+                            plt.close(fig_s)
+
+                st.caption(
+                    f"⚠️ Simulations are based on {_PREV_YEAR}/{_CUR_YEAR} game logs. "
+                    "Results are probabilistic estimates, not guaranteed outcomes. Bet responsibly."
+                )
