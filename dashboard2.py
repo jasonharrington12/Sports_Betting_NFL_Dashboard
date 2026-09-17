@@ -109,6 +109,133 @@ def _full_team_name_to_abbr(full: str) -> str:
 def _norm_team(abbr: str) -> str:
     return {"LAR": "LA", "WSH": "WAS"}.get(abbr, abbr)
 
+
+# ── Stadium coordinates (home team → lat/lon + dome flag) ────────────────────
+_STADIUM_COORDS = {
+    "ARI": (33.5277,  -112.2626, True,  "State Farm Stadium"),
+    "ATL": (33.7554,   -84.4008, True,  "Mercedes-Benz Stadium"),
+    "BAL": (39.2780,   -76.6227, False, "M&T Bank Stadium"),
+    "BUF": (42.7738,   -78.7870, False, "Highmark Stadium"),
+    "CAR": (35.2258,   -80.8528, False, "Bank of America Stadium"),
+    "CHI": (41.8623,   -87.6167, False, "Soldier Field"),
+    "CIN": (39.0955,   -84.5160, False, "Paycor Stadium"),
+    "CLE": (41.5061,   -81.6995, False, "Cleveland Browns Stadium"),
+    "DAL": (32.7473,   -97.0945, True,  "AT&T Stadium"),
+    "DEN": (39.7439,   -105.0201,False, "Empower Field"),
+    "DET": (42.3400,   -83.0456, True,  "Ford Field"),
+    "GB":  (44.5013,   -88.0622, False, "Lambeau Field"),
+    "HOU": (29.6847,   -95.4107, True,  "NRG Stadium"),
+    "IND": (39.7601,   -86.1639, True,  "Lucas Oil Stadium"),
+    "JAX": (30.3239,   -81.6373, False, "EverBank Stadium"),
+    "KC":  (39.0489,   -94.4839, False, "Arrowhead Stadium"),
+    "LA":  (33.9535,   -118.3392,True,  "SoFi Stadium"),
+    "LAC": (33.9535,   -118.3392,True,  "SoFi Stadium"),
+    "LV":  (36.0909,   -115.1833,True,  "Allegiant Stadium"),
+    "MIA": (25.9580,   -80.2389, False, "Hard Rock Stadium"),
+    "MIN": (44.9737,   -93.2576, True,  "U.S. Bank Stadium"),
+    "NE":  (42.0909,   -71.2643, False, "Gillette Stadium"),
+    "NO":  (29.9511,   -90.0812, True,  "Caesars Superdome"),
+    "NYG": (40.8136,   -74.0744, False, "MetLife Stadium"),
+    "NYJ": (40.8136,   -74.0744, False, "MetLife Stadium"),
+    "PHI": (39.9008,   -75.1675, False, "Lincoln Financial Field"),
+    "PIT": (40.4468,   -80.0158, False, "Acrisure Stadium"),
+    "SF":  (37.4032,   -121.9698,False, "Levi's Stadium"),
+    "SEA": (47.5952,   -122.3316,False, "Lumen Field"),
+    "TB":  (27.9759,   -82.5033, True,  "Raymond James Stadium"),
+    "TEN": (36.1665,   -86.7713, False, "Nissan Stadium"),
+    "WAS": (38.9076,   -76.8645, False, "Northwest Stadium"),
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_game_weather(home_team: str, game_date: str = "") -> dict:
+    """
+    Fetch forecast weather for the home team's stadium using Open-Meteo (no API key).
+    game_date: YYYY-MM-DD string; if blank uses today.
+    Returns dict with temp_f, wind_mph, precip_mm, condition, is_dome, stadium.
+    """
+    coords = _STADIUM_COORDS.get(home_team)
+    if not coords:
+        return {}
+    lat, lon, is_dome, stadium = coords
+
+    if is_dome:
+        return {
+            "temp_f": 72, "wind_mph": 0, "precip_mm": 0,
+            "condition": "Indoor — controlled climate",
+            "is_dome": True, "stadium": stadium,
+        }
+
+    import datetime as _dtw
+    try:
+        target = _dtw.date.fromisoformat(game_date) if game_date else _dtw.date.today()
+    except ValueError:
+        target = _dt.date.today()
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&daily=temperature_2m_max,precipitation_sum,windspeed_10m_max,weathercode"
+        f"&temperature_unit=fahrenheit&windspeed_unit=mph"
+        f"&timezone=America%2FNew_York"
+        f"&start_date={target}&end_date={target}"
+    )
+    data = _get_json(url)
+    if not data:
+        return {}
+
+    try:
+        daily  = data["daily"]
+        temp_f = daily["temperature_2m_max"][0]
+        wind   = daily["windspeed_10m_max"][0]
+        precip = daily["precipitation_sum"][0]
+        wcode  = int(daily["weathercode"][0])
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+    # WMO weather code → human label
+    _WMO = {
+        0: "Clear", 1: "Mostly Clear", 2: "Partly Cloudy", 3: "Overcast",
+        45: "Fog", 48: "Fog", 51: "Light Drizzle", 53: "Drizzle", 55: "Heavy Drizzle",
+        61: "Light Rain", 63: "Rain", 65: "Heavy Rain",
+        71: "Light Snow", 73: "Snow", 75: "Heavy Snow", 77: "Snow Grains",
+        80: "Showers", 81: "Showers", 82: "Heavy Showers",
+        85: "Snow Showers", 86: "Heavy Snow Showers",
+        95: "Thunderstorm", 96: "Thunderstorm w/ Hail", 99: "Thunderstorm w/ Hail",
+    }
+    condition = _WMO.get(wcode, f"Code {wcode}")
+
+    return {
+        "temp_f":    round(temp_f, 1),
+        "wind_mph":  round(wind,   1),
+        "precip_mm": round(precip, 2),
+        "condition": condition,
+        "is_dome":   False,
+        "stadium":   stadium,
+    }
+
+
+def _weather_sim_factor(weather: dict, stat_col: str) -> float:
+    """
+    Return a multiplier (close to 1.0) that adjusts simulated stats for weather.
+    Only meaningfully affects passing/receiving in high wind or heavy precip.
+    """
+    if not weather or weather.get("is_dome"):
+        return 1.0
+    wind  = weather.get("wind_mph",  0)
+    precip = weather.get("precip_mm", 0)
+    factor = 1.0
+    if stat_col in ("passing_yards", "receiving_yards", "receptions", "passing_tds"):
+        if wind >= 20:   factor -= 0.08
+        if wind >= 30:   factor -= 0.07   # cumulative −15% at 30+ mph
+        if precip >= 5:  factor -= 0.05
+        if precip >= 15: factor -= 0.05   # cumulative −10% in heavy rain
+    if stat_col in ("rush_yards",):
+        if wind >= 25:   factor += 0.03   # teams run more in wind
+        if precip >= 10: factor += 0.02
+    return max(0.60, min(1.15, factor))
+
+
 # ── Season / week detection via nflreadpy ────────────────────────────────────
 import nflreadpy as _nflr
 
@@ -4798,6 +4925,12 @@ if data_ok:
                 key="sim_stat",
             )
 
+            sim_game_date = st.date_input(
+                "Game date (for weather forecast)",
+                value=_dt.date.today(),
+                key="sim_date",
+            )
+
             sim_n = st.select_slider(
                 "Simulations",
                 options=[1_000, 5_000, 10_000, 25_000],
@@ -4809,6 +4942,8 @@ if data_ok:
                                       key="sim_trend")
             sim_use_matchup = st.toggle("Apply matchup adjustment", value=True,
                                         key="sim_matchup")
+            sim_use_weather = st.toggle("Apply weather adjustment", value=True,
+                                        key="sim_weather")
 
             st.divider()
             st.markdown("### 📋 Prop Lines")
@@ -4886,6 +5021,47 @@ if data_ok:
                     st.warning("No player data found for either team. Try a different stat or season.")
                     st.stop()
 
+                # ── Fetch weather ─────────────────────────────────────────────
+                game_date_str = str(sim_game_date)
+                with st.spinner("Fetching weather forecast…"):
+                    weather = fetch_game_weather(sim_home, game_date_str)
+                w_factor = _weather_sim_factor(weather, stat_col) if sim_use_weather else 1.0
+
+                # ── Weather card ──────────────────────────────────────────────
+                if weather:
+                    if weather.get("is_dome"):
+                        w_icon, w_bg = "🏟️", "#e8f4e8"
+                        w_impact = "No weather impact — indoor game"
+                    else:
+                        wind  = weather["wind_mph"]
+                        precip = weather["precip_mm"]
+                        w_icon = "🌧️" if precip > 5 else ("🌬️" if wind > 20 else "☀️")
+                        w_bg   = "#fff3e0" if wind > 20 or precip > 5 else "#e8f4e8"
+                        impact_parts = []
+                        if wind >= 30:   impact_parts.append(f"⚠️ High wind ({wind} mph) — passing reduced ~15%")
+                        elif wind >= 20: impact_parts.append(f"💨 Moderate wind ({wind} mph) — passing reduced ~8%")
+                        if precip >= 15: impact_parts.append(f"🌧️ Heavy precip ({precip} mm) — passing reduced ~10%")
+                        elif precip >= 5: impact_parts.append(f"🌦️ Light precip ({precip} mm) — passing reduced ~5%")
+                        if stat_col == "rush_yards" and (wind >= 25 or precip >= 10):
+                            impact_parts.append("🏃 Run game boosted slightly")
+                        w_impact = " · ".join(impact_parts) if impact_parts else "Minimal weather impact"
+
+                    st.markdown(
+                        f'<div style="background:{w_bg};border:1px solid #e5e7eb;'
+                        f'border-radius:8px;padding:12px 16px;margin-bottom:16px;">'
+                        f'<b>{w_icon} {weather.get("stadium","Stadium")}</b><br>'
+                        f'<span style="font-size:13px;">'
+                        f'🌡️ {weather.get("temp_f","—")}°F &nbsp;·&nbsp; '
+                        f'💨 {weather.get("wind_mph","—")} mph &nbsp;·&nbsp; '
+                        f'🌧️ {weather.get("precip_mm","—")} mm precip &nbsp;·&nbsp; '
+                        f'{weather.get("condition","")}'
+                        f'</span><br>'
+                        f'<span style="font-size:12px;color:#57606a;">{w_impact}'
+                        f'{f" · Sim factor: {w_factor:.2f}×" if sim_use_weather and not weather.get("is_dome") else ""}'
+                        f'</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
                 # ── Run simulations for every player ──────────────────────────
                 sim_results = []
 
@@ -4905,6 +5081,9 @@ if data_ok:
                         if not sim_use_matchup:
                             sim_params["adj_mean"] = (params["trend_mean"] if sim_use_trend else params["mean"])
                             sim_params["matchup_factor"] = 1.0
+
+                        # Apply weather factor to adj_mean
+                        sim_params["adj_mean"] = sim_params["adj_mean"] * w_factor
 
                         draws = _run_simulation(sim_params, sim_n)
 
@@ -4953,6 +5132,9 @@ if data_ok:
                     st.stop()
 
                 # ── Scoreboard header ─────────────────────────────────────────
+                w_note = ""
+                if weather and not weather.get("is_dome") and sim_use_weather and w_factor != 1.0:
+                    w_note = f' · {weather.get("condition","")} {weather.get("wind_mph","")}mph'
                 st.markdown(
                     f'<div style="background:#1f2328;color:#fff;padding:16px 24px;'
                     f'border-radius:10px;text-align:center;margin-bottom:20px;">'
@@ -4960,7 +5142,7 @@ if data_ok:
                     f'{sim_away} <span style="opacity:0.5;font-size:20px;">@</span> {sim_home}'
                     f'</span><br>'
                     f'<span style="font-size:13px;opacity:0.7;">'
-                    f'Monte Carlo · {sim_n:,} simulations · {stat_label}'
+                    f'Monte Carlo · {sim_n:,} simulations · {stat_label}{w_note}'
                     f'</span></div>',
                     unsafe_allow_html=True,
                 )
