@@ -695,10 +695,90 @@ def _scrape_season_live(year, progress_text=None, from_week=1):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING  (ESPN API only — cached for 1 hour so data stays fresh)
-# ttl=3600 means: first visitor triggers a scrape, everyone else for the next
-# hour gets instant loads. After 1 hour it automatically re-scrapes, picking up
-# any new games that were played.
+# nflreadpy LOADER  — preferred data source (richer stats, pre-calculated PPR)
+# Falls back to ESPN scraper if nflreadpy is unavailable or returns nothing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_nflreadpy_season(year: int) -> pd.DataFrame:
+    """
+    Pull one season of per-game player stats from nflreadpy and normalise the
+    columns to exactly the schema the rest of the app expects:
+
+        player_id, game_id, season, player_name, team,
+        completions, attempts, passing_yards, passing_tds, interceptions,
+        rush_attempts, rush_yards, rush_tds,
+        receptions, targets, receiving_yards, receiving_tds, fantasy_points
+
+    Returns an empty DataFrame on any error so the caller can fall back to ESPN.
+    """
+    try:
+        import nflreadpy as _nflr
+        raw = _nflr.load_player_stats(seasons=[year])
+    except Exception:
+        return pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # Keep regular-season weeks only
+    if "season_type" in raw.columns:
+        raw = raw[raw["season_type"] == "REG"].copy()
+
+    # Rename to match app schema
+    rename = {
+        "player_display_name": "player_name",
+        "passing_interceptions": "interceptions",
+        "carries":              "rush_attempts",
+        "rushing_yards":        "rush_yards",
+        "rushing_tds":          "rush_tds",
+        "fantasy_points_ppr":   "fantasy_points",
+    }
+    raw = raw.rename(columns=rename)
+
+    # Use player_display_name if available, fall back to player_name
+    if "player_name" not in raw.columns and "player_display_name" in raw.columns:
+        raw = raw.rename(columns={"player_display_name": "player_name"})
+
+    # Build a stable game_id in the same format the app uses: YYYY_WW_AWAY_HOME
+    # nflreadpy game_id format is already "YYYY_WW_AWAY_HOME" — use it directly
+    # if present; otherwise construct it from season + week + opponent columns.
+    if "game_id" not in raw.columns:
+        raw["game_id"] = (
+            raw["season"].astype(str) + "_"
+            + raw["week"].astype(str).str.zfill(2) + "_???_???"
+        )
+
+    # Select and order to the expected schema (fill missing cols with 0)
+    _COLS = [
+        "player_id", "game_id", "season", "player_name", "team",
+        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
+        "rush_attempts", "rush_yards", "rush_tds",
+        "receptions", "targets", "receiving_yards", "receiving_tds",
+        "fantasy_points",
+    ]
+    for col in _COLS:
+        if col not in raw.columns:
+            raw[col] = 0
+
+    df = raw[_COLS].copy()
+    df["season"] = year
+
+    # Drop rows with zero involvement (same filter as the ESPN scraper)
+    df = df[
+        (df["attempts"] >= 5) |
+        (df["rush_attempts"] >= 3) |
+        (df["targets"] >= 1) |
+        (df["receptions"] >= 1)
+    ].copy()
+
+    df["player_name"] = df["player_name"].str.strip()
+    df["fantasy_points"] = df["fantasy_points"].round(4)
+
+    return df.drop_duplicates().sort_values(["player_name", "game_id"]).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DATA LOADING  (nflreadpy primary, ESPN scraper fallback, cached 1 hour)
 # ──────────────────────────────────────────────────────────────────────────────
 _CSV_GAME_LOGS = _os.path.join(_os.path.dirname(__file__), "nfl_game_logs.csv")
 
@@ -707,85 +787,94 @@ def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
     """
     Load prev-season + current-season NFL game logs.
 
-    Strategy (fast cold-start for Streamlit Cloud):
-      1. Load bundled nfl_game_logs.csv instantly (no ESPN calls needed).
-      2. Determine the latest week already in the CSV.
-      3. Call ESPN only for weeks newer than what the CSV contains —
-         typically 0–1 scoreboard calls on a game day, nothing otherwise.
+    Strategy:
+      1. Try nflreadpy for each season — fast, reliable, pre-calculated PPR.
+      2. Fall back to the bundled CSV for any season nflreadpy can't supply.
+      3. Top-up with the ESPN scraper only for weeks newer than both sources.
 
     cur_year/prev_year are passed explicitly so that when _CUR_YEAR rolls
-    forward to a new season the cache key changes and a fresh scrape runs.
+    forward to a new season the cache key changes and a fresh load runs.
 
     Returns (nfl_df, team_changes_df).
     """
     _cur_year  = cur_year
     _prev_year = prev_year
 
-    # ── Step 1: load bundled CSV ───────────────────────────────────────────
-    try:
-        base_df = pd.read_csv(_CSV_GAME_LOGS, low_memory=False)
-        base_df = base_df[base_df["season"].isin([_prev_year, _cur_year])]
-    except FileNotFoundError:
-        base_df = pd.DataFrame()
+    msg  = st.empty()
+    prog = st.empty()
 
-    # ── Step 2: find latest week already covered per season ───────────────
-    def _latest_week(df, year):
-        sub = df[df["season"] == year] if not df.empty else pd.DataFrame()
-        if sub.empty:
+    # ── Step 1: try nflreadpy for both seasons ────────────────────────────
+    season_dfs: dict[int, pd.DataFrame] = {}
+    for _year in [_prev_year, _cur_year]:
+        msg.info(f"Loading {_year} stats from nflreadpy…")
+        nflr_df = _load_nflreadpy_season(_year)
+        if not nflr_df.empty:
+            season_dfs[_year] = nflr_df
+
+    # ── Step 2: fall back to CSV for any season nflreadpy couldn't supply ─
+    csv_df = pd.DataFrame()
+    try:
+        csv_df = pd.read_csv(_CSV_GAME_LOGS, low_memory=False)
+        csv_df = csv_df[csv_df["season"].isin([_prev_year, _cur_year])]
+    except FileNotFoundError:
+        pass
+
+    for _year in [_prev_year, _cur_year]:
+        if _year not in season_dfs:
+            sub = csv_df[csv_df["season"] == _year] if not csv_df.empty else pd.DataFrame()
+            if not sub.empty:
+                season_dfs[_year] = sub
+
+    # ── Step 3: top-up with ESPN for weeks newer than what we have ────────
+    def _latest_week(df):
+        if df.empty:
             return 0
         try:
             return (
-                sub["game_id"].str.split("_", expand=True)[1]
+                df["game_id"].str.split("_", expand=True)[1]
                 .dropna().astype(int).max()
             )
         except Exception:
             return 0
 
-    prev_latest = _latest_week(base_df, _prev_year)
-    cur_latest  = _latest_week(base_df, _cur_year)
-
-    # ── Step 3: top-up only new weeks from ESPN ───────────────────────────
-    msg  = st.empty()
-    prog = st.empty()
-
-    new_rows = []
-    for _year, _from_week in [(_prev_year, prev_latest + 1), (_cur_year, cur_latest + 1)]:
-        if _from_week > 18:
+    for _year in [_prev_year, _cur_year]:
+        existing = season_dfs.get(_year, pd.DataFrame())
+        latest   = _latest_week(existing)
+        from_wk  = latest + 1
+        if from_wk > 18:
             continue
-        # Quick check: does ESPN have anything new for this season?
         probe = _get_json(
             "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week={_from_week}&dates={_year}"
+            f"?seasontype=2&week={from_wk}&dates={_year}"
         )
         if not probe:
             continue
-        events = probe.get("events", [])
         has_new = any(
             e.get("competitions", [{}])[0]
              .get("status", {}).get("type", {}).get("completed", False)
-            for e in events
+            for e in probe.get("events", [])
         )
         if not has_new:
             continue
-        msg.info(f"New games found — fetching {_year} from week {_from_week}…")
-        new_df = _scrape_season_live(_year, prog, from_week=_from_week)
-        if not new_df.empty:
-            new_rows.append(new_df)
+        msg.info(f"New games found — fetching {_year} week {from_wk}+ from ESPN…")
+        espn_df = _scrape_season_live(_year, prog, from_week=from_wk)
+        if not espn_df.empty:
+            season_dfs[_year] = pd.concat(
+                [existing, espn_df], ignore_index=True
+            ).drop_duplicates()
 
     prog.empty()
     msg.empty()
 
-    # ── Combine CSV base + any new rows ───────────────────────────────────
-    parts = [p for p in ([base_df] + new_rows) if not p.empty]
-    if not parts:
+    if not season_dfs:
         raise RuntimeError(
-            "No game log data available. The bundled CSV is missing and ESPN "
-            "did not return data. Try refreshing in a minute."
+            "No game log data available. nflreadpy returned nothing, the "
+            "bundled CSV is missing, and ESPN did not respond. Try refreshing."
         )
 
-    combined = pd.concat(parts, ignore_index=True).drop_duplicates()
-    df_prev = combined[combined["season"] == _prev_year].copy()
-    df_cur  = combined[combined["season"] == _cur_year].copy()
+    combined = pd.concat(season_dfs.values(), ignore_index=True).drop_duplicates()
+    df_prev  = combined[combined["season"] == _prev_year].copy()
+    df_cur   = combined[combined["season"] == _cur_year].copy()
 
     # Normalise columns
     _COLS = [
