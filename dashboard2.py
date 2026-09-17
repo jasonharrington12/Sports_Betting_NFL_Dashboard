@@ -2473,7 +2473,18 @@ if data_ok:
                         })
 
                 if not prop_rows:
-                    st.info("No real book lines available yet. Add your Odds API key above — props are usually posted 1–2 days before kickoff.")
+                    if not mf_api_key.strip():
+                        st.warning(
+                            "⚠️ **No Odds API key entered.** Paste your key in the field above — "
+                            "only games with live book lines are shown. "
+                            "Get a free key at [the-odds-api.com](https://the-odds-api.com) (500 requests/month free)."
+                        )
+                    else:
+                        st.info(
+                            "No live prop lines found yet for this week. "
+                            "Books typically post player props 1–2 days before kickoff. "
+                            "Try again closer to game day."
+                        )
                 if prop_rows:
                     prop_df = pd.DataFrame(prop_rows).sort_values("_conf", ascending=False)
                     prop_df = prop_df.drop(columns=["_conf"])
