@@ -703,9 +703,9 @@ def _scrape_season_live(year, progress_text=None, from_week=1):
 _CSV_GAME_LOGS = _os.path.join(_os.path.dirname(__file__), "nfl_game_logs.csv")
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_data():
+def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
     """
-    Load 2024 + current-season NFL game logs.
+    Load prev-season + current-season NFL game logs.
 
     Strategy (fast cold-start for Streamlit Cloud):
       1. Load bundled nfl_game_logs.csv instantly (no ESPN calls needed).
@@ -713,11 +713,13 @@ def load_data():
       3. Call ESPN only for weeks newer than what the CSV contains —
          typically 0–1 scoreboard calls on a game day, nothing otherwise.
 
+    cur_year/prev_year are passed explicitly so that when _CUR_YEAR rolls
+    forward to a new season the cache key changes and a fresh scrape runs.
+
     Returns (nfl_df, team_changes_df).
     """
-    # Use the module-level season constants so all code agrees on the same year.
-    _cur_year  = _CUR_YEAR
-    _prev_year = _PREV_YEAR
+    _cur_year  = cur_year
+    _prev_year = prev_year
 
     # ── Step 1: load bundled CSV ───────────────────────────────────────────
     try:
@@ -1219,7 +1221,7 @@ st.caption(f"Live data via ESPN API  ·  {_PREV_YEAR} + {_CUR_YEAR} regular seas
 
 with st.spinner("Loading data…"):
     try:
-        nfl_df, team_changes = load_data()
+        nfl_df, team_changes = load_data(_CUR_YEAR, _PREV_YEAR)
         player_team_map = build_player_team_map(nfl_df)
         data_ok = True
     except Exception as e:
