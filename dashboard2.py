@@ -62,6 +62,36 @@ C_TREND = "#7c5cd8"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DYNAMIC SEASON YEAR  (computed once at import so the whole app stays in sync)
+# ──────────────────────────────────────────────────────────────────────────────
+import datetime as _dt_init, requests as _req_init
+
+def _detect_cur_year() -> int:
+    """Return the current NFL season year (e.g. 2026 once week-1 games are complete)."""
+    _today = _dt_init.date.today()
+    _cal   = _today.year if _today.month >= 9 else _today.year - 1
+    try:
+        r = _req_init.get(
+            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            f"?seasontype=2&week=1&dates={_cal}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if any(
+                e.get("competitions", [{}])[0]
+                 .get("status", {}).get("type", {}).get("completed", False)
+                for e in data.get("events", [])
+            ):
+                return _cal
+    except Exception:
+        pass
+    return _cal - 1
+
+_CUR_YEAR  = _detect_cur_year()
+_PREV_YEAR = _CUR_YEAR - 1
+
+# ──────────────────────────────────────────────────────────────────────────────
 # ESPN API HELPERS  +  ODDS API HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
 import re as _re, time as _time, requests as _requests, os as _os
@@ -404,10 +434,10 @@ def _build_depth_chart_from_gamelog(nfl) -> dict:
     """
     result = {}
 
-    p25 = nfl[nfl["season"] == 2025]
-    p24 = nfl[nfl["season"] == 2024]
+    p_cur  = nfl[nfl["season"] == _CUR_YEAR]
+    p_prev = nfl[nfl["season"] == _PREV_YEAR]
 
-    for season_df in [p25, p24]:
+    for season_df in [p_cur, p_prev]:
         if season_df.empty:
             continue
 
@@ -685,26 +715,9 @@ def load_data():
 
     Returns (nfl_df, team_changes_df).
     """
-    import datetime as _dt
-
-    # Season year detection — probe ESPN week 1 if calendar says new season
-    # may have started but we're not sure games have been played yet.
-    _today    = _dt.date.today()
-    _cal_year = _today.year if _today.month >= 9 else _today.year - 1
-
-    def _has_completed(_year):
-        d = _get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-            f"?seasontype=2&week=1&dates={_year}"
-        )
-        return bool(d and any(
-            e.get("competitions", [{}])[0]
-             .get("status", {}).get("type", {}).get("completed", False)
-            for e in d.get("events", [])
-        ))
-
-    _cur_year  = _cal_year if _has_completed(_cal_year) else _cal_year - 1
-    _prev_year = _cur_year - 1
+    # Use the module-level season constants so all code agrees on the same year.
+    _cur_year  = _CUR_YEAR
+    _prev_year = _PREV_YEAR
 
     # ── Step 1: load bundled CSV ───────────────────────────────────────────
     try:
@@ -785,8 +798,8 @@ def load_data():
         df.columns = df.columns.str.lower().str.strip()
         return df.drop_duplicates()
 
-    df_2024 = _norm(df_prev) if not df_prev.empty else pd.DataFrame(columns=_COLS)
-    df_2025 = _norm(df_cur)  if not df_cur.empty  else pd.DataFrame(columns=_COLS)
+    df_prev_n = _norm(df_prev) if not df_prev.empty else pd.DataFrame(columns=_COLS)
+    df_cur_n  = _norm(df_cur)  if not df_cur.empty  else pd.DataFrame(columns=_COLS)
 
     # ── team-change detection ──────────────────────────────────────────────
     # last team each player appeared for in each season
@@ -798,8 +811,10 @@ def load_data():
             .rename(label)
         )
 
-    t24 = _last_team(df_2024, "team_2024") if not df_2024.empty else pd.Series(name="team_2024", dtype=str)
-    t25 = _last_team(df_2025, "team_2025") if not df_2025.empty else pd.Series(name="team_2025", dtype=str)
+    _prev_col = f"team_{_PREV_YEAR}"
+    _cur_col  = f"team_{_CUR_YEAR}"
+    t_prev = _last_team(df_prev_n, _prev_col) if not df_prev_n.empty else pd.Series(name=_prev_col, dtype=str)
+    t_cur  = _last_team(df_cur_n,  _cur_col)  if not df_cur_n.empty  else pd.Series(name=_cur_col,  dtype=str)
 
     # Use the CSV roster as ground truth for current team where available
     _roster_current: dict[str, str] = {}   # player_name → current team
@@ -814,37 +829,37 @@ def load_data():
     except FileNotFoundError:
         pass
 
-    team_changes = pd.concat([t24, t25], axis=1).reset_index()
-    team_changes.columns = ["player_name", "team_2024", "team_2025"]
-    team_changes = team_changes.dropna(subset=["team_2024"])
+    team_changes = pd.concat([t_prev, t_cur], axis=1).reset_index()
+    team_changes.columns = ["player_name", _prev_col, _cur_col]
+    team_changes = team_changes.dropna(subset=[_prev_col])
 
-    # Override team_2025 from CSV when available (handles pre-season / no 2025 games yet)
-    team_changes["team_2025_csv"] = team_changes["player_name"].map(_roster_current)
-    team_changes["team_2025"] = team_changes["team_2025_csv"].combine_first(team_changes["team_2025"])
-    team_changes = team_changes.drop(columns=["team_2025_csv"])
+    # Override current-year col from CSV (handles pre-season / no cur-year games yet)
+    team_changes[_cur_col + "_csv"] = team_changes["player_name"].map(_roster_current)
+    team_changes[_cur_col] = team_changes[_cur_col + "_csv"].combine_first(team_changes[_cur_col])
+    team_changes = team_changes.drop(columns=[_cur_col + "_csv"])
 
     team_changes["changed_team"] = (
-        team_changes["team_2024"].notna() &
-        team_changes["team_2025"].notna() &
-        (team_changes["team_2024"] != team_changes["team_2025"])
+        team_changes[_prev_col].notna() &
+        team_changes[_cur_col].notna() &
+        (team_changes[_prev_col] != team_changes[_cur_col])
     )
 
-    # Tag 2024 rows for players who changed teams (weight them lower)
-    df_2024 = df_2024.merge(
+    # Tag prev-year rows for players who changed teams (weight them lower)
+    df_prev_n = df_prev_n.merge(
         team_changes[["player_name", "changed_team"]], on="player_name", how="left"
     )
-    df_2024["changed_team"] = df_2024["changed_team"].fillna(False)
-    df_2025["changed_team"] = False   # 2025 rows are always current team
+    df_prev_n["changed_team"] = df_prev_n["changed_team"].fillna(False)
+    df_cur_n["changed_team"]  = False   # current-year rows are always current team
 
-    nfl = pd.concat([df_2024, df_2025], ignore_index=True)
+    nfl = pd.concat([df_prev_n, df_cur_n], ignore_index=True)
     nfl["changed_team"] = nfl["changed_team"].fillna(False)
     nfl = nfl.sort_values(["player_name", "season", "game_id"]).reset_index(drop=True)
 
     # ── season weights (vectorised — no row-by-row apply) ──────────────────
     nfl["weight"] = np.select(
         [
-            nfl["season"] == 2025,
-            (nfl["season"] == 2024) & nfl["changed_team"],
+            nfl["season"] == _CUR_YEAR,
+            (nfl["season"] == _PREV_YEAR) & nfl["changed_team"],
         ],
         [1.0, 0.3],
         default=0.6,
@@ -898,21 +913,21 @@ def build_player_team_map(nfl):
       - the team from the player's most recent 2024 game if no 2025 data exists.
     Used to show players on their new teams in dropdowns and headers.
     """
-    p25 = (
-        nfl[nfl["season"] == 2025]
+    p_cur = (
+        nfl[nfl["season"] == _CUR_YEAR]
         .sort_values("game_id")
         .groupby("player_name")["team"]
         .last()
     )
-    p24 = (
-        nfl[nfl["season"] == 2024]
+    p_prev = (
+        nfl[nfl["season"] == _PREV_YEAR]
         .sort_values("game_id")
         .groupby("player_name")["team"]
         .last()
     )
-    # Combine: 2025 takes priority over 2024
-    combined = p24.to_dict()
-    combined.update(p25.to_dict())
+    # Combine: current season takes priority over previous
+    combined = p_prev.to_dict()
+    combined.update(p_cur.to_dict())
     return combined
 
 
@@ -951,18 +966,18 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_wind
         return None
 
     full    = pdf["player_name"].iloc[0]
-    p25     = pdf[pdf["season"] == 2025]
-    p24     = pdf[pdf["season"] == 2024]
+    p_cur   = pdf[pdf["season"] == _CUR_YEAR]
+    p_prev  = pdf[pdf["season"] == _PREV_YEAR]
     changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
 
     try:
-        hr25, ov25, tot25 = hit_rate(p25, col, line)
+        hr_cur, ov_cur, tot_cur = hit_rate(p_cur, col, line)
     except Exception:
-        hr25, ov25, tot25 = None, None, None
+        hr_cur, ov_cur, tot_cur = None, None, None
     try:
-        hr24, ov24, tot24 = hit_rate(p24, col, line)
+        hr_prev, ov_prev, tot_prev = hit_rate(p_prev, col, line)
     except Exception:
-        hr24, ov24, tot24 = None, None, None
+        hr_prev, ov_prev, tot_prev = None, None, None
 
     # Window slice — tail of the combined sorted dataframe
     n_games = {"Last 3": 3, "Last 5": 5, "Season": None}.get(game_window, None)
@@ -981,22 +996,25 @@ def prop_analysis(nfl, player_name, category, line, use_weighted=True, game_wind
     window_hit = (window_df[col] > line).mean() * 100 if not window_df.empty else 0.0
 
     return {
-        "full_name":     full,
-        "changed":       changed,
-        "team_24":       p24["team"].iloc[-1] if not p24.empty else "N/A",
-        "team_25":       p25["team"].iloc[-1] if not p25.empty else "N/A",
-        "hr_2025":       hr25, "over_2025": ov25, "total_2025": tot25,
-        "avg_2025":      p25[col].mean() if not p25.empty else None,
-        "hr_2024":       hr24, "over_2024": ov24, "total_2024": tot24,
-        "avg_2024":      p24[col].mean() if not p24.empty else None,
-        "w_avg":         w_avg,
-        "w_hit":         w_hit,
-        "weight_label":  "0.3" if changed else "0.6",
-        "window_avg":    window_avg,
-        "window_hit":    window_hit,
-        "window_label":  game_window,
-        "window_games":  len(window_df),
-        "std_dev":       window_df[col].std() if not window_df.empty else 0.0,
+        "full_name":      full,
+        "changed":        changed,
+        "team_prev":      p_prev["team"].iloc[-1] if not p_prev.empty else "N/A",
+        "team_cur":       p_cur["team"].iloc[-1]  if not p_cur.empty  else "N/A",
+        # keep legacy keys so existing display code still works
+        "team_24":        p_prev["team"].iloc[-1] if not p_prev.empty else "N/A",
+        "team_25":        p_cur["team"].iloc[-1]  if not p_cur.empty  else "N/A",
+        f"hr_{_CUR_YEAR}":    hr_cur,  f"over_{_CUR_YEAR}":  ov_cur,  f"total_{_CUR_YEAR}":  tot_cur,
+        f"avg_{_CUR_YEAR}":   p_cur[col].mean()  if not p_cur.empty  else None,
+        f"hr_{_PREV_YEAR}":   hr_prev, f"over_{_PREV_YEAR}": ov_prev, f"total_{_PREV_YEAR}": tot_prev,
+        f"avg_{_PREV_YEAR}":  p_prev[col].mean() if not p_prev.empty else None,
+        "w_avg":          w_avg,
+        "w_hit":          w_hit,
+        "weight_label":   "0.3" if changed else "0.6",
+        "window_avg":     window_avg,
+        "window_hit":     window_hit,
+        "window_label":   game_window,
+        "window_games":   len(window_df),
+        "std_dev":        window_df[col].std() if not window_df.empty else 0.0,
         "recommendation": "OVER" if w_avg > line else "UNDER",
     }
 
@@ -1015,17 +1033,17 @@ def bar_chart(nfl, player_name, category, line=None, game_window="Season"):
 
     if n_games is not None:
         combined = pdf.tail(n_games).copy()
-        p24 = combined[combined["season"] == 2024].reset_index(drop=True)
-        p25 = combined[combined["season"] == 2025].reset_index(drop=True)
+        p_prev = combined[combined["season"] == _PREV_YEAR].reset_index(drop=True)
+        p_cur  = combined[combined["season"] == _CUR_YEAR].reset_index(drop=True)
     else:
-        p24 = pdf[pdf["season"] == 2024].reset_index(drop=True)
-        p25 = pdf[pdf["season"] == 2025].reset_index(drop=True)
+        p_prev = pdf[pdf["season"] == _PREV_YEAR].reset_index(drop=True)
+        p_cur  = pdf[pdf["season"] == _CUR_YEAR].reset_index(drop=True)
 
-    p24["week"] = range(1, len(p24) + 1)
-    p25["week"] = range(1, len(p25) + 1)
+    p_prev["week"] = range(1, len(p_prev) + 1)
+    p_cur["week"]  = range(1, len(p_cur)  + 1)
 
-    has24, has25 = not p24.empty, not p25.empty
-    ncols = 2 if (has24 and has25) else 1
+    has_prev, has_cur = not p_prev.empty, not p_cur.empty
+    ncols = 2 if (has_prev and has_cur) else 1
     fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 4.5), sharey=True)
     if ncols == 1:
         axes = [axes]
@@ -1070,10 +1088,10 @@ def bar_chart(nfl, player_name, category, line=None, game_window="Season"):
         ax.grid(axis="y", linestyle="--", alpha=0.35, zorder=0)
 
     idx = 0
-    if has24:
-        _draw(axes[idx], p24, "2024 Season", C_2024); idx += 1
-    if has25:
-        _draw(axes[idx], p25, "2025 Season", C_2025)
+    if has_prev:
+        _draw(axes[idx], p_prev, f"{_PREV_YEAR} Season", C_2024); idx += 1
+    if has_cur:
+        _draw(axes[idx], p_cur, f"{_CUR_YEAR} Season", C_2025)
 
     if line is not None:
         fig.legend(
@@ -1106,7 +1124,7 @@ def trend_chart(nfl, player_name, category):
     pdf["game_num"] = range(1, len(pdf) + 1)
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    colors = [C_2025 if r == 2025 else C_2024 for r in pdf["season"]]
+    colors = [C_2025 if r == _CUR_YEAR else C_2024 for r in pdf["season"]]
     ax.bar(pdf["game_num"], pdf[col], color=colors, alpha=0.6,
            edgecolor="white", linewidth=0.5, zorder=2, label="_nolegend_")
 
@@ -1115,10 +1133,10 @@ def trend_chart(nfl, player_name, category):
                 linewidth=2, label="3-game rolling avg", zorder=4)
 
     # Season boundary line
-    boundary = pdf[pdf["season"] == 2025]["game_num"].min()
+    boundary = pdf[pdf["season"] == _CUR_YEAR]["game_num"].min()
     if pd.notna(boundary) and boundary > 1:
         ax.axvline(boundary - 0.5, color="#888", linewidth=1.2,
-                   linestyle=":", label="2024 → 2025")
+                   linestyle=":", label=f"{_PREV_YEAR} → {_CUR_YEAR}")
 
     ax.set_title(f"{pdf['player_name'].iloc[0]}  —  {col_label}  |  All Games",
                  fontsize=12, fontweight="bold")
@@ -1126,8 +1144,8 @@ def trend_chart(nfl, player_name, category):
     ax.set_ylabel(col_label, fontsize=9)
     ax.legend(
         handles=[
-            mpatches.Patch(color=C_2024, label="2024"),
-            mpatches.Patch(color=C_2025, label="2025"),
+            mpatches.Patch(color=C_2024, label=str(_PREV_YEAR)),
+            mpatches.Patch(color=C_2025, label=str(_CUR_YEAR)),
             plt.Line2D([0], [0], color=C_TREND, linewidth=2, label="3-game rolling avg"),
         ],
         fontsize=8, framealpha=0.85,
@@ -1147,7 +1165,7 @@ def team_bar_chart(nfl, season, stat_col, stat_label):
         .reset_index()
     )
     fig, ax = plt.subplots(figsize=(10, max(5, len(tdf) * 0.32)))
-    colors = [C_2025 if season == 2025 else C_2024] * len(tdf)
+    colors = [C_2025 if season == _CUR_YEAR else C_2024] * len(tdf)
     bars = ax.barh(tdf["team"], tdf[stat_col], color=colors, alpha=0.85,
                    edgecolor="white", linewidth=0.5)
     for bar, val in zip(bars, tdf[stat_col]):
@@ -1197,7 +1215,7 @@ _COL_TO_POS = {
 # LOAD DATA
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("🏈 NFL Prop Betting Dashboard")
-st.caption("Live data via ESPN API  ·  2024 + 2025 regular seasons  ·  PPR scoring")
+st.caption(f"Live data via ESPN API  ·  {_PREV_YEAR} + {_CUR_YEAR} regular seasons  ·  PPR scoring")
 
 with st.spinner("Loading data…"):
     try:
@@ -1275,7 +1293,7 @@ with main_bet:
                     help="Select the opposing defense to factor matchup difficulty into the recommendation.",
                 )
                 weighted = st.toggle("Season Weighting", value=True,
-                                     help="2025 × 1.0 · 2024 × 0.6 · team-changer × 0.3")
+                                     help=f"{_CUR_YEAR} × 1.0 · {_PREV_YEAR} × 0.6 · team-changer × 0.3")
                 game_window = st.radio(
                     "Game Window",
                     options=["Last 3", "Last 5", "Season"],
@@ -1332,8 +1350,8 @@ with main_bet:
                         # ── Team change warning ───────────────────────────────
                         if res["changed"]:
                             st.warning(
-                                f"⚠️ Team change: **{res['team_24']}** (2024) → "
-                                f"**{res['team_25']}** (2025) — 2024 weight = {res['weight_label']}"
+                                f"⚠️ Team change: **{res['team_prev']}** ({_PREV_YEAR}) → "
+                                f"**{res['team_cur']}** ({_CUR_YEAR}) — {_PREV_YEAR} weight = {res['weight_label']}"
                             )
 
                         # ── Matchup banner ────────────────────────────────────
@@ -1405,20 +1423,20 @@ with main_bet:
                         # ── Season split table ────────────────────────────────
                         st.subheader("Season Split")
                         split_rows = []
-                        if res["hr_2025"] is not None:
+                        if res.get(f"hr_{_CUR_YEAR}") is not None:
                             split_rows.append({
-                                "Season": "2025",
-                                "Hit Rate": f"{res['hr_2025']:.1f}%",
-                                "Over / Total": f"{int(res['over_2025'])} / {res['total_2025']}",
-                                "Average": f"{res['avg_2025']:.1f}",
+                                "Season": str(_CUR_YEAR),
+                                "Hit Rate": f"{res[f'hr_{_CUR_YEAR}']:.1f}%",
+                                "Over / Total": f"{int(res[f'over_{_CUR_YEAR}'])} / {res[f'total_{_CUR_YEAR}']}",
+                                "Average": f"{res[f'avg_{_CUR_YEAR}']:.1f}",
                                 "Weight": "1.0",
                             })
-                        if res["hr_2024"] is not None:
+                        if res.get(f"hr_{_PREV_YEAR}") is not None:
                             split_rows.append({
-                                "Season": "2024",
-                                "Hit Rate": f"{res['hr_2024']:.1f}%",
-                                "Over / Total": f"{int(res['over_2024'])} / {res['total_2024']}",
-                                "Average": f"{res['avg_2024']:.1f}",
+                                "Season": str(_PREV_YEAR),
+                                "Hit Rate": f"{res[f'hr_{_PREV_YEAR}']:.1f}%",
+                                "Over / Total": f"{int(res[f'over_{_PREV_YEAR}'])} / {res[f'total_{_PREV_YEAR}']}",
+                                "Average": f"{res[f'avg_{_PREV_YEAR}']:.1f}",
                                 "Weight": res["weight_label"],
                             })
                         if split_rows:
@@ -1458,7 +1476,7 @@ with main_bet:
                                              step=0.5, format="%.1f", key="sf_line")
                 sf_dir    = st.radio("Streak Direction", ["Over", "Under"], horizontal=True,
                                       key="sf_dir")
-                sf_season = st.radio("Season", [2025, 2024, "Both"], key="sf_season")
+                sf_season = st.radio("Season", [_CUR_YEAR, _PREV_YEAR, "Both"], key="sf_season")
                 sf_min    = st.number_input("Min streak length", min_value=1, value=2,
                                              step=1, key="sf_min")
                 sf_top    = st.slider("Show top N players", 5, 30, 15, key="sf_top")
@@ -1583,7 +1601,7 @@ with main_players:
                     "Trend stat", list(CAT_MAP.keys()),
                     format_func=str.title, key="pp_cat",
                 )
-                pp_season = st.radio("Season filter", ["Both", "2024", "2025"], key="pp_season")
+                pp_season = st.radio("Season filter", ["Both", str(_PREV_YEAR), str(_CUR_YEAR)], key="pp_season")
 
             with col_b:
                 pdf = find_player(nfl_df, pp_player)
@@ -1593,22 +1611,22 @@ with main_players:
                     full = pdf["player_name"].iloc[0]
                     # Show current team (most recent 2025 game, or latest 2024)
                     team = player_team_map.get(full) or pdf.sort_values("game_id")["team"].iloc[-1]
-                    p24  = pdf[pdf["season"] == 2024]
-                    p25  = pdf[pdf["season"] == 2025]
+                    p_prev = pdf[pdf["season"] == _PREV_YEAR]
+                    p_cur  = pdf[pdf["season"] == _CUR_YEAR]
 
                     # Check for team change and note old team
-                    old_team = p24["team"].iloc[-1] if not p24.empty else None
+                    old_team = p_prev["team"].iloc[-1] if not p_prev.empty else None
                     team_change_note = (
-                        f" _(was {old_team} in 2024)_"
-                        if old_team and old_team != team and not p25.empty
+                        f" _(was {old_team} in {_PREV_YEAR})_"
+                        if old_team and old_team != team and not p_cur.empty
                         else ""
                     )
                     st.subheader(f"{full}  ·  {team}{team_change_note}")
                     h1, h2, h3, h4, h5 = st.columns(5)
-                    h1.metric("Games (2025)", len(p25))
-                    h2.metric("Games (2024)", len(p24))
-                    h3.metric("2025 Avg Fantasy", f"{p25['fantasy_points'].mean():.1f}" if not p25.empty else "—")
-                    h4.metric("2024 Avg Fantasy", f"{p24['fantasy_points'].mean():.1f}" if not p24.empty else "—")
+                    h1.metric(f"Games ({_CUR_YEAR})",  len(p_cur))
+                    h2.metric(f"Games ({_PREV_YEAR})", len(p_prev))
+                    h3.metric(f"{_CUR_YEAR} Avg Fantasy",  f"{p_cur['fantasy_points'].mean():.1f}"  if not p_cur.empty  else "—")
+                    h4.metric(f"{_PREV_YEAR} Avg Fantasy", f"{p_prev['fantasy_points'].mean():.1f}" if not p_prev.empty else "—")
                     changed = pdf["changed_team"].any() if "changed_team" in pdf.columns else False
                     h5.metric("Team Change", "Yes ⚠️" if changed else "No")
 
@@ -1619,10 +1637,10 @@ with main_players:
                         plt.close(fig2)
 
                     st.subheader("Game Log")
-                    if pp_season == "2024":
-                        log_df = p24.copy()
-                    elif pp_season == "2025":
-                        log_df = p25.copy()
+                    if pp_season == str(_PREV_YEAR):
+                        log_df = p_prev.copy()
+                    elif pp_season == str(_CUR_YEAR):
+                        log_df = p_cur.copy()
                     else:
                         log_df = pdf.copy()
 
@@ -1642,7 +1660,7 @@ with main_players:
             ll_col1, ll_col2 = st.columns([1, 3])
             with ll_col1:
                 st.subheader("Filters")
-                ll_season = st.radio("Season", ["2025", "2024", "Both"], key="ll_season")
+                ll_season = st.radio("Season", [str(_CUR_YEAR), str(_PREV_YEAR), "Both"], key="ll_season")
                 ll_stat   = st.selectbox("Stat", list(LEADER_COLS.keys()), key="ll_stat")
                 ll_agg    = st.radio("Aggregate by", ["Average", "Total"], key="ll_agg")
                 ll_min    = st.number_input("Min games played", min_value=1, value=4, step=1, key="ll_min")
@@ -1675,7 +1693,7 @@ with main_players:
                 st.subheader(f"Top {ll_top} — {val_label}  ({ll_season})")
 
                 fig4, ax4 = plt.subplots(figsize=(9, max(4, len(leaders) * 0.35)))
-                bar_color = C_2025 if ll_season == "2025" else (C_2024 if ll_season == "2024" else C_TREND)
+                bar_color = C_2025 if ll_season == str(_CUR_YEAR) else (C_2024 if ll_season == str(_PREV_YEAR) else C_TREND)
                 bars4 = ax4.barh(leaders["Player"][::-1], leaders[val_label][::-1],
                                  color=bar_color, alpha=0.85, edgecolor="white", linewidth=0.4)
                 for bar, val in zip(bars4, leaders[val_label][::-1]):
@@ -1719,7 +1737,7 @@ with main_teams:
             t_col1, t_col2 = st.columns([1, 3])
             with t_col1:
                 st.subheader("Filters")
-                to_season = st.radio("Season", [2025, 2024], key="to_season")
+                to_season = st.radio("Season", [_CUR_YEAR, _PREV_YEAR], key="to_season")
                 to_stat   = st.selectbox("Stat to chart", list(LEADER_COLS.keys()), key="to_stat")
                 to_team   = st.selectbox("Team spotlight",
                                           ["All"] + sorted(nfl_df["team"].unique().tolist()),
@@ -1776,7 +1794,7 @@ with main_teams:
                 "📋 **Highlightly** depth charts active · QB / RB / WR / TE · cached 6 hrs"
                 if _hl_active else
                 "QB / RB / WR / TE — sourced from ESPN if available, otherwise derived from "
-                "2025/2024 game logs · Add a Highlightly key in ⚙️ Settings → 🔑 API Keys for live data"
+                f"{_CUR_YEAR}/{_PREV_YEAR} game logs · Add a Highlightly key in ⚙️ Settings → 🔑 API Keys for live data"
             )
 
             with st.spinner("Loading depth charts…"):
@@ -1821,22 +1839,22 @@ with main_teams:
                                     name.split(" ")[0], case=False, na=False
                                 )]
                                 if not p_data.empty:
-                                    p25 = p_data[p_data["season"] == 2025]
-                                    p24 = p_data[p_data["season"] == 2024]
+                                    p_dc_cur  = p_data[p_data["season"] == _CUR_YEAR]
+                                    p_dc_prev = p_data[p_data["season"] == _PREV_YEAR]
                                     stat_col_map = {"QB": "passing_yards", "RB": "rush_yards",
                                                     "WR": "receiving_yards", "TE": "receiving_yards"}
                                     sc = stat_col_map[pos]
-                                    avg_25 = f"{p25[sc].mean():.1f}" if not p25.empty else "—"
-                                    avg_24 = f"{p24[sc].mean():.1f}" if not p24.empty else "—"
-                                    games  = len(p_data)
+                                    avg_cur  = f"{p_dc_cur[sc].mean():.1f}"  if not p_dc_cur.empty  else "—"
+                                    avg_prev = f"{p_dc_prev[sc].mean():.1f}" if not p_dc_prev.empty else "—"
+                                    games    = len(p_data)
                                 else:
-                                    avg_25 = avg_24 = "New/No data"
-                                    games  = 0
+                                    avg_cur = avg_prev = "New/No data"
+                                    games   = 0
                                 rows.append({
                                     "Depth": f"#{i}",
                                     "Player": name,
-                                    "2025 Avg": avg_25,
-                                    "2024 Avg": avg_24,
+                                    f"{_CUR_YEAR} Avg":  avg_cur,
+                                    f"{_PREV_YEAR} Avg": avg_prev,
                                     "Games in DB": games,
                                 })
                             st.dataframe(pd.DataFrame(rows),
@@ -1873,8 +1891,8 @@ with main_settings:
         with c1:
             st.markdown("### ℹ️ How it works")
             st.markdown(
-                """
-- **First load of the day** → scrapes 2024 + 2025 from ESPN (~5 min)
+                f"""
+- **First load of the day** → scrapes {_PREV_YEAR} + {_CUR_YEAR} from ESPN (~5 min)
 - **Everyone else within that hour** → instant load from cache
 - **After 1 hour** → cache expires, next visitor triggers a fresh scrape
 - **New games** appear automatically the next time the cache refreshes
@@ -2013,7 +2031,7 @@ if data_ok:
                 key="me_opp",
             )
             me_season = st.radio(
-                "Defensive sample season", ["2025", "2024", "Both"],
+                "Defensive sample season", [str(_CUR_YEAR), str(_PREV_YEAR), "Both"],
                 key="me_season",
             )
             me_go = st.button("Run Matchup Analysis", type="primary",
@@ -2030,20 +2048,20 @@ if data_ok:
                     st.stop()
 
                 full_name = pdf["player_name"].iloc[0]
-                p25 = pdf[pdf["season"] == 2025]
-                p24 = pdf[pdf["season"] == 2024]
+                p_cur  = pdf[pdf["season"] == _CUR_YEAR]
+                p_prev = pdf[pdf["season"] == _PREV_YEAR]
 
-                player_avg_25  = p25[col].mean()  if not p25.empty else None
-                player_avg_24  = p24[col].mean()  if not p24.empty else None
-                player_last3   = p25[col].tail(3).mean() if not p25.empty else pdf[col].tail(3).mean()
-                player_all_avg = pdf[col].mean()
+                player_avg_cur  = p_cur[col].mean()  if not p_cur.empty  else None
+                player_avg_prev = p_prev[col].mean()  if not p_prev.empty else None
+                player_last3    = p_cur[col].tail(3).mean() if not p_cur.empty else pdf[col].tail(3).mean()
+                player_all_avg  = pdf[col].mean()
 
                 # ── defensive averages allowed vs this stat ───────────────────
                 # filter to games where the opposing team = me_opp
-                if me_season == "2025":
-                    def_df = nfl_opp[nfl_opp["season"] == 2025]
-                elif me_season == "2024":
-                    def_df = nfl_opp[nfl_opp["season"] == 2024]
+                if me_season == str(_CUR_YEAR):
+                    def_df = nfl_opp[nfl_opp["season"] == _CUR_YEAR]
+                elif me_season == str(_PREV_YEAR):
+                    def_df = nfl_opp[nfl_opp["season"] == _PREV_YEAR]
                 else:
                     def_df = nfl_opp.copy()
 
@@ -2111,8 +2129,8 @@ if data_ok:
                 with d1:
                     st.subheader(f"📌 {full_name}")
                     player_rows = [
-                        {"Metric": "2025 Season Avg",    "Value": f"{player_avg_25:.1f}"  if player_avg_25  is not None else "—"},
-                        {"Metric": "2024 Season Avg",    "Value": f"{player_avg_24:.1f}"  if player_avg_24  is not None else "—"},
+                        {"Metric": f"{_CUR_YEAR} Season Avg",  "Value": f"{player_avg_cur:.1f}"  if player_avg_cur  is not None else "—"},
+                        {"Metric": f"{_PREV_YEAR} Season Avg", "Value": f"{player_avg_prev:.1f}" if player_avg_prev is not None else "—"},
                         {"Metric": "Last 3 Games Avg",   "Value": f"{player_last3:.1f}"},
                         {"Metric": "Career Avg (both)",  "Value": f"{player_all_avg:.1f}"},
                         {"Metric": "Prop Line",          "Value": str(me_line)},
@@ -2145,7 +2163,7 @@ if data_ok:
 
                 fig6, ax6 = plt.subplots(figsize=(12, 4))
 
-                bar_colors = [C_2025 if s == 2025 else C_2024 for s in chart_df["season"]]
+                bar_colors = [C_2025 if s == _CUR_YEAR else C_2024 for s in chart_df["season"]]
                 ax6.bar(chart_df["game_num"], chart_df[col],
                         color=bar_colors, alpha=0.65, edgecolor="white",
                         linewidth=0.5, zorder=2, label="_nolegend_")
@@ -2167,10 +2185,10 @@ if data_ok:
                             zorder=3)
 
                 # season boundary
-                boundary = chart_df[chart_df["season"] == 2025]["game_num"].min()
+                boundary = chart_df[chart_df["season"] == _CUR_YEAR]["game_num"].min()
                 if pd.notna(boundary) and boundary > 1:
                     ax6.axvline(boundary - 0.5, color="#888", linewidth=1,
-                                linestyle=":", label="2024 → 2025")
+                                linestyle=":", label=f"{_PREV_YEAR} → {_CUR_YEAR}")
 
                 ax6.set_xlabel("Game #", fontsize=9)
                 ax6.set_ylabel(col_label, fontsize=9)
@@ -2479,7 +2497,7 @@ if data_ok:
                     # ── risk note ─────────────────────────────────────────────
                     st.caption(
                         "⚠️ Probabilities are estimated from historical hit rates using "
-                        "2024/2025 weighted game logs. They are not guaranteed outcomes. "
+                        f"{_PREV_YEAR}/{_CUR_YEAR} weighted game logs. They are not guaranteed outcomes. "
                         "Bet responsibly."
                     )
                 else:
@@ -2682,7 +2700,7 @@ if data_ok:
         with mf_c1:
             mf_stat      = st.selectbox("Stat category", list(CAT_MAP.keys()),
                                          format_func=str.title, key="mf_stat")
-            mf_season    = st.radio("Defensive sample", [2025, 2024, "Both"],
+            mf_season    = st.radio("Defensive sample", [_CUR_YEAR, _PREV_YEAR, "Both"],
                                      key="mf_season")
             mf_min_games = st.number_input("Min games sample", 1, 18, 4,
                                             key="mf_min")
@@ -2810,16 +2828,16 @@ if data_ok:
                         # Prefer depth-chart starters; fall back to historical leaders
                         dc_names = depth_chart_players(offense_team, col, max_rank=3)
 
-                        # ── Step 1: players who played for this team in 2025/2024 ──
+                        # ── Step 1: players who played for this team in cur/prev season ──
                         team_players = nfl_def[
                             (nfl_def["team"] == offense_team) &
-                            (nfl_def["season"] == 2025) &
+                            (nfl_def["season"] == _CUR_YEAR) &
                             (nfl_def[col] > 0)
                         ]
                         if team_players.empty:
                             team_players = nfl_def[
                                 (nfl_def["team"] == offense_team) &
-                                (nfl_def["season"] == 2024) &
+                                (nfl_def["season"] == _PREV_YEAR) &
                                 (nfl_def[col] > 0)
                             ]
 
@@ -2910,8 +2928,8 @@ if data_ok:
 
                         # Get last-3 avg for this player (from any team)
                         p_df   = nfl_def[nfl_def["player_name"] == best["player_name"]]
-                        p_2025 = p_df[p_df["season"] == 2025]
-                        last3  = float(p_2025[col].tail(3).mean()) if not p_2025.empty else player_avg_display
+                        p_cur_mf = p_df[p_df["season"] == _CUR_YEAR]
+                        last3    = float(p_cur_mf[col].tail(3).mean()) if not p_cur_mf.empty else player_avg_display
 
                         # ── Line: real book line if available, else model projection ──
                         proj = player_avg_display * matchup_factor
@@ -3077,13 +3095,13 @@ if data_ok:
 
                                         team_p = nfl_def[
                                             (nfl_def["team"] == offense_team) &
-                                            (nfl_def["season"] == 2025) &
+                                            (nfl_def["season"] == _CUR_YEAR) &
                                             (nfl_def[ap_col] > 0)
                                         ]
                                         if team_p.empty:
                                             team_p = nfl_def[
                                                 (nfl_def["team"] == offense_team) &
-                                                (nfl_def["season"] == 2024) &
+                                                (nfl_def["season"] == _PREV_YEAR) &
                                                 (nfl_def[ap_col] > 0)
                                             ]
                                         if team_p.empty:
@@ -3387,7 +3405,7 @@ if data_ok:
             )
             ha_cat    = st.selectbox("Stat", list(CAT_MAP.keys()),
                                       format_func=str.title, key="ha_cat")
-            ha_season = st.radio("Season", [2025, 2024, "Both"], key="ha_season")
+            ha_season = st.radio("Season", [_CUR_YEAR, _PREV_YEAR, "Both"], key="ha_season")
             ha_line   = st.number_input("Prop line (optional)",
                                          min_value=0.0, value=0.0, step=0.5,
                                          format="%.1f", key="ha_line")
@@ -3522,14 +3540,14 @@ if data_ok:
                 if pdf.empty:
                     return None
                 full   = pdf["player_name"].iloc[0]
-                p25    = pdf[pdf["season"] == 2025]
-                p24    = pdf[pdf["season"] == 2024]
+                p_cur  = pdf[pdf["season"] == _CUR_YEAR]
+                p_prev = pdf[pdf["season"] == _PREV_YEAR]
 
                 vals   = pdf[col].values
                 wts    = pdf["weight"].values
                 w_avg  = np.average(vals, weights=wts)
-                last3  = p25[col].tail(3).mean() if not p25.empty else pdf[col].tail(3).mean()
-                season_avg = p25[col].mean() if not p25.empty else pdf[col].mean()
+                last3  = p_cur[col].tail(3).mean() if not p_cur.empty else pdf[col].tail(3).mean()
+                season_avg = p_cur[col].mean() if not p_cur.empty else pdf[col].mean()
 
                 # Opponent defensive strength for this stat
                 opp_data = nfl_ss[nfl_ss["opponent"] == opp_team]
@@ -4560,18 +4578,18 @@ if data_ok:
         # ── Roster: players from either team in our dataset ───────────────────
         @st.cache_data(show_spinner=False)
         def _sgp_roster(nfl, home, away):
-            """Return sorted player list for a game (both teams, 2025 first, then 2024)."""
+            """Return sorted player list for a game (both teams, cur-year first, then prev-year)."""
             mask = nfl["team"].isin([home, away])
-            names25 = set(nfl[(nfl["season"] == 2025) & mask]["player_name"].unique())
-            names24 = set(nfl[(nfl["season"] == 2024) & mask]["player_name"].unique())
-            return sorted(names25 | names24)
+            names_cur  = set(nfl[(nfl["season"] == _CUR_YEAR)  & mask]["player_name"].unique())
+            names_prev = set(nfl[(nfl["season"] == _PREV_YEAR) & mask]["player_name"].unique())
+            return sorted(names_cur | names_prev)
 
         sgp_roster = _sgp_roster(nfl_df, home_norm, away_norm)
 
         if not sgp_roster:
             st.info(
                 f"No player data found for {away_raw} or {home_raw}. "
-                "They may not yet have 2024/2025 game logs in the dataset."
+                f"They may not yet have {_PREV_YEAR}/{_CUR_YEAR} game logs in the dataset."
             )
         else:
             # ── Helper: resolve real book line for a player + cat ─────────────
@@ -4696,13 +4714,13 @@ if data_ok:
                                     # Players on this offense team
                                     team_players_df = nfl_df[
                                         (nfl_df["team"] == offense_team) &
-                                        (nfl_df["season"] == 2025) &
+                                        (nfl_df["season"] == _CUR_YEAR) &
                                         (nfl_df[col_key] > 0)
                                     ]
                                     if team_players_df.empty:
                                         team_players_df = nfl_df[
                                             (nfl_df["team"] == offense_team) &
-                                            (nfl_df["season"] == 2024) &
+                                            (nfl_df["season"] == _PREV_YEAR) &
                                             (nfl_df[col_key] > 0)
                                         ]
                                     if team_players_df.empty:
