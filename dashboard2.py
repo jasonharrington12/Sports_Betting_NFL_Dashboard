@@ -144,6 +144,15 @@ def _nflr_player_stats(year: int) -> pd.DataFrame:
 
     raw = raw[raw["season_type"] == "REG"].copy()
 
+    # Drop columns that would create duplicates after rename
+    # (raw data has both player_name and player_display_name; both fantasy_points variants)
+    for _drop in ["player_name", "fantasy_points"]:
+        if _drop in raw.columns and (
+            (_drop == "player_name"    and "player_display_name" in raw.columns) or
+            (_drop == "fantasy_points" and "fantasy_points_ppr"  in raw.columns)
+        ):
+            raw = raw.drop(columns=[_drop])
+
     raw = raw.rename(columns={
         "player_display_name":   "player_name",
         "passing_interceptions": "interceptions",
