@@ -316,7 +316,7 @@ def _nflr_player_stats(year: int) -> pd.DataFrame:
 
 
 # ── Depth charts ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)   # 6-hour TTL
 def fetch_depth_charts(cur_year: int = _CUR_YEAR) -> dict:
     """
     Load depth charts from nflreadpy for cur_year.
@@ -401,7 +401,7 @@ def _build_depth_chart_from_gamelog(nfl) -> dict:
 
 
 # ── Rosters (weekly — most-recent week = current roster + injury status) ──────
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=21600, show_spinner=False)   # 6-hour TTL
 def fetch_rosters(cur_year: int = _CUR_YEAR) -> pd.DataFrame:
     """
     Load weekly rosters from nflreadpy, keep only the latest week per player.
@@ -424,7 +424,7 @@ def fetch_rosters(cur_year: int = _CUR_YEAR) -> pd.DataFrame:
 
 
 # ── Injuries ─────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)    # 30-min TTL — injury status changes frequently
 def fetch_injuries(cur_year: int = _CUR_YEAR) -> pd.DataFrame:
     """
     Load injury report from nflreadpy for cur_year.
@@ -640,23 +640,16 @@ def fetch_game_odds(espn_id: str) -> dict:
 
 
 # ── Main data loader ──────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=_cache_ttl(), show_spinner=False)
 def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
     """
     Load two seasons of player game logs from nflreadpy.
-    TTL is dynamic: 30 min on game days (Sun/Mon/Thu), 6 hrs otherwise —
-    so new weekly data appears automatically without a manual refresh.
-
-    cur_year/prev_year are in the cache key so rolling to a new season
-    immediately busts the cache and triggers a fresh load.
-
+    TTL is dynamic: 30 min on game days (Sun/Mon/Thu), 6 hrs otherwise.
+    Both seasons are downloaded in parallel to cut cold-start time roughly in half.
+    cur_year/prev_year are in the cache key so a season rollover busts the cache.
     Returns (nfl_df, team_changes_df).
     """
-    ttl = _cache_ttl()
-    # Force Streamlit to re-evaluate TTL on each call by embedding it
-    # in a dummy side-effect-free expression (the actual TTL is set via
-    # the decorator above — we re-register dynamically below).
-    _ = ttl  # used by load_data.clear() path in Data Refresh tab
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     _COLS = [
         "player_id", "game_id", "season", "player_name", "team",
@@ -665,11 +658,18 @@ def load_data(cur_year: int = _CUR_YEAR, prev_year: int = _PREV_YEAR):
         "receptions", "targets", "receiving_yards", "receiving_tds", "fantasy_points",
     ]
 
+    # Download both seasons in parallel
     season_dfs: dict[int, pd.DataFrame] = {}
-    for yr in [prev_year, cur_year]:
-        df = _nflr_player_stats(yr)
-        if not df.empty:
-            season_dfs[yr] = df
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = {ex.submit(_nflr_player_stats, yr): yr for yr in [prev_year, cur_year]}
+        for fut in as_completed(futures):
+            yr = futures[fut]
+            try:
+                df = fut.result()
+                if not df.empty:
+                    season_dfs[yr] = df
+            except Exception:
+                pass
 
     if not season_dfs:
         raise RuntimeError(
@@ -1058,9 +1058,9 @@ _COL_TO_POS = {
 # LOAD DATA
 # ──────────────────────────────────────────────────────────────────────────────
 st.title("🏈 NFL Prop Betting Dashboard")
-st.caption(f"Live data via ESPN API  ·  {_PREV_YEAR} + {_CUR_YEAR} regular seasons  ·  PPR scoring")
+st.caption(f"Data via nflreadpy (nflverse)  ·  {_PREV_YEAR} + {_CUR_YEAR} regular seasons  ·  PPR scoring")
 
-with st.spinner("Loading data…"):
+with st.spinner(f"Loading {_PREV_YEAR} + {_CUR_YEAR} player stats from nflverse… (first load ~10s, then cached)"):
     try:
         nfl_df, team_changes = load_data(_CUR_YEAR, _PREV_YEAR)
         player_team_map = build_player_team_map(nfl_df)
@@ -1068,9 +1068,8 @@ with st.spinner("Loading data…"):
     except Exception as e:
         st.error(
             f"**Data load failed:** {e}\n\n"
-            "If running locally, use the **Data Refresh** tab to scrape data first. "
-            "If this is a fresh cloud deploy, the ESPN API may be temporarily unavailable — "
-            "try refreshing the page in a minute."
+            "Check your internet connection and that nflreadpy is installed. "
+            "Use the **⚙️ Settings & Data → 🔄 Data Refresh** tab to retry."
         )
         data_ok = False
 
